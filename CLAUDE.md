@@ -54,6 +54,17 @@ NOT acceptable:
 - Privacy notice displayed in UI
 - Fall detection alert banner (red, auto-hides after 20s)
 
+## Proactive Behavior (COMPLETE — D51, D52, D53, D54)
+- System prompt positions Abide as a live companion robot, not a chatbot
+- 30-second proactive check-in: if user is silent, Abide initiates based on vision
+- UserContext persistence: extracts name, topics, preferences, mood from conversation
+- User facts injected into every Claude turn ("What I know about you: ...")
+- Vision activity buffer: last 5 observations with relative timestamps
+- Vision-reactive trigger: waving, thumbs up, standing up etc. trigger immediate response (D54)
+Implementation: `CHECK_IN_INTERVAL_S` + `_proactive_checkin_loop()` in `app/main.py`,
+`UserContext` dataclass + `_extract_user_facts()` in `app/session.py`,
+`extract_user_facts()` in `app/conversation.py`.
+
 ## Session Summary (COMPLETE — D50)
 When user clicks Stop, a full-screen glass-morphism overlay shows:
 - Session duration (start time — end time)
@@ -77,7 +88,7 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
   folding clothes, putting on shirt
 - Bounding box overlay rendered on canvas
 - Ask clarifying questions: "It looks like you're sitting — am I correct?"
-- Rolling buffer of last 3 scene descriptions
+- Rolling buffer of last 5 scene descriptions with relative timestamps
 - Fall detection: FALL: prefix → red alert banner + urgent Claude context
 - Prompt injection defense: vision context wrapped in <camera_observations> block
 
@@ -103,6 +114,8 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 - Create httpx/Groq/Anthropic clients per-request
 - Put user speech examples in Whisper prompt (causes hallucinations)
 - Send raw exception messages to the client (security risk)
+- Call start_response() without checking/cancelling existing task (race condition)
+- Use bare ws.send_json() in main.py — always use Session._safe_send_json()
 
 ## Verification Checklist
 - [ ] Barge-in: speak mid-response, system stops within ~420ms
@@ -133,6 +146,8 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 - ✅ Prompt injection defense on vision context
 - ✅ Whisper confidence filter (verbose_json + no_speech_prob threshold)
 - ✅ HTTP/2 persistent clients with connection prewarm
+- ✅ Proactive check-in (30s silence trigger) so Abide initiates conversation
+- ✅ UserContext fact extraction — Abide remembers name, topics, preferences within session
 - ❌ Logitech MeetUp pan/tilt (hardware not available, listed as bonus)
 
 ## File Structure

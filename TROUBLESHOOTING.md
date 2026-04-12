@@ -4,6 +4,32 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
+## 11. Security/performance audit: race conditions, unguarded sends, per-request client (Post-Phase-7)
+
+**Symptom**: During a code review audit, three categories of issues were identified:
+
+1. **Race condition in `start_response()`**: Three concurrent callers (STT path, check-in loop, vision-reactive trigger) could call `start_response()` simultaneously, orphaning the first task and causing overlapping audio output.
+
+2. **Unguarded WebSocket sends**: 11 direct `ws.send_json()` calls in `main.py` could crash with "Cannot call send once a close message has been sent" if the client disconnected mid-operation. Already seen in testing (Troubleshooting #10 logs).
+
+3. **Per-request httpx client in `/api/analyze`**: The session analysis endpoint created a fresh `httpx.AsyncClient` per call, paying ~300-500ms TCP+TLS handshake each time.
+
+**Fixes (D55, D56, D57)**:
+
+1. `start_response()` now cancels any in-flight `_response_task` before starting a new one. Sets `_cancelled = True`, calls `task.cancel()`, then resets for the new task. User speech always wins over check-in/vision-reactive responses.
+
+2. All 11 `ws.send_json()` calls in `main.py` replaced with `Session._safe_send_json(ws, ...)` which checks `ws.client_state` before sending and silently swallows exceptions on closed connections.
+
+3. `/api/analyze` now uses a module-level `_analyze_client` (persistent HTTP/2) instead of per-request creation. Client is closed in `_on_shutdown()`.
+
+4. `sample_rate` from client config validated as int with range check (8000-192000 Hz), defaults to 48000 on invalid input.
+
+5. `_proactive_checkin_loop()` now wraps `start_response()` in try/except to prevent silent loop death on unexpected errors.
+
+**Files touched**: `app/main.py`, `app/session.py`
+
+---
+
 ## 10. STT prompt was seeding the very hallucinations it was meant to prevent (Phase 7+)
 
 **Symptom**: Even with the blocklist from Fix #8 and D41 in place, phantom `"Thank you"` transcripts were still reaching Claude — "I get random Thank you all of a sudden" during normal use. The blocklist only caught the well-documented YouTube outros (`"Thanks for watching"`, `"Subtitles by Amara.org"`, etc.), not a bare `"Thank you."`.
@@ -211,4 +237,11 @@ Also pinned `CHUNK_SIZE = 2048` on the frontend to give the worklet a stable, pr
 - ~~Session summary screen~~ — Implemented (D50). Full-screen overlay on Stop with duration, transcript, activity log, and Claude-powered accuracy analysis.
 - ~~Diary view~~ — Implemented (D49). Live-updating tab in the transcript panel with color-coded chronological event log.
 - ~~Groq Whisper verbose_json~~ — Implemented (D48, Fix #10). Confidence filter + standalone blocklist active.
+- ~~Demo video~~ — Still pending.
+- ~~Proactive check-in~~ — Implemented (D52). 30-second silence trigger with vision-based initiation.
+- ~~UserContext persistence~~ — Implemented (D53). Lightweight extraction after each response.
+- ~~Vision-reactive trigger~~ — Implemented (D54). Waving, thumbs up, standing up etc. trigger immediate response.
+- ~~Race condition in start_response()~~ — Fixed (D55, Fix #11). Cancels in-flight task before starting new one.
+- ~~Unguarded WebSocket sends~~ — Fixed (D56, Fix #11). All sends use Session._safe_send_json().
+- ~~Per-request client in /api/analyze~~ — Fixed (Fix #11). Module-level persistent HTTP/2 client.
 - ~~Demo video~~ — Still pending.

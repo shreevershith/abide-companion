@@ -9,9 +9,11 @@ Parallel TTS pipeline:
 """
 
 import asyncio
+import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
@@ -35,14 +37,76 @@ _MAX_TURN_LATENCY_SAMPLES = 100
 _TTS_QUEUE_MAXSIZE = 32
 
 # Maximum wall-clock duration the `client_playing` flag is trusted.
-# If the browser sends `playback_start` but the matching `playback_end`
-# never arrives (JS error, tab crash, ungraceful disconnect that somehow
-# doesn't tear down the WS), the flag would otherwise stay True forever
-# and make every subsequent user speech look like a barge-in candidate.
-# 60 seconds is several times the longest plausible TTS playback for a
-# multi-sentence Claude response.
 _CLIENT_PLAYING_STALENESS_S = 60.0
 
+# Activities that should trigger an immediate proactive response when
+# detected as a NEW activity (different from the previous observation).
+# These are gestures or movements that clearly invite engagement —
+# a companion in the room would notice and react immediately, not wait
+# for the person to speak.
+_REACTIVE_ACTIVITIES = frozenset({
+    "waving", "wave", "thumbs up", "pointing", "beckoning",
+    "standing up", "getting up", "picked up", "picking up",
+    "holding up", "raised hand", "gesturing", "reaching",
+    "dancing", "exercising", "stretching",
+})
+
+# Minimum seconds between vision-reactive responses. Without this,
+# a sustained wave would trigger a response every ~3.6s (vision cycle).
+_VISION_REACT_COOLDOWN_S = 15.0
+
+
+@dataclass
+class UserContext:
+    """Persistent user context that accumulates across the session.
+
+    Updated after each Claude response via a lightweight extraction call.
+    Injected into every Claude turn so Abide feels like it genuinely
+    knows and remembers the person.
+    """
+    name: str | None = None
+    mentioned_topics: list[str] = field(default_factory=list)
+    preferences: list[str] = field(default_factory=list)
+    mood_signals: list[str] = field(default_factory=list)
+
+    def update(self, facts: dict):
+        """Merge extracted facts into this context."""
+        if not facts:
+            return
+        if facts.get("name") and not self.name:
+            self.name = facts["name"]
+        for topic in facts.get("topics", []):
+            if topic and topic not in self.mentioned_topics:
+                self.mentioned_topics.append(topic)
+                # Keep bounded
+                if len(self.mentioned_topics) > 15:
+                    self.mentioned_topics = self.mentioned_topics[-15:]
+        for pref in facts.get("preferences", []):
+            if pref and pref not in self.preferences:
+                self.preferences.append(pref)
+                if len(self.preferences) > 10:
+                    self.preferences = self.preferences[-10:]
+        mood = facts.get("mood")
+        if mood:
+            self.mood_signals.append(mood)
+            if len(self.mood_signals) > 5:
+                self.mood_signals = self.mood_signals[-5:]
+
+    def as_prompt(self) -> str:
+        """Format for injection into Claude's system prompt.
+        Returns empty string if nothing is known yet."""
+        lines = []
+        if self.name:
+            lines.append(f"- Name: {self.name}")
+        if self.mentioned_topics:
+            lines.append(f"- We've talked about: {', '.join(self.mentioned_topics)}")
+        if self.preferences:
+            lines.append(f"- You mentioned you like: {', '.join(self.preferences)}")
+        if self.mood_signals:
+            lines.append(f"- Current mood: {self.mood_signals[-1]}")
+        if not lines:
+            return ""
+        return "What I know about you:\n" + "\n".join(lines)
 
 class Session:
     """Manages response pipeline as a concurrent task for barge-in support."""
@@ -68,6 +132,20 @@ class Session:
         # a buggy client that fails to send playback_end.
         self._client_playing: bool = False
         self._client_playing_since: float | None = None
+
+        # User context — accumulates facts about the user across the session
+        self.user_context: UserContext = UserContext()
+
+        # Timestamp of last user speech (for proactive check-in timing)
+        self.last_user_speech_ts: float = time.monotonic()
+
+        # Engine/key refs for vision-reactive triggers. Set by main.py
+        # in the config handler so _run_vision() can call start_response().
+        self._engine_ref: ConversationEngine | None = None
+        self._openai_key_ref: str | None = None
+
+        # Cooldown for vision-reactive responses (prevents spam)
+        self._last_vision_react_ts: float = 0.0
 
         # Vision state
         self.vision_buffer: VisionBuffer = VisionBuffer()
@@ -202,7 +280,17 @@ class Session:
         `turn_trace` is an optional Langfuse trace handle created by main.py
         right after STT. If provided, Claude and TTS spans are attached to
         it and it is finalized in `_run_response`.
+
+        If a previous response is still running, it is cancelled first to
+        prevent orphaned tasks and overlapping audio.
         """
+        # Cancel any in-flight response before starting a new one.
+        # This prevents orphaned tasks when concurrent callers (STT path,
+        # check-in loop, vision-reactive trigger) race to start a response.
+        if self._response_task is not None and not self._response_task.done():
+            self._cancelled = True
+            self._response_task.cancel()
+            log.info("Previous response task cancelled before starting new one")
         self._cancelled = False
         self._current_turn_trace = turn_trace
         self.stats["total_turns"] += 1
@@ -220,9 +308,31 @@ class Session:
             )
             vision_context = (urgent + "\n\n" + vision_context).strip()
             self._pending_fall_alert = None
+        user_context = self.user_context.as_prompt()
         self._response_task = asyncio.create_task(
-            self._run_response(ws, engine, text, openai_key, vision_context)
+            self._run_response(ws, engine, text, openai_key, vision_context, user_context)
         )
+
+    def _is_reactive_change(self, new_activity: str) -> bool:
+        """Return True if the new activity is 'interesting' and different
+        from the previous observation — worth triggering a proactive response.
+
+        NOTE: This is called AFTER vision_buffer.append(), so the new
+        activity is already the latest entry. We compare against the
+        second-to-last entry to detect actual changes.
+        """
+        low = new_activity.lower()
+        # Check if any reactive keyword appears in the activity text
+        if not any(kw in low for kw in _REACTIVE_ACTIVITIES):
+            return False
+        # Compare against the PREVIOUS entry (second-to-last, since the
+        # new activity was already appended to the buffer by _run_vision)
+        entries = self.vision_buffer.entries
+        if len(entries) >= 2:
+            prev = entries[-2].result.activity.lower()
+            if low == prev:
+                return False
+        return True
 
     def process_frames(
         self,
@@ -301,10 +411,49 @@ class Session:
                     "fall": result.is_fall,
                 },
             )
+
+            # Vision-reactive trigger: if the activity is "interesting"
+            # (waving, standing up, thumbs up, etc.) and Abide isn't
+            # already talking, trigger an immediate proactive response.
+            # Falls have their own dedicated urgent-context path above.
+            if (
+                not result.is_fall
+                and self._engine_ref is not None
+                and self._is_reactive_change(result.activity)
+                and not self.is_responding
+                and not self.is_audible
+                and time.monotonic() - self._last_vision_react_ts >= _VISION_REACT_COOLDOWN_S
+                and ws.client_state == WebSocketState.CONNECTED
+            ):
+                silence = time.monotonic() - self.last_user_speech_ts
+                if silence > 3.0:  # don't interrupt active conversation
+                    self._last_vision_react_ts = time.monotonic()
+                    log.info(
+                        "[VISION-REACT] Activity '%s' detected — triggering proactive response",
+                        result.activity,
+                    )
+                    react_text = (
+                        "[System: You just noticed the user doing something — "
+                        f"'{result.activity}'. React to it naturally in 1 sentence. "
+                        "Be warm and conversational, like noticing what a friend is doing.]"
+                    )
+                    self.start_response(
+                        ws, self._engine_ref, react_text, self._openai_key_ref,
+                    )
         except Exception as e:
             log.error("Vision worker error: %s", e)
 
     # ── Safe WebSocket send helpers ──
+    async def _extract_user_facts(self, engine: ConversationEngine):
+        """Fire-and-forget task: extract user facts from the last exchange."""
+        try:
+            facts = await engine.extract_user_facts()
+            if facts:
+                self.user_context.update(facts)
+                log.info("[CONTEXT] User context updated: %s", self.user_context.as_prompt()[:120])
+        except Exception as e:
+            log.debug("User fact extraction skipped: %s", e)
+
     # The response pipeline can outlive the WebSocket (TTS in flight when the
     # client disconnects). Without these guards, late sends raise
     # "Unexpected ASGI message 'websocket.send' after 'websocket.close'".
@@ -334,6 +483,7 @@ class Session:
         text: str,
         openai_key: str | None,
         vision_context: str = "",
+        user_context: str = "",
     ):
         """Stream Claude + parallel TTS, checking for cancellation."""
         full_response: list[str] = []
@@ -347,7 +497,7 @@ class Session:
             try:
                 await self._safe_send_json(ws, {"type": "status", "state": "thinking"})
 
-                async for chunk in engine.respond(text, vision_context=vision_context):
+                async for chunk in engine.respond(text, vision_context=vision_context, user_context=user_context):
                     if self._cancelled:
                         log.info("Barge-in: stopping Claude stream")
                         break
@@ -525,3 +675,8 @@ class Session:
 
             if not self._cancelled:
                 await self._safe_send_json(ws, {"type": "status", "state": "listening"})
+
+            # Fire-and-forget: extract user facts from the last exchange
+            # and update the persistent UserContext. Non-blocking — the
+            # voice loop is already back to "listening" above.
+            asyncio.create_task(self._extract_user_facts(engine))

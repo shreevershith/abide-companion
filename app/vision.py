@@ -23,7 +23,7 @@ log = logging.getLogger("abide.vision")
 
 CHAT_URL = "https://api.openai.com/v1/chat/completions"
 MODEL = "gpt-4o-mini"
-BUFFER_SIZE = 3  # rolling buffer of last N descriptions
+BUFFER_SIZE = 5  # rolling buffer of last N descriptions (with timestamps for temporal awareness)
 
 VISION_SYSTEM_PROMPT = """\
 You are a vision assistant for an elderly care companion. You will receive \
@@ -170,13 +170,25 @@ class VisionBuffer:
         """Format the buffer for injection into Claude's system prompt.
 
         Only the activity string is passed to Claude — bboxes are UI-only.
-        Returns empty string if there's no history yet.
+        Returns empty string if there's no history yet. Includes relative
+        timestamps so Claude has temporal awareness of activity changes.
         """
         if not self.entries:
             return ""
-        lines = ["Recent camera observations (most recent last):"]
+        now = time.monotonic()
+        lines = ["Recent activity history (most recent last):"]
         for e in self.entries:
-            lines.append(f"- {e.result.activity}")
+            ago = now - e.ts
+            if ago < 10:
+                label = "just now"
+            elif ago < 60:
+                label = f"{int(ago)}s ago"
+            elif ago < 3600:
+                mins = int(ago // 60)
+                label = f"{mins} min ago"
+            else:
+                label = f"{int(ago // 3600)}h ago"
+            lines.append(f"- {label}: {e.result.activity}")
         return "\n".join(lines)
 
     def clear(self):

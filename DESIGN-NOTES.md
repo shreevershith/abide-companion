@@ -135,11 +135,11 @@ Format for each entry:
 - **Alternatives**: Queue (cost risk), block (voice regression), cancel-previous (reasonable, but drop-new is simpler and gives the model a longer "settle" time).
 - **Trade-offs**: We can miss a frame or two during an API slowdown. Not a meaningful accuracy loss — the next tick grabs a fresh frame.
 
-### D19. Rolling 3-description buffer, injected as system-prompt prefix per turn
-- **Decision**: `VisionBuffer` holds the last 3 `SceneResult`s. `as_context()` returns a formatted block that `ConversationEngine.respond()` prepends to the system prompt for that one turn only. The vision buffer is NEVER appended to conversation message history.
-- **Context**: Claude needs *current* situational awareness, not history bloat. Putting scene descriptions in the system prompt (turn-local) keeps token usage flat and ensures the most recent view always dominates.
-- **Alternatives**: Append as user messages (pollutes history), single-turn tool call (over-engineered).
-- **Trade-offs**: Scene context is rebuilt every turn — slight duplication across calls. Worth it for Claude's ability to say "I see you're sitting, how's your day?" naturally.
+### D19. Rolling 5-description buffer with relative timestamps, injected as system-prompt prefix per turn
+- **Decision**: `VisionBuffer` holds the last 5 `SceneResult`s (expanded from 3 for better temporal coverage). `as_context()` returns a formatted block with relative timestamps (e.g., "2 min ago: sitting in chair", "just now: standing up") that `ConversationEngine.respond()` prepends to the system prompt for that one turn only. The vision buffer is NEVER appended to conversation message history.
+- **Context**: Claude needs *current* situational awareness AND temporal context — not just what's happening now, but what the user has been doing. With 5 entries and relative timestamps, Claude can notice activity transitions ("Oh, you were sitting and now you're up — going somewhere?") and reference recent history naturally. Timestamps are computed from `time.monotonic()` deltas and formatted as "just now" (<10s), "Ns ago" (<60s), "N min ago" (<1h), or "Nh ago" (≥1h).
+- **Alternatives**: Append as user messages (pollutes history), single-turn tool call (over-engineered), bare bullets without timestamps (no temporal signal).
+- **Trade-offs**: 5 entries × ~15 tokens each ≈ 75 tokens of system prompt per turn — modest overhead. Scene context is rebuilt every turn. Worth it for Claude's ability to proactively comment on activity changes.
 
 ### D20. Vision prompt: cap at 10 words, forbid appearance/emotion
 - **Decision**: The system prompt explicitly limits activity to ≤10 words and forbids describing clothing, hair, appearance, emotions, mood, or medical conditions.
@@ -233,6 +233,47 @@ Format for each entry:
 ---
 
 ## Post-Phase-7: Code review hardening
+
+### D57. Input validation: sample_rate type coercion and range check
+- **Decision**: `main.py` config handler now wraps `data.get("sample_rate", 48000)` in `int()` coercion with a try/except fallback to 48000. Rejects values outside the range 8000–192000 Hz.
+- **Context**: A client sending `"sample_rate": "not_a_number"` or `"sample_rate": -100` would cause downstream crashes in `np.interp()` resampling. The field was not validated before — it was used directly from the JSON payload.
+- **Trade-offs**: None. Defensive input validation with sensible defaults.
+
+### D56. All WebSocket sends in main.py guarded via Session._safe_send_json()
+- **Decision**: Replaced all 11 bare `ws.send_json()` calls in `main.py`'s WebSocket handler with `Session._safe_send_json(ws, ...)`. The safe helper checks `ws.client_state != WebSocketState.CONNECTED` before sending and silently swallows any exception.
+- **Context (the bug)**: During testing, clicking Stop while a transcription was in-flight produced `ERROR: Cannot call "send" once a close message has been sent`. The WS handler had multiple direct `send_json()` calls that assumed the connection was still open. Session's `_run_response()` already used safe helpers; the main handler did not.
+- **Trade-offs**: Late sends on a closed connection are now silently dropped. This is correct — sending status updates to a dead connection has no useful effect. The INFO log "WS closed during STT, dropping transcript" was added for one specific path; the rest rely on the safe helper's silent drop.
+
+### D55. Concurrent response mutex: start_response() cancels in-flight tasks
+- **Decision**: `start_response()` in `session.py` now checks if a previous `_response_task` is still running and cancels it before starting a new one. Sets `_cancelled = True`, calls `task.cancel()`, then resets `_cancelled = False` for the new task.
+- **Context (the bug)**: Three code paths can call `start_response()` concurrently: (1) user speech → STT → Claude, (2) the 30-second proactive check-in loop, (3) the vision-reactive trigger in `_run_vision()`. Without a mutex, two near-simultaneous calls would orphan the first task — it would keep running with no reference, potentially sending overlapping audio to the WebSocket. The second call would overwrite `_response_task`, making `is_responding` return False even though the first task was still active.
+- **Alternatives**: (a) asyncio.Lock — adds contention, complicates the simple fire-and-forget pattern. (b) Queue-based approach — over-engineered for at most 2-3 concurrent callers. (c) Check `is_responding` before calling — still has a TOCTOU race.
+- **Trade-offs**: The previous response is hard-cancelled, not gracefully drained. If the user's speech and a vision-reactive trigger fire within milliseconds of each other, the user's speech wins (it calls `start_response` after the vision task, cancelling the vision response). This is the correct priority — user speech should always take precedence.
+
+### D54. Vision-reactive proactive responses (immediate trigger on interesting activities)
+- **Decision**: `_run_vision()` in `session.py` now checks each new vision result against a `_REACTIVE_ACTIVITIES` keyword set (waving, thumbs up, standing up, gesturing, dancing, etc.). If the activity is "interesting" AND different from the previous observation AND Abide isn't already responding AND the user has been silent for >3 seconds AND the 15-second cooldown hasn't elapsed, it triggers an immediate `start_response()` with a system-generated prompt asking Claude to react to what it just saw.
+- **Context (the bug)**: During testing, the user waved at the camera but Abide stayed silent until the user spoke. The vision system correctly detected "Waving hand" and stored it in the buffer, but the only response triggers were user speech (STT path) and the 30-second silence timer. A companion in the room would react to a wave immediately.
+- **Guards**: 6-layer gate prevents spam and conflicts: (1) not a fall (falls have their own urgent-context path), (2) engine exists (config has been received), (3) activity is reactive AND changed from previous, (4) not already responding/playing, (5) 15-second cooldown between vision-reactive responses, (6) WebSocket still open, (7) user has been silent >3 seconds.
+- **Alternatives**: (a) Shorter check-in timer (10s instead of 30s) — reduces latency but fires too often on unchanging scenes. (b) Client-side detection that sends a "react" message — adds protocol complexity. (c) Every vision update triggers a response — overwhelming, one response every 3.6 seconds.
+- **Trade-offs**: The 15-second cooldown means a second wave within 15 seconds won't get a reaction. Acceptable — the first reaction covers the social need, and a second "I see you waving" would feel repetitive. The `_engine_ref` / `_openai_key_ref` stored on Session is slightly unclean architecturally but avoids threading engine through every method signature.
+
+### D53. UserContext: persistent user fact extraction and injection
+- **Decision**: Added a `UserContext` dataclass to `session.py` that tracks: `name`, `mentioned_topics`, `preferences`, and `mood_signals`. After each Claude response, a lightweight non-streaming extraction call sends the last 2 turns to Claude with a structured JSON extraction prompt. Results are merged into the persistent context via `UserContext.update()`. The context is injected into every Claude turn via `user_context` parameter on `respond()`, formatted as "What I know about you: - Name: John, - We've talked about: garden, daughter Sarah, - You mentioned you like: morning tea, classical music".
+- **Context**: Without this, Abide has no memory within a session beyond the rolling 20-message history window. A user who says "I'm John" on turn 1 would not be called by name on turn 15 after history truncation. The brief scores "natural conversational flow" — and real companions remember who they're talking to.
+- **Alternatives**: (a) Parse user messages with regex — fragile, misses nuance. (b) Store the full conversation forever — blows up token budget. (c) Use a separate embedding/RAG system — wildly over-engineered for a prototype.
+- **Trade-offs**: The extraction call adds ~500-1500ms of latency after each response, but it's fire-and-forget and non-blocking — the user hears Abide's reply normally while extraction runs in the background. Uses the same persistent HTTP/2 client so no connection overhead. Bounded lists (15 topics, 10 preferences, 5 moods) prevent context from growing unbounded.
+
+### D52. Proactive check-in background task (30-second silence trigger)
+- **Decision**: A background asyncio loop fires every `CHECK_IN_INTERVAL_S` (30 seconds). If the user has been silent for at least that long, Abide is not already responding/playing, and there's vision context available, it calls `session.start_response()` with a system-generated prompt asking Claude to initiate conversation based on what it sees. The task is cancelled on WebSocket disconnect.
+- **Context**: The brief says Abide is "a companion who is actively present and engaged" — but without this, Abide only speaks in response to user speech. A real companion in the room would notice someone sitting quietly and say something. The 30-second interval balances attentiveness (long enough to not be annoying) with presence (short enough that the user feels noticed).
+- **Alternatives**: (a) Client-side timer that sends a "check-in" message — adds protocol complexity. (b) Shorter interval (15s) — too chatty, feels intrusive. (c) Longer interval (60s) — too passive for a demo. (d) Vision-change-triggered instead of timer — more complex, requires diffing scene descriptions.
+- **Trade-offs**: If vision context is empty (camera not working), no check-in fires — Abide stays silent rather than saying something generic. The check-in prompt uses a `[System: ...]` prefix to signal to Claude that this is a system-initiated turn, not user speech. The barge-in mechanism still works normally during check-in responses.
+
+### D51. Proactive vision engagement in Claude system prompt
+- **Decision**: Rewrote the Claude system prompt in `conversation.py` to make vision engagement mandatory, not optional. The old prompt said "You *may* receive context about what the camera sees. Use it naturally... but don't over-describe." The new prompt says "You have a live camera feed. You MUST proactively comment on what you see — don't wait for the user to ask." Two new guidelines reinforce this: always react to camera observations, and notice activity changes between turns.
+- **Context**: During live testing, Abide had all the visual context it needed (the `<camera_observations>` block was populated correctly) but often ignored it, defaulting to generic conversational responses. The old prompt's "may receive" and "don't over-describe" framing gave Claude permission to stay passive. For an elderly care companion, proactive engagement is a core feature — noticing someone standing up, waving, or picking something up is the whole point. The evaluator brief explicitly scores "ability to interpret activity" and "ask clarifying questions."
+- **Alternatives**: (a) Inject a per-turn "You must mention what you see" instruction alongside the vision context — fragile, easily ignored in long conversations. (b) Add a second Claude call dedicated to vision commentary — doubles latency and cost. (c) Make the vision observations part of the user message instead of system prompt — pollutes conversation history.
+- **Trade-offs**: Claude may now occasionally over-comment on unchanging scenes ("I see you're still sitting"). Acceptable — a friend who notices too much is better than one who notices nothing. The 2-3 sentence response guideline naturally constrains verbosity. Combined with D19's temporal timestamps, Claude can also skip redundant comments when the scene hasn't changed.
 
 ### D50. Session summary overlay with Claude-powered accuracy analysis
 - **Decision**: When the user clicks Stop, a full-screen glass-morphism overlay displays four sections: (1) session duration, (2) complete conversation transcript with timestamps, (3) activity log with timestamps (all vision observations and fall alerts), (4) "What Abide Got Right / Wrong" — a Claude-generated analysis of interpretation accuracy. The analysis is a one-shot non-streaming Claude call fired asynchronously after the overlay renders; a spinner shows while it loads, with graceful fallback on failure.
@@ -378,6 +419,11 @@ Format for each entry:
 - ✅ Four-layer Whisper hallucination defense (D41, D48)
 - ✅ Prompt injection defense on vision context
 - ✅ HTTP/2 persistent clients with connection prewarm
+- ✅ Proactive check-in loop — 30s silence trigger initiates conversation from vision (D52)
+- ✅ UserContext fact extraction — remembers name, topics, preferences within session (D53)
+- ✅ Vision-reactive triggers — waving, thumbs up, standing up trigger immediate response (D54)
+- ✅ Concurrent response mutex — prevents orphaned tasks from race conditions (D55)
+- ✅ Safe WebSocket sends — all main.py sends guarded against close races (D56)
 - ❌ Logitech MeetUp pan/tilt (not attempted — would require hardware access layer; explicitly a bonus)
 
 ---

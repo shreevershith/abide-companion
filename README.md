@@ -51,6 +51,13 @@ It runs on one machine with Docker Desktop. You double-click `start.bat`
 - **Live diary** — a tab in the transcript panel showing all events
   (speech, replies, vision observations, alerts) in chronological order
   with timestamps, live-updating during the session.
+- **Proactive check-ins** — if the user is silent for 30 seconds, Abide
+  initiates conversation based on what it sees on camera. It's a companion
+  in the room, not a chatbot waiting for input.
+- **User memory within session** — Abide extracts and remembers the user's
+  name, topics discussed, preferences, and mood signals. These are injected
+  into every Claude turn so responses feel personal ("John, I noticed you're
+  back in your chair — how was your walk?").
 - **Low latency** — target is under 1.5 seconds from end-of-speech to
   first audio response. Achieved via persistent HTTP/2 clients, streaming
   LLM to streaming TTS on sentence boundaries, and parallel TTS
@@ -188,7 +195,7 @@ abide-companion/
 |-- requirements.txt      Python dependencies
 |-- README.md             This file
 |-- README-SETUP.txt      Plain-English setup guide for the evaluator
-|-- DESIGN-NOTES.md       50 architectural decisions with context and trade-offs
+|-- DESIGN-NOTES.md       57 architectural decisions with context and trade-offs
 |-- CLAUDE.md             Developer guidance for Claude Code sessions
 `-- TROUBLESHOOTING.md    10 bugs, root causes, and fixes
 ```
@@ -232,7 +239,7 @@ fire-and-forget background task:
 4. Server sends the batch to GPT-4o-mini with a structured prompt
 5. Response includes: activity description (max 10 words) + bounding box
 6. Result displayed on the frontend: scene chip + canvas overlay
-7. Latest scene description injected into Claude's system prompt
+7. Last 5 scene descriptions with relative timestamps injected into Claude's system prompt
 
 **Activities detected:** sitting, standing, walking, waving, dancing,
 reaching, bending, stretching, folding clothes, putting on a shirt,
@@ -321,7 +328,7 @@ has four layers of defense (see D41, D48, Troubleshooting #8, #10):
 ## Key Design Decisions
 
 These are documented in full with alternatives and trade-offs in
-`DESIGN-NOTES.md` (50 entries across 8+ phases). Highlights:
+`DESIGN-NOTES.md` (57 entries across 8+ phases). Highlights:
 
 - **Single-file frontend, no framework** (D1) — build tools are a cold-start
   liability for a zero-config evaluator experience.
@@ -344,6 +351,26 @@ These are documented in full with alternatives and trade-offs in
   at session end reviews conversation accuracy.
 - **Live diary tab** (D49) — chronological event log mixing speech,
   replies, and vision observations with color-coded type badges.
+- **Proactive vision engagement** (D51) — Claude is instructed to always
+  comment on what it sees, not wait to be asked. Activity changes between
+  turns are noticed and remarked on naturally.
+- **Proactive check-in** (D52) — 30-second silence trigger fires a
+  system-initiated Claude turn based on vision context. Abide doesn't
+  wait for the user to speak first.
+- **UserContext persistence** (D53) — lightweight extraction call after each
+  response extracts user facts (name, topics, preferences, mood) and
+  injects them into every subsequent Claude turn.
+- **Vision-reactive triggers** (D54) — waving, thumbs up, standing up etc.
+  trigger an immediate Claude response within ~4 seconds, not waiting
+  for the 30-second timer or user speech.
+- **Concurrent response mutex** (D55) — `start_response()` cancels any
+  in-flight task before starting a new one, preventing orphaned tasks.
+- **Safe WebSocket sends** (D56) — all 11 `ws.send_json()` calls in
+  `main.py` replaced with `Session._safe_send_json()` to prevent crashes
+  on WebSocket close race conditions.
+- **Temporal activity context** (D19) — last 5 scene descriptions with
+  relative timestamps ("2 min ago: sitting", "just now: standing up")
+  give Claude awareness of what the user has been doing over time.
 
 ---
 
@@ -429,6 +456,7 @@ silent no-op. The voice loop never depends on telemetry.
 | `MIN_SPEECH_SAMPLES` | `audio.py` | 8000 | Min segment length (0.5s at 16kHz) |
 | `MIN_SPEECH_RMS` | `audio.py` | 0.015 | Min segment loudness |
 | `MAX_HISTORY` | `conversation.py` | 20 | Conversation window (messages) |
+| `CHECK_IN_INTERVAL_S` | `main.py` | 30 | Proactive check-in silence threshold (s) |
 | `CAPTURE_INTERVAL_MS` | `index.html` | 1200 | Vision frame capture interval |
 | `SEND_EVERY_N` | `index.html` | 3 | Frames before sending to vision |
 
@@ -451,7 +479,7 @@ Prototype / research code. No license granted.
 ## Further Reading
 
 - `README-SETUP.txt` — one-page setup guide for the end user
-- `DESIGN-NOTES.md` — 50 architectural decisions with context and
+- `DESIGN-NOTES.md` — 57 architectural decisions with context and
   trade-offs across 8+ development phases
 - `TROUBLESHOOTING.md` — 10 bugs, root causes, and fixes
 - `CLAUDE.md` — developer instructions for Claude Code sessions

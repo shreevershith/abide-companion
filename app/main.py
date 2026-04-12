@@ -11,6 +11,7 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.websockets import WebSocketState
 from pathlib import Path
 
 # Load .env BEFORE importing app modules so os.environ has Langfuse
@@ -88,12 +89,17 @@ async def _on_startup() -> None:
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
-    """Flush any pending Langfuse traces before the worker exits.
-    Complements the per-connection flush in websocket_endpoint."""
+    """Flush Langfuse traces and close persistent HTTP clients."""
     try:
         telemetry.flush(telemetry.init_langfuse())
     except Exception:
         pass
+    # Close module-level httpx clients
+    for client_name, client in [("analyze", _analyze_client)]:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 # ── Session analysis endpoint ──
@@ -101,6 +107,10 @@ async def _on_shutdown() -> None:
 # Frontend cannot call the Anthropic API directly (CORS blocked), so this
 # lightweight proxy accepts conversation history + activity log and returns
 # a structured analysis string.
+
+# Persistent HTTP/2 client for the analysis endpoint. Module-level so we
+# don't pay TCP+TLS handshake per call (~300-500ms). Reused across sessions.
+_analyze_client = httpx.AsyncClient(timeout=30.0, http2=True)
 
 ANALYZE_PROMPT = (
     "Review this conversation between Abide (an AI elderly care companion) and a user. "
@@ -145,21 +155,20 @@ async def analyze_session(request: Request) -> JSONResponse:
         user_content += f"\n\nActivity Log (vision observations):\n{activity_log}"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0, http2=True) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 500,
-                    "system": ANALYZE_PROMPT,
-                    "messages": [{"role": "user", "content": user_content}],
-                },
-            )
+        resp = await _analyze_client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 500,
+                "system": ANALYZE_PROMPT,
+                "messages": [{"role": "user", "content": user_content}],
+            },
+        )
         if resp.status_code != 200:
             log.error("Analysis API error %d: %s", resp.status_code, resp.text[:300])
             return JSONResponse({"error": "Claude API error"}, status_code=502)
@@ -207,6 +216,68 @@ async def root():
     return FileResponse(FRONTEND_DIR / "index.html")
 
 
+# ── Proactive check-in ──
+# If the user has been silent for this many seconds, Abide initiates
+# conversation based on what it sees on camera. This makes Abide feel
+# like a present companion, not a passive chatbot waiting for input.
+CHECK_IN_INTERVAL_S = 30
+
+
+async def _proactive_checkin_loop(
+    ws: WebSocket,
+    session: "Session",
+    engine: ConversationEngine,
+    openai_key: str | None,
+):
+    """Background loop that fires every CHECK_IN_INTERVAL_S seconds.
+
+    If the user has been silent and Abide is not already responding,
+    sends a proactive message based on the latest vision context.
+    """
+    while True:
+        try:
+            await asyncio.sleep(CHECK_IN_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+
+        # Guard: don't talk over ourselves or the user
+        if session.is_responding or session.is_audible:
+            continue
+
+        # Guard: only check in if the user has actually been silent
+        silence = time.monotonic() - session.last_user_speech_ts
+        if silence < CHECK_IN_INTERVAL_S:
+            continue
+
+        # Guard: need vision context to say something meaningful
+        vision_ctx = session.vision_buffer.as_context()
+        if not vision_ctx:
+            continue
+
+        # Guard: websocket still open
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
+
+        log.info(
+            "[CHECK-IN] User silent for %.0fs — initiating proactive message",
+            silence,
+        )
+
+        # Use a system-generated prompt that tells Claude to initiate
+        # based on what it sees, not respond to user speech.
+        checkin_text = (
+            "[System: The user has been quiet for a while. "
+            "Based on what you see on camera, say something natural "
+            "to start or continue a conversation. Be warm and brief — "
+            "1 sentence. Don't mention that they've been quiet unless "
+            "it's been a very long time.]"
+        )
+        try:
+            session.start_response(ws, engine, checkin_text, openai_key)
+        except Exception as e:
+            log.error("Proactive check-in failed: %s", e)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -217,6 +288,7 @@ async def websocket_endpoint(ws: WebSocket):
     openai_key: str | None = None
     source_rate: int = 48000
     prev_speech = False
+    checkin_task: asyncio.Task | None = None
 
     # Echo-suppression state
     pending_barge_in_start: float | None = None
@@ -287,10 +359,21 @@ async def websocket_endpoint(ws: WebSocket):
                     groq_key = data.get("groq_api_key")
                     anthropic_key = data.get("anthropic_api_key")
                     openai_key = data.get("openai_api_key")
-                    source_rate = data.get("sample_rate", 48000)
+                    try:
+                        source_rate = int(data.get("sample_rate", 48000))
+                        if source_rate < 8000 or source_rate > 192000:
+                            source_rate = 48000
+                    except (TypeError, ValueError):
+                        source_rate = 48000
 
                     if anthropic_key:
                         engine = ConversationEngine(api_key=anthropic_key)
+
+                    # Store refs on session so vision-reactive triggers
+                    # can call start_response() from _run_vision().
+                    if engine is not None:
+                        session._engine_ref = engine
+                    session._openai_key_ref = openai_key
 
                     log.info(
                         "Config received: rate=%d, groq=%s, anthropic=%s, openai=%s",
@@ -313,7 +396,14 @@ async def websocket_endpoint(ws: WebSocket):
                         t_vision = asyncio.create_task(vision_prewarm(openai_key))
                         t_vision.add_done_callback(_log_prewarm_exception("Vision"))
 
-                    await ws.send_json({"type": "status", "state": "listening"})
+                    # Launch the proactive check-in background loop.
+                    # Every CHECK_IN_INTERVAL_S seconds of user silence, Abide
+                    # initiates conversation based on what it sees on camera.
+                    checkin_task = asyncio.create_task(
+                        _proactive_checkin_loop(ws, session, engine, openai_key)
+                    )
+
+                    await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
 
                 elif msg_type == "frame":
                     # Legacy single-frame message from browser (kept for
@@ -434,7 +524,7 @@ async def websocket_endpoint(ws: WebSocket):
                         state = "hearing" if prev_speech else "listening"
                         # Don't send "listening" if a response is still playing
                         if not (state == "listening" and session.is_audible):
-                            await ws.send_json({"type": "status", "state": state})
+                            await Session._safe_send_json(ws,{"type": "status", "state": state})
 
                 # Sustained-speech check: if we've been seeing speech during a response
                 # for >= SUSTAINED_SPEECH_MS, AND the audio we've collected is loud
@@ -479,10 +569,10 @@ async def websocket_endpoint(ws: WebSocket):
 
                 if wav_bytes is not None:
                     if not groq_key:
-                        await ws.send_json({"type": "error", "message": "Groq API key not set"})
+                        await Session._safe_send_json(ws,{"type": "error", "message": "Groq API key not set"})
                         continue
 
-                    await ws.send_json({"type": "status", "state": "processing"})
+                    await Session._safe_send_json(ws,{"type": "status", "state": "processing"})
                     log.info("Speech segment captured, transcribing...")
 
                     try:
@@ -491,7 +581,12 @@ async def websocket_endpoint(ws: WebSocket):
                         stt_latency_ms = (time.monotonic() - stt_t0) * 1000
                         if text:
                             log.info("Transcript: %s", text)
-                            await ws.send_json({"type": "transcript", "text": text})
+                            session.last_user_speech_ts = time.monotonic()
+                            # Guard: WS may have closed while STT was in flight
+                            if ws.client_state != WebSocketState.CONNECTED:
+                                log.info("WS closed during STT, dropping transcript")
+                                continue
+                            await Session._safe_send_json(ws,{"type": "transcript", "text": text})
 
                             if engine:
                                 # Telemetry: create the parent trace for this turn
@@ -520,29 +615,29 @@ async def websocket_endpoint(ws: WebSocket):
                                     turn_trace=turn_trace,
                                 )
                             else:
-                                await ws.send_json({"type": "error", "message": "Anthropic API key not set"})
+                                await Session._safe_send_json(ws,{"type": "error", "message": "Anthropic API key not set"})
                         else:
                             log.info("Empty transcript, skipping")
                             if not session.is_audible:
-                                await ws.send_json({"type": "status", "state": "listening"})
+                                await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
                     except asyncio.TimeoutError:
                         log.error("Transcription timed out")
-                        await ws.send_json({
+                        await Session._safe_send_json(ws,{
                             "type": "error",
                             "message": "I didn't catch that — please try again.",
                         })
                         if not session.is_audible:
-                            await ws.send_json({"type": "status", "state": "listening"})
+                            await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
                     except Exception as e:
                         # Log the real error server-side but send a safe,
                         # non-leaky message to the client.
                         log.error("Transcription failed: %s", e)
-                        await ws.send_json({
+                        await Session._safe_send_json(ws,{
                             "type": "error",
                             "message": "I'm having trouble hearing you right now. Please try again.",
                         })
                         if not session.is_audible:
-                            await ws.send_json({"type": "status", "state": "listening"})
+                            await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
 
     except WebSocketDisconnect:
         log.info("Client disconnected")
@@ -571,6 +666,10 @@ async def websocket_endpoint(ws: WebSocket):
             telemetry.flush(lf)
         except Exception as e:
             log.debug("Session summary telemetry skipped: %s", e)
+
+        # Cancel proactive check-in loop
+        if checkin_task is not None and not checkin_task.done():
+            checkin_task.cancel()
 
         if engine is not None:
             try:
