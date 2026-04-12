@@ -1,0 +1,44 @@
+# Git / IDE
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+*.swp
+
+# Claude Code local state — never ship
+.claude
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+env
+
+# Secrets — mounted at runtime via docker-compose env_file, not baked in
+.env
+.env.local
+.env.*.local
+
+# Build / packaging outputs
+dist
+build
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Project docs that don't need to be inside the image
+DESIGN-NOTES.md
+TROUBLESHOOTING.md
+tests/
+*.md
+!README-SETUP.txt

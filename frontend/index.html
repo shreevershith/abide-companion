@@ -1,0 +1,1462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Abide Companion</title>
+<style>
+:root {
+    --bg: #0b0d14;
+    --bg-accent: #1a1d2e;
+    --surface: rgba(255, 255, 255, 0.04);
+    --surface-hi: rgba(255, 255, 255, 0.07);
+    --border: rgba(255, 255, 255, 0.08);
+    --border-hi: rgba(255, 255, 255, 0.14);
+    --text: #e7e9f2;
+    --text-dim: #9097a8;
+    --text-dimmer: #5c6375;
+    --indigo: #8b9dff;
+    --indigo-soft: rgba(139, 157, 255, 0.18);
+    --teal: #5fe3c1;
+    --teal-soft: rgba(95, 227, 193, 0.18);
+    --amber: #ffc16b;
+    --rose: #ff7a93;
+    --danger: #ff6478;
+    --radius-lg: 20px;
+    --radius-md: 14px;
+    --radius-sm: 10px;
+    --shadow-lg: 0 30px 80px rgba(0, 0, 0, 0.55);
+    --shadow-md: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body { height: 100%; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
+    background:
+        radial-gradient(ellipse at 50% -10%, #1a1d2e 0%, #0b0d14 55%),
+        var(--bg);
+    color: var(--text);
+    font-size: 18px;
+    line-height: 1.5;
+    min-height: 100vh;
+    overflow-x: hidden;
+}
+
+/* ── Top bar ── */
+.topbar {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 32px;
+    background: rgba(11, 13, 20, 0.6);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+}
+.wordmark {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 18px; font-weight: 600; letter-spacing: -0.01em;
+}
+.wordmark .logo {
+    width: 28px; height: 28px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--indigo), var(--teal));
+    box-shadow: 0 0 20px rgba(139, 157, 255, 0.35);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+}
+.wordmark .subtitle {
+    font-size: 12px; font-weight: 400; color: var(--text-dim);
+    letter-spacing: 0.04em;
+}
+
+/* ── Status pill ── */
+.status-pill {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    font-size: 14px;
+    color: var(--text-dim);
+    transition: all 0.3s ease;
+}
+.status-pill .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--text-dimmer);
+    transition: all 0.3s ease;
+    box-shadow: 0 0 0 0 rgba(0, 0, 0, 0);
+}
+.status-pill.listening .dot { background: var(--teal); box-shadow: 0 0 12px var(--teal-soft); animation: breathe 3s ease-in-out infinite; }
+.status-pill.hearing   .dot { background: var(--amber); box-shadow: 0 0 12px rgba(255, 193, 107, 0.4); animation: pulse-fast 0.7s ease-in-out infinite; }
+.status-pill.processing .dot { background: var(--indigo); animation: pulse-med 1.2s ease-in-out infinite; }
+.status-pill.thinking  .dot { background: var(--indigo); box-shadow: 0 0 12px var(--indigo-soft); animation: pulse-med 1.2s ease-in-out infinite; }
+.status-pill.speaking  .dot { background: var(--teal); box-shadow: 0 0 16px var(--teal-soft); animation: pulse-fast 0.55s ease-in-out infinite; }
+.status-pill.listening, .status-pill.hearing, .status-pill.processing, .status-pill.thinking, .status-pill.speaking {
+    color: var(--text);
+    border-color: var(--border-hi);
+}
+
+@keyframes breathe    { 0%,100% { opacity: 0.55; transform: scale(1); } 50% { opacity: 1; transform: scale(1.15); } }
+@keyframes pulse-fast { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+@keyframes pulse-med  { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* ── Control buttons ── */
+.controls { display: flex; gap: 10px; }
+button {
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    padding: 11px 22px;
+    border-radius: 12px;
+    border: 1px solid var(--border-hi);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    backdrop-filter: blur(8px);
+}
+button:hover:not(:disabled) {
+    background: var(--surface-hi);
+    transform: translateY(-1px);
+}
+button:disabled { opacity: 0.35; cursor: not-allowed; }
+#startBtn {
+    background: linear-gradient(135deg, var(--indigo), #6c7fff);
+    border-color: transparent;
+    box-shadow: 0 6px 20px rgba(108, 127, 255, 0.35);
+}
+#startBtn:hover:not(:disabled) { box-shadow: 0 8px 28px rgba(108, 127, 255, 0.5); }
+#stopBtn { }
+
+/* ── Main layout ── */
+main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 36px 32px 120px;
+}
+
+/* ── Hero video section ── */
+.hero {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    max-height: 72vh;
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background: #05060b;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-lg);
+    margin-bottom: 32px;
+}
+.hero::before {
+    /* outer glow accent */
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: calc(var(--radius-lg) + 2px);
+    background: linear-gradient(135deg, rgba(139,157,255,0.25), rgba(95,227,193,0.18));
+    z-index: -1;
+    filter: blur(24px);
+    opacity: 0.55;
+    pointer-events: none;
+    transition: opacity 0.4s ease;
+}
+.hero.speaking::before { opacity: 0.85; }
+
+#videoPreview {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    background: #000;
+    display: block;
+    /* mirror horizontally — feels natural for a self-view */
+    transform: scaleX(-1);
+}
+#videoPreview.hidden { display: none; }
+
+/* Bounding box canvas sits on top of the video, same size.
+   We mirror it to match the mirrored video so bboxes line up visually. */
+#videoOverlay {
+    position: absolute;
+    inset: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    transform: scaleX(-1);
+}
+
+/* Mic-level ring pulse along the video border */
+.mic-ring {
+    position: absolute; inset: 0;
+    border-radius: var(--radius-lg);
+    pointer-events: none;
+    box-shadow: 0 0 0 0 rgba(95, 227, 193, 0) inset;
+    transition: box-shadow 80ms linear;
+}
+
+/* Scene glass chip overlaid on the video bottom */
+.scene-chip {
+    position: absolute;
+    left: 20px;
+    right: 20px;
+    bottom: 20px;
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: rgba(11, 13, 20, 0.62);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    color: var(--text);
+    font-size: 15px;
+    box-shadow: var(--shadow-md);
+    max-width: 70%;
+}
+.scene-chip .icon {
+    flex-shrink: 0;
+    width: 28px; height: 28px;
+    border-radius: 8px;
+    background: var(--indigo-soft);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+}
+.scene-chip .scene-label {
+    font-size: 10px; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em; display: block;
+    margin-bottom: 2px;
+}
+.scene-chip .scene-text { color: var(--text); font-weight: 500; }
+.scene-chip.empty .scene-text { color: var(--text-dim); font-style: italic; font-weight: 400; }
+
+/* Camera-unavailable notice */
+.vision-notice {
+    display: none;
+    margin-bottom: 20px;
+    padding: 12px 18px;
+    background: rgba(255, 193, 107, 0.08);
+    border: 1px solid rgba(255, 193, 107, 0.3);
+    border-radius: var(--radius-md);
+    color: var(--amber);
+    font-size: 14px;
+}
+.vision-notice.show { display: block; }
+
+/* Fall alert banner — red, top of main, only shown on fall event */
+.fall-alert {
+    display: none;
+    margin-bottom: 20px;
+    padding: 16px 20px;
+    background: linear-gradient(135deg, rgba(255, 100, 120, 0.18), rgba(255, 100, 120, 0.08));
+    border: 1px solid rgba(255, 100, 120, 0.55);
+    border-radius: var(--radius-md);
+    color: #ffd8df;
+    font-size: 15px;
+    font-weight: 500;
+    box-shadow: 0 0 30px rgba(255, 100, 120, 0.22);
+    animation: fall-pulse 1.8s ease-in-out infinite;
+}
+.fall-alert.show { display: flex; align-items: center; gap: 14px; }
+.fall-alert .icon {
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    background: rgba(255, 100, 120, 0.25);
+    border: 1px solid rgba(255, 100, 120, 0.6);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 700;
+    color: #ff8fa0;
+    flex-shrink: 0;
+}
+.fall-alert .label {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+    color: #ff9fb0; text-transform: uppercase; display: block; margin-bottom: 2px;
+}
+.fall-alert .text { color: #ffe4e9; }
+@keyframes fall-pulse {
+    0%, 100% { box-shadow: 0 0 24px rgba(255, 100, 120, 0.18); }
+    50%      { box-shadow: 0 0 44px rgba(255, 100, 120, 0.38); }
+}
+
+/* ── Transcript panel ── */
+.transcript-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    backdrop-filter: blur(8px);
+    overflow: hidden;
+}
+.transcript-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 22px;
+    border-bottom: 1px solid var(--border);
+}
+.transcript-header h2 {
+    font-size: 13px; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em;
+}
+.transcript-header .toggle {
+    font-size: 13px;
+    color: var(--text-dim);
+    padding: 6px 12px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+.transcript-header .toggle:hover { background: var(--surface-hi); }
+
+#transcript {
+    padding: 20px 22px;
+    max-height: 420px;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+}
+.transcript-panel.collapsed #transcript { display: none; }
+.transcript-panel.collapsed .transcript-header { border-bottom: none; }
+
+#transcript .empty {
+    color: var(--text-dimmer);
+    font-style: italic;
+    text-align: center;
+    padding: 30px 0;
+}
+
+.msg {
+    padding: 12px 16px;
+    border-radius: var(--radius-md);
+    margin-bottom: 10px;
+    max-width: 82%;
+    word-wrap: break-word;
+    border: 1px solid var(--border);
+    backdrop-filter: blur(4px);
+    animation: msg-in 0.25s ease;
+}
+@keyframes msg-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.msg .label {
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    display: block; margin-bottom: 4px;
+}
+.msg .time {
+    color: var(--text-dimmer); font-size: 11px; margin-left: 8px; font-weight: 400;
+}
+.msg.user {
+    margin-left: auto;
+    background: linear-gradient(135deg, rgba(139,157,255,0.15), rgba(139,157,255,0.08));
+    border-color: rgba(139,157,255,0.25);
+    border-bottom-right-radius: 4px;
+}
+.msg.user .label { color: var(--indigo); }
+.msg.assistant {
+    margin-right: auto;
+    background: linear-gradient(135deg, rgba(95,227,193,0.12), rgba(95,227,193,0.05));
+    border-color: rgba(95,227,193,0.22);
+    border-bottom-left-radius: 4px;
+}
+.msg.assistant .label { color: var(--teal); }
+
+/* ── Error line ── */
+.error-msg {
+    color: var(--danger);
+    font-size: 13px;
+    margin-top: 12px;
+    min-height: 18px;
+}
+
+/* ── API key drawer (bottom right) ── */
+.key-drawer {
+    position: fixed;
+    bottom: 24px; right: 24px;
+    z-index: 30;
+}
+.key-drawer .gear {
+    width: 46px; height: 46px; border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border-hi);
+    backdrop-filter: blur(10px);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    font-size: 20px;
+    transition: transform 0.2s ease, background 0.2s ease;
+    box-shadow: var(--shadow-md);
+}
+.key-drawer .gear:hover { transform: rotate(30deg); background: var(--surface-hi); }
+.key-drawer .panel {
+    position: absolute;
+    bottom: 58px; right: 0;
+    width: 340px;
+    background: rgba(11, 13, 20, 0.85);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--border-hi);
+    border-radius: var(--radius-md);
+    padding: 18px;
+    box-shadow: var(--shadow-lg);
+    opacity: 0; pointer-events: none;
+    transform: translateY(8px) scale(0.98);
+    transition: all 0.2s ease;
+}
+.key-drawer.open .panel {
+    opacity: 1; pointer-events: auto;
+    transform: translateY(0) scale(1);
+}
+.key-drawer h3 {
+    font-size: 12px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin-bottom: 12px;
+}
+.key-field { margin-bottom: 12px; }
+.key-field:last-of-type { margin-bottom: 0; }
+.key-field label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 5px;
+}
+.key-field input {
+    width: 100%;
+    padding: 9px 12px;
+    font-size: 13px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    outline: none;
+    transition: border-color 0.15s ease;
+}
+.key-field input:focus { border-color: var(--indigo); }
+.key-field .saved {
+    font-size: 11px; color: var(--teal);
+    opacity: 0; transition: opacity 0.3s ease;
+    display: inline-block; margin-left: 6px;
+}
+.key-field .saved.show { opacity: 1; }
+
+/* ── Responsive tweaks ── */
+@media (max-width: 680px) {
+    .topbar { padding: 14px 18px; }
+    main { padding: 24px 18px 120px; }
+    .wordmark .subtitle { display: none; }
+    .scene-chip { max-width: 88%; left: 12px; right: 12px; bottom: 12px; padding: 11px 14px; }
+    .key-drawer .panel { width: 300px; }
+    button { padding: 10px 16px; font-size: 14px; }
+}
+
+/* Accessibility: focus rings */
+button:focus-visible, input:focus-visible, .gear:focus-visible {
+    outline: 2px solid var(--indigo);
+    outline-offset: 2px;
+}
+
+/* Hide until JS hydrates to avoid flash */
+.sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
+/* ── Transcript tabs ── */
+.transcript-tabs { display: flex; gap: 4px; }
+.tab-btn {
+    font-size: 13px; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    padding: 6px 14px; background: transparent;
+    border: 1px solid transparent; border-radius: 8px; cursor: pointer;
+    transition: all 0.15s ease;
+}
+.tab-btn:hover { background: var(--surface-hi); }
+.tab-btn.active { color: var(--text); background: var(--surface-hi); border-color: var(--border); }
+
+/* ── Diary tab ── */
+#diary {
+    padding: 20px 22px; max-height: 420px;
+    overflow-y: auto; scroll-behavior: smooth;
+}
+#diary .empty {
+    color: var(--text-dimmer); font-style: italic;
+    text-align: center; padding: 30px 0;
+}
+.transcript-panel.collapsed #diary { display: none; }
+
+.diary-entry {
+    padding: 10px 14px; border-radius: var(--radius-sm);
+    margin-bottom: 8px; border: 1px solid var(--border);
+    backdrop-filter: blur(4px); animation: msg-in 0.25s ease;
+    font-size: 14px; line-height: 1.5;
+}
+.diary-entry .diary-time {
+    font-size: 11px; color: var(--text-dimmer);
+    margin-right: 8px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.diary-entry .diary-type {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.06em; padding: 2px 6px; border-radius: 4px;
+    margin-right: 8px; display: inline-block;
+}
+.diary-entry.type-user { background: rgba(139,157,255,0.08); border-color: rgba(139,157,255,0.18); }
+.diary-entry.type-user .diary-type { color: var(--indigo); background: var(--indigo-soft); }
+.diary-entry.type-assistant { background: rgba(95,227,193,0.06); border-color: rgba(95,227,193,0.15); }
+.diary-entry.type-assistant .diary-type { color: var(--teal); background: var(--teal-soft); }
+.diary-entry.type-activity { background: rgba(255,193,107,0.06); border-color: rgba(255,193,107,0.15); }
+.diary-entry.type-activity .diary-type { color: var(--amber); background: rgba(255,193,107,0.18); }
+.diary-entry.type-alert, .diary-entry.type-fall { background: rgba(255,122,147,0.06); border-color: rgba(255,122,147,0.15); }
+.diary-entry.type-alert .diary-type, .diary-entry.type-fall .diary-type { color: var(--rose); background: rgba(255,122,147,0.18); }
+
+/* ── Session summary overlay ── */
+.summary-overlay {
+    display: none; position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    justify-content: center; align-items: flex-start;
+    padding: 32px; overflow-y: auto;
+}
+.summary-overlay.show { display: flex; }
+.summary-modal {
+    width: 100%; max-width: 720px; margin: auto;
+    background: rgba(26,29,46,0.95); backdrop-filter: blur(20px);
+    border: 1px solid var(--border-hi); border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg); display: flex; flex-direction: column;
+}
+.summary-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 24px; border-bottom: 1px solid var(--border);
+}
+.summary-header h2 { font-size: 18px; font-weight: 600; }
+.summary-close {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text-dim); font-size: 20px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s ease;
+}
+.summary-close:hover { background: var(--surface-hi); color: var(--text); }
+.summary-body { padding: 24px; }
+.summary-section { margin-bottom: 24px; }
+.summary-section:last-child { margin-bottom: 0; }
+.summary-section h3 {
+    font-size: 12px; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;
+}
+.summary-section > p { font-size: 15px; color: var(--text); }
+.summary-note { font-size: 13px; color: var(--text-dim); font-style: italic; margin-bottom: 10px; }
+.summary-scroll {
+    max-height: 220px; overflow-y: auto; padding: 12px 16px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.summary-item {
+    padding: 6px 0; border-bottom: 1px solid var(--border);
+    font-size: 14px; line-height: 1.5;
+}
+.summary-item:last-child { border-bottom: none; }
+.summary-item .time { color: var(--text-dimmer); font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
+.summary-item .type-label {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em; margin-right: 6px;
+}
+.summary-empty { color: var(--text-dimmer); font-style: italic; text-align: center; padding: 12px 0; }
+.summary-analysis { white-space: pre-wrap; font-size: 14px; line-height: 1.6; color: var(--text); }
+.summary-spinner {
+    display: flex; align-items: center; gap: 10px;
+    color: var(--text-dim); font-size: 14px; padding: 16px 0;
+}
+.summary-spinner::before {
+    content: ""; width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid var(--border); border-top-color: var(--indigo);
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+    <div class="wordmark">
+        <div class="logo">◇</div>
+        <div>Abide Companion</div>
+    </div>
+    <div class="status-pill" id="statusPill">
+        <span class="dot"></span>
+        <span id="status">Ready</span>
+    </div>
+    <div class="controls">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+    </div>
+</header>
+
+<main>
+    <div class="vision-notice" id="visionNotice">
+        Camera is off — running in voice-only mode. You can still talk with Abide.
+    </div>
+
+    <div class="fall-alert" id="fallAlert" role="alert">
+        <div class="icon">!</div>
+        <div>
+            <span class="label">Possible fall detected</span>
+            <div class="text" id="fallAlertText">Checking in with you…</div>
+        </div>
+    </div>
+
+    <section class="hero" id="hero">
+        <video id="videoPreview" autoplay muted playsinline></video>
+        <canvas id="videoOverlay"></canvas>
+        <div class="mic-ring" id="micRing"></div>
+        <div class="scene-chip empty" id="sceneChip">
+            <div class="icon">◉</div>
+            <div>
+                <span class="scene-label">What I see</span>
+                <div class="scene-text" id="scene">Waiting for camera...</div>
+            </div>
+        </div>
+    </section>
+
+    <section class="transcript-panel" id="transcriptPanel">
+        <div class="transcript-header">
+            <div class="transcript-tabs">
+                <button class="tab-btn active" id="tabConversation">Conversation</button>
+                <button class="tab-btn" id="tabDiary">Diary</button>
+            </div>
+            <button class="toggle" id="transcriptToggle">Hide</button>
+        </div>
+        <div id="transcript"><div class="empty">Press Start and speak to begin a conversation.</div></div>
+        <div id="diary" style="display:none;"><div class="empty">Diary entries will appear here during the session.</div></div>
+    </section>
+
+    <div class="error-msg" id="errorMsg"></div>
+</main>
+
+<!-- API key drawer -->
+<div class="key-drawer" id="keyDrawer">
+    <div class="gear" id="keyGear" title="API keys" tabindex="0">⚙</div>
+    <div class="panel">
+        <h3>API Keys</h3>
+        <div class="key-field">
+            <label>Groq <span class="saved" id="groqSaved">Saved</span></label>
+            <input type="password" id="groqKey" placeholder="gsk_...">
+        </div>
+        <div class="key-field">
+            <label>Anthropic <span class="saved" id="anthropicSaved">Saved</span></label>
+            <input type="password" id="anthropicKey" placeholder="sk-ant-...">
+        </div>
+        <div class="key-field">
+            <label>OpenAI <span class="saved" id="openaiSaved">Saved</span></label>
+            <input type="password" id="openaiKey" placeholder="sk-...">
+        </div>
+    </div>
+</div>
+
+<!-- Session summary overlay -->
+<div class="summary-overlay" id="summaryOverlay">
+    <div class="summary-modal">
+        <div class="summary-header">
+            <h2>Session Summary</h2>
+            <button class="summary-close" id="summaryClose">&times;</button>
+        </div>
+        <div class="summary-body">
+            <div class="summary-section">
+                <h3>Duration</h3>
+                <p id="summaryDuration"></p>
+            </div>
+            <div class="summary-section">
+                <h3>Conversation Transcript</h3>
+                <div id="summaryTranscript" class="summary-scroll"></div>
+            </div>
+            <div class="summary-section">
+                <h3>Activity Log</h3>
+                <div id="summaryActivities" class="summary-scroll"></div>
+            </div>
+            <div class="summary-section">
+                <h3>What Abide Got Right / Wrong</h3>
+                <div id="summaryAnalysis" class="summary-scroll">
+                    <div class="summary-spinner">Analyzing session with Claude…</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const CHUNK_SIZE = 2048;
+
+// Vision sampling: capture 1 JPEG every CAPTURE_INTERVAL_MS, maintain a
+// ring buffer of the last FRAMES_PER_CALL frames, send the whole buffer
+// to the server every SEND_EVERY_N captures. Net: one vision API call
+// every (CAPTURE_INTERVAL_MS * SEND_EVERY_N) ms, each call containing
+// FRAMES_PER_CALL consecutive frames ~CAPTURE_INTERVAL_MS apart.
+const CAPTURE_INTERVAL_MS = 1200;
+const FRAMES_PER_CALL = 3;
+const SEND_EVERY_N = 3;
+
+let audioCtx, micStream, workletNode, ws;
+let currentAssistantMsg = null;
+
+// ── Session diary & summary state ──
+let sessionStartTime = null;
+let diaryEntries = []; // { timestamp: Date, type: "user"|"assistant"|"activity"|"alert"|"fall", content: string }
+
+// ── Vision state ──
+let videoStream = null;
+let frameTimer = null;
+let frameCanvas = null;
+let frameCtx = null;
+// Ring buffer of the most recent base64 JPEG strings, oldest → newest.
+let frameRing = [];
+let captureCounter = 0;
+
+// ── Latest bbox (normalized 0-1), redrawn when video resizes ──
+let latestBBox = null;
+let latestActivity = "";
+
+// ── TTS playback queue (Web Audio API) ──
+// rawQueue holds raw ArrayBuffers in the exact order the server sent them.
+// We decode strictly sequentially — decodeAudioData is async and its
+// callbacks fire in completion order, not queue order, so parallel decoding
+// causes sentences to play out of order or be skipped entirely.
+let rawQueue = [];
+let isProcessing = false;
+let playbackEpoch = 0;      // bumped on barge-in so in-flight decodes drop their result
+let currentSource = null;   // active AudioBufferSourceNode
+
+// Tracks whether we've told the server we're currently playing audio.
+// Sent to the server as playback_start / playback_end JSON messages on
+// state transitions. The server uses this to gate barge-in correctly
+// even during the window where its own response task has already
+// finished but the client still has buffered audio to play back.
+// Without this signal, barge-in goes "deaf" for the 5-15 seconds that
+// a multi-sentence response takes to actually play out on the speakers.
+let audibleState = false;
+
+// ── DOM refs ──
+const $startBtn = document.getElementById("startBtn");
+const $stopBtn  = document.getElementById("stopBtn");
+const $status   = document.getElementById("status");
+const $statusPill = document.getElementById("statusPill");
+const $transcript = document.getElementById("transcript");
+const $transcriptPanel = document.getElementById("transcriptPanel");
+const $transcriptToggle = document.getElementById("transcriptToggle");
+const $groqKey  = document.getElementById("groqKey");
+const $anthropicKey = document.getElementById("anthropicKey");
+const $openaiKey = document.getElementById("openaiKey");
+const $groqSaved = document.getElementById("groqSaved");
+const $anthropicSaved = document.getElementById("anthropicSaved");
+const $openaiSaved = document.getElementById("openaiSaved");
+const $error    = document.getElementById("errorMsg");
+const $video    = document.getElementById("videoPreview");
+const $overlay  = document.getElementById("videoOverlay");
+const $scene    = document.getElementById("scene");
+const $sceneChip = document.getElementById("sceneChip");
+const $visionNotice = document.getElementById("visionNotice");
+const $fallAlert = document.getElementById("fallAlert");
+const $fallAlertText = document.getElementById("fallAlertText");
+let fallAlertHideTimer = null;
+const $hero     = document.getElementById("hero");
+const $micRing  = document.getElementById("micRing");
+const $keyDrawer = document.getElementById("keyDrawer");
+const $keyGear  = document.getElementById("keyGear");
+const $diary    = document.getElementById("diary");
+const $tabConversation = document.getElementById("tabConversation");
+const $tabDiary = document.getElementById("tabDiary");
+const $summaryOverlay = document.getElementById("summaryOverlay");
+
+// ── API key persistence ──
+$groqKey.value = localStorage.getItem("groq_api_key") || "";
+$anthropicKey.value = localStorage.getItem("anthropic_api_key") || "";
+$openaiKey.value = localStorage.getItem("openai_api_key") || "";
+
+function bindKeyInput(input, storageKey, indicator) {
+    input.addEventListener("input", () => {
+        localStorage.setItem(storageKey, input.value);
+        indicator.classList.add("show");
+        setTimeout(() => indicator.classList.remove("show"), 1500);
+    });
+}
+bindKeyInput($groqKey, "groq_api_key", $groqSaved);
+bindKeyInput($anthropicKey, "anthropic_api_key", $anthropicSaved);
+bindKeyInput($openaiKey, "openai_api_key", $openaiSaved);
+
+// ── Key drawer toggle ──
+$keyGear.addEventListener("click", () => $keyDrawer.classList.toggle("open"));
+$keyGear.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $keyDrawer.classList.toggle("open"); }
+});
+document.addEventListener("click", (e) => {
+    if (!$keyDrawer.contains(e.target)) $keyDrawer.classList.remove("open");
+});
+// Auto-open the drawer on first load if any key is missing, to guide the user.
+if (!$groqKey.value || !$anthropicKey.value || !$openaiKey.value) {
+    $keyDrawer.classList.add("open");
+}
+
+// ── Transcript collapse ──
+$transcriptToggle.addEventListener("click", () => {
+    const collapsed = $transcriptPanel.classList.toggle("collapsed");
+    $transcriptToggle.textContent = collapsed ? "Show" : "Hide";
+});
+
+// ── Tab switching (Conversation / Diary) ──
+function switchTab(tabName) {
+    if (tabName === "conversation") {
+        $transcript.style.display = "";
+        $diary.style.display = "none";
+        $tabConversation.classList.add("active");
+        $tabDiary.classList.remove("active");
+    } else {
+        $transcript.style.display = "none";
+        $diary.style.display = "";
+        $tabConversation.classList.remove("active");
+        $tabDiary.classList.add("active");
+        $diary.scrollTop = $diary.scrollHeight;
+    }
+}
+$tabConversation.addEventListener("click", () => switchTab("conversation"));
+$tabDiary.addEventListener("click", () => switchTab("diary"));
+
+// ── Diary helpers ──
+const _diaryTypeLabels = { user: "You", assistant: "Abide", activity: "Vision", alert: "Alert", fall: "Fall" };
+
+function addDiaryEntry(type, content) {
+    const entry = { timestamp: new Date(), type, content };
+    diaryEntries.push(entry);
+    renderDiaryEntry(entry);
+}
+
+function renderDiaryEntry(entry) {
+    const emptyEl = $diary.querySelector(".empty");
+    if (emptyEl) emptyEl.remove();
+
+    const div = document.createElement("div");
+    div.className = "diary-entry type-" + entry.type;
+    const time = entry.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    div.innerHTML =
+        '<span class="diary-time">' + time + "</span>" +
+        '<span class="diary-type">' + (_diaryTypeLabels[entry.type] || entry.type) + "</span>" +
+        '<span class="diary-content">' + escapeHtml(entry.content) + "</span>";
+    $diary.appendChild(div);
+    if ($diary.style.display !== "none") {
+        $diary.scrollTop = $diary.scrollHeight;
+    }
+}
+
+// ── Status ──
+function setStatus(text, cls) {
+    $status.textContent = text;
+    $statusPill.className = "status-pill" + (cls ? " " + cls : "");
+    if (cls === "speaking") $hero.classList.add("speaking");
+    else $hero.classList.remove("speaking");
+}
+
+// ── Transcript helpers ──
+function clearEmpty() {
+    const e = $transcript.querySelector(".empty");
+    if (e) e.remove();
+}
+function addUserMsg(text) {
+    clearEmpty();
+    const div = document.createElement("div");
+    div.className = "msg user";
+    const time = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    div.innerHTML = `<span class="label">You<span class="time">${time}</span></span>${escapeHtml(text)}`;
+    $transcript.appendChild(div);
+    $transcript.scrollTop = $transcript.scrollHeight;
+    addDiaryEntry("user", text);
+}
+function startAssistantMsg() {
+    clearEmpty();
+    const div = document.createElement("div");
+    div.className = "msg assistant";
+    const time = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    div.innerHTML = `<span class="label">Abide<span class="time">${time}</span></span><span class="text"></span>`;
+    $transcript.appendChild(div);
+    currentAssistantMsg = div.querySelector(".text");
+    $transcript.scrollTop = $transcript.scrollHeight;
+}
+function appendAssistantChunk(text) {
+    if (!currentAssistantMsg) startAssistantMsg();
+    currentAssistantMsg.textContent += text;
+    $transcript.scrollTop = $transcript.scrollHeight;
+}
+function finalizeAssistantMsg() {
+    if (currentAssistantMsg) addDiaryEntry("assistant", currentAssistantMsg.textContent);
+    currentAssistantMsg = null;
+}
+function escapeHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+// ── Web Audio TTS playback (strictly sequential) ──
+
+// Tell the server when we're currently audible (playing buffered audio)
+// so it can fire barge-in even after its own response task has finished.
+// Idempotent: only sends a message on actual state transitions.
+function setAudibleState(on) {
+    if (on === audibleState) return;
+    audibleState = on;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+            ws.send(JSON.stringify({
+                type: on ? "playback_start" : "playback_end"
+            }));
+        } catch (e) {
+            console.warn("playback state send failed:", e);
+        }
+    }
+}
+
+function queueAudio(arrayBuffer) {
+    if (!audioCtx) return;
+    rawQueue.push(arrayBuffer);
+    if (!isProcessing) processNextAudio();
+}
+async function processNextAudio() {
+    if (rawQueue.length === 0) {
+        isProcessing = false;
+        currentSource = null;
+        // Transition back to idle — tell the server playback has ended
+        // so barge-in is no longer gated on this pseudo-state.
+        setAudibleState(false);
+        return;
+    }
+    // Transition to audible — idempotent, only fires once per run.
+    setAudibleState(true);
+    isProcessing = true;
+    const buf = rawQueue.shift();
+    const epoch = playbackEpoch;
+
+    let decoded;
+    try {
+        decoded = await audioCtx.decodeAudioData(buf.slice(0));
+    } catch (err) {
+        console.error("Audio decode error:", err);
+        processNextAudio();
+        return;
+    }
+    if (epoch !== playbackEpoch) {
+        // Barge-in fired while we were decoding — drop this clip.
+        processNextAudio();
+        return;
+    }
+    const source = audioCtx.createBufferSource();
+    source.buffer = decoded;
+    source.connect(audioCtx.destination);
+    currentSource = source;
+    source.onended = () => {
+        if (currentSource === source) currentSource = null;
+        processNextAudio();
+    };
+    source.start(0);
+}
+function stopPlayback() {
+    playbackEpoch++;
+    if (currentSource) {
+        try { currentSource.stop(); } catch(e) {}
+        currentSource = null;
+    }
+    rawQueue = [];
+    isProcessing = false;
+    // Tell the server we're no longer playing — the server also clears
+    // its own client_playing flag when it fires a barge-in, so this is
+    // belt-and-suspenders, but it's essential for the Stop button path.
+    setAudibleState(false);
+}
+
+// ── Bounding box overlay ──
+function syncOverlaySize() {
+    if (!$video || !$overlay) return;
+    const rect = $video.getBoundingClientRect();
+    // Use intrinsic pixels for sharper lines on HiDPI
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    $overlay.width  = Math.max(1, Math.round(rect.width  * dpr));
+    $overlay.height = Math.max(1, Math.round(rect.height * dpr));
+    $overlay.style.width  = rect.width + "px";
+    $overlay.style.height = rect.height + "px";
+    drawOverlay();
+}
+
+function drawOverlay() {
+    if (!$overlay) return;
+    const ctx = $overlay.getContext("2d");
+    const W = $overlay.width;
+    const H = $overlay.height;
+    ctx.clearRect(0, 0, W, H);
+    if (!latestBBox || latestBBox.length !== 4) return;
+
+    const [x1, y1, x2, y2] = latestBBox;
+    const bx = x1 * W;
+    const by = y1 * H;
+    const bw = Math.max(2, (x2 - x1) * W);
+    const bh = Math.max(2, (y2 - y1) * H);
+
+    // Translucent fill
+    ctx.fillStyle = "rgba(139, 157, 255, 0.14)";
+    ctx.fillRect(bx, by, bw, bh);
+
+    // Border — dashed, soft indigo
+    ctx.lineWidth = Math.max(2, Math.round(3 * (W / 640)));
+    ctx.strokeStyle = "rgba(139, 157, 255, 0.92)";
+    ctx.setLineDash([Math.round(10 * (W / 640)), Math.round(6 * (W / 640))]);
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.setLineDash([]);
+
+    // Corner ticks (gives it a "tracking" feel)
+    const tick = Math.max(8, Math.round(14 * (W / 640)));
+    ctx.lineWidth = Math.max(3, Math.round(4 * (W / 640)));
+    ctx.strokeStyle = "rgba(95, 227, 193, 0.95)";
+    // Top-left
+    ctx.beginPath();
+    ctx.moveTo(bx, by + tick); ctx.lineTo(bx, by); ctx.lineTo(bx + tick, by);
+    // Top-right
+    ctx.moveTo(bx + bw - tick, by); ctx.lineTo(bx + bw, by); ctx.lineTo(bx + bw, by + tick);
+    // Bottom-left
+    ctx.moveTo(bx, by + bh - tick); ctx.lineTo(bx, by + bh); ctx.lineTo(bx + tick, by + bh);
+    // Bottom-right
+    ctx.moveTo(bx + bw - tick, by + bh); ctx.lineTo(bx + bw, by + bh); ctx.lineTo(bx + bw, by + bh - tick);
+    ctx.stroke();
+
+    // Label chip — note: overlay is mirrored (scaleX(-1)) for alignment with
+    // the mirrored video. We flip the text back so it reads left-to-right.
+    if (latestActivity) {
+        const label = latestActivity.length > 36 ? latestActivity.slice(0, 34) + "…" : latestActivity;
+        ctx.save();
+        // Flip the text horizontally so it's human-readable despite the overlay mirror.
+        // We translate to the right edge of the box, then scale(-1, 1).
+        const fontPx = Math.max(11, Math.round(13 * (W / 640)));
+        ctx.font = `600 ${fontPx}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+        const pad = Math.round(fontPx * 0.65);
+        const metrics = ctx.measureText(label);
+        const chipW = metrics.width + pad * 2;
+        const chipH = fontPx + pad;
+        const chipX = bx;
+        const chipY = Math.max(0, by - chipH - 4);
+
+        // Chip background
+        ctx.fillStyle = "rgba(11, 13, 20, 0.82)";
+        ctx.strokeStyle = "rgba(139, 157, 255, 0.4)";
+        ctx.lineWidth = 1;
+        roundRect(ctx, chipX, chipY, chipW, chipH, 6);
+        ctx.fill();
+        ctx.stroke();
+
+        // Mirror text back
+        ctx.translate(chipX + chipW, chipY + chipH / 2);
+        ctx.scale(-1, 1);
+        ctx.fillStyle = "#e7e9f2";
+        ctx.textBaseline = "middle";
+        ctx.fillText(label, pad, 1);
+        ctx.restore();
+    }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+}
+
+// Keep the overlay canvas sized to match the video at all times.
+const resizeObs = new ResizeObserver(syncOverlaySize);
+resizeObs.observe($video);
+window.addEventListener("resize", syncOverlaySize);
+$video.addEventListener("loadedmetadata", syncOverlaySize);
+
+// ── Vision: frame capture loop (ring buffer → multi-frame send) ──
+async function startVision() {
+    try {
+        videoStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }
+        });
+    } catch (err) {
+        console.warn("Camera permission denied or unavailable:", err);
+        $video.classList.add("hidden");
+        $visionNotice.classList.add("show");
+        $sceneChip.classList.remove("empty");
+        $scene.textContent = "Camera unavailable";
+        return false;
+    }
+
+    $video.srcObject = videoStream;
+    frameCanvas = document.createElement("canvas");
+    frameCanvas.width = 512;
+    frameCanvas.height = 384;
+    frameCtx = frameCanvas.getContext("2d");
+    frameRing = [];
+    captureCounter = 0;
+    $sceneChip.classList.remove("empty");
+    $scene.textContent = "Looking...";
+    syncOverlaySize();
+
+    frameTimer = setInterval(captureFrameTick, CAPTURE_INTERVAL_MS);
+    // Warm up the ring with an initial capture shortly after permission.
+    setTimeout(captureFrameTick, 600);
+    return true;
+}
+
+// Each tick: capture one frame to the ring buffer. Every SEND_EVERY_N
+// ticks, send the full ring to the server as a multi-frame batch.
+function captureFrameTick() {
+    if (!videoStream || !frameCtx || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if ($video.readyState < 2) return;
+
+    try {
+        frameCtx.drawImage($video, 0, 0, frameCanvas.width, frameCanvas.height);
+    } catch (e) {
+        console.warn("drawImage failed:", e);
+        return;
+    }
+
+    frameCanvas.toBlob((blob) => {
+        if (!blob) return;
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const dataUrl = reader.result;
+            const b64 = dataUrl.substring(dataUrl.indexOf(",") + 1);
+
+            // Push into ring buffer, drop oldest if over capacity.
+            frameRing.push(b64);
+            while (frameRing.length > FRAMES_PER_CALL) frameRing.shift();
+
+            captureCounter++;
+            // Send once we have at least 2 frames AND it's a send tick.
+            // The first send happens after FRAMES_PER_CALL captures so the
+            // model always sees a full buffer.
+            const haveFull = frameRing.length >= Math.min(2, FRAMES_PER_CALL);
+            const isSendTick = (captureCounter % SEND_EVERY_N) === 0;
+            if (haveFull && isSendTick && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: "frames",
+                    jpeg_b64_list: frameRing.slice(),  // oldest → newest
+                }));
+            }
+        };
+        reader.readAsDataURL(blob);
+    }, "image/jpeg", 0.7);
+}
+
+function stopVision() {
+    if (frameTimer) { clearInterval(frameTimer); frameTimer = null; }
+    if (videoStream) {
+        videoStream.getTracks().forEach(t => t.stop());
+        videoStream = null;
+    }
+    $video.srcObject = null;
+    frameCanvas = null;
+    frameCtx = null;
+    frameRing = [];
+    captureCounter = 0;
+    latestBBox = null;
+    latestActivity = "";
+    drawOverlay();
+    hideFallAlert();
+}
+
+// ── Fall alert ──
+function showFallAlert(text) {
+    $fallAlertText.textContent = text || "I noticed you went down — are you alright?";
+    $fallAlert.classList.add("show");
+    if (fallAlertHideTimer) clearTimeout(fallAlertHideTimer);
+    // Auto-hide after 20 seconds. Can be re-triggered by a fresh event.
+    fallAlertHideTimer = setTimeout(hideFallAlert, 20000);
+}
+function hideFallAlert() {
+    $fallAlert.classList.remove("show");
+    if (fallAlertHideTimer) { clearTimeout(fallAlertHideTimer); fallAlertHideTimer = null; }
+}
+
+// ── AudioWorklet processor ──
+const workletCode = `
+class CaptureProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this._buf = new Float32Array(${CHUNK_SIZE});
+        this._pos = 0;
+    }
+    process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (!ch) return true;
+        let i = 0;
+        while (i < ch.length) {
+            const space = ${CHUNK_SIZE} - this._pos;
+            const toCopy = Math.min(space, ch.length - i);
+            this._buf.set(ch.subarray(i, i + toCopy), this._pos);
+            this._pos += toCopy;
+            i += toCopy;
+            if (this._pos === ${CHUNK_SIZE}) {
+                this.port.postMessage(this._buf.slice());
+                this._pos = 0;
+            }
+        }
+        return true;
+    }
+}
+registerProcessor("capture-processor", CaptureProcessor);
+`;
+
+// ── Mic ring pulse (driven by analyser) ──
+function updateMicRing(level) {
+    // level: 0..1. Scales an inset box-shadow glow.
+    const intensity = Math.min(1, level * 1.4);
+    const blur = 14 + intensity * 20;
+    const spread = intensity * 6;
+    $micRing.style.boxShadow =
+        `0 0 ${blur}px ${spread}px rgba(95, 227, 193, ${intensity * 0.35}) inset`;
+}
+
+// ── Start ──
+$startBtn.onclick = async () => {
+    $error.textContent = "";
+
+    if (!$groqKey.value.trim()) { $error.textContent = "Enter your Groq API key first."; $keyDrawer.classList.add("open"); return; }
+    if (!$anthropicKey.value.trim()) { $error.textContent = "Enter your Anthropic API key first."; $keyDrawer.classList.add("open"); return; }
+    if (!$openaiKey.value.trim()) { $error.textContent = "Enter your OpenAI API key first."; $keyDrawer.classList.add("open"); return; }
+
+    $startBtn.disabled = true;
+    setStatus("Connecting...");
+
+    // Reset session state for diary / summary
+    sessionStartTime = new Date();
+    diaryEntries = [];
+    $diary.innerHTML = '<div class="empty">Diary entries will appear here during the session.</div>';
+    // Reset transcript for new session
+    $transcript.innerHTML = '<div class="empty">Press Start and speak to begin a conversation.</div>';
+
+    try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+
+        audioCtx = new AudioContext();
+        const blob = new Blob([workletCode], { type: "application/javascript" });
+        const url = URL.createObjectURL(blob);
+        await audioCtx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+
+        const source = audioCtx.createMediaStreamSource(micStream);
+        workletNode = new AudioWorkletNode(audioCtx, "capture-processor");
+
+        // Mic level analyser → animated ring around the video
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        const levelBuf = new Uint8Array(analyser.frequencyBinCount);
+        function updateLevel() {
+            if (!audioCtx) return;
+            analyser.getByteFrequencyData(levelBuf);
+            const avg = levelBuf.reduce((a, b) => a + b, 0) / levelBuf.length;
+            updateMicRing(avg / 128);
+            requestAnimationFrame(updateLevel);
+        }
+        updateLevel();
+
+        // WebSocket
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+            ws.send(JSON.stringify({
+                type: "config",
+                groq_api_key: $groqKey.value.trim(),
+                anthropic_api_key: $anthropicKey.value.trim(),
+                openai_api_key: $openaiKey.value.trim(),
+                sample_rate: audioCtx.sampleRate,
+            }));
+
+            $stopBtn.disabled = false;
+            $keyDrawer.classList.remove("open");
+
+            workletNode.port.onmessage = (e) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(e.data.buffer);
+                }
+            };
+            source.connect(workletNode);
+
+            // Kick off vision after the WS is open.
+            startVision();
+        };
+
+        ws.onmessage = (e) => {
+            if (e.data instanceof ArrayBuffer) {
+                queueAudio(e.data);
+                return;
+            }
+            const msg = JSON.parse(e.data);
+
+            if (msg.type === "status") {
+                const labels = {
+                    listening: "Listening",
+                    hearing:   "Hearing you…",
+                    processing:"Processing…",
+                    thinking:  "Thinking…",
+                    speaking:  "Speaking…",
+                };
+                setStatus(labels[msg.state] || msg.state, msg.state);
+            } else if (msg.type === "transcript") {
+                addUserMsg(msg.text);
+            } else if (msg.type === "response_chunk") {
+                appendAssistantChunk(msg.text);
+            } else if (msg.type === "response_done") {
+                finalizeAssistantMsg();
+            } else if (msg.type === "barge_in") {
+                console.log("Barge-in: stopping playback");
+                stopPlayback();
+                finalizeAssistantMsg();
+            } else if (msg.type === "tts_done") {
+                // no-op
+            } else if (msg.type === "scene") {
+                $sceneChip.classList.remove("empty");
+                $scene.textContent = msg.text;
+                latestActivity = msg.text || "";
+                latestBBox = Array.isArray(msg.bbox) && msg.bbox.length === 4 ? msg.bbox : null;
+                drawOverlay();
+                // If the scene itself declares a fall (redundant with the
+                // dedicated alert message but harmless), surface the banner.
+                if (msg.fall) showFallAlert(msg.text);
+                if (msg.text) addDiaryEntry("activity", msg.text);
+            } else if (msg.type === "alert") {
+                if (msg.level === "fall") showFallAlert(msg.text);
+                addDiaryEntry(msg.level === "fall" ? "fall" : "alert", msg.text);
+            } else if (msg.type === "error") {
+                $error.textContent = msg.message;
+            }
+        };
+
+        ws.onerror = () => setStatus("Connection error");
+        ws.onclose = () => { if (!$stopBtn.disabled) stop(); };
+
+    } catch (err) {
+        setStatus("Error: " + err.message);
+        $startBtn.disabled = false;
+    }
+};
+
+// ── Session summary ──
+function showSessionSummary() {
+    const endTime = new Date();
+
+    // Duration
+    const durationMs = endTime - sessionStartTime;
+    const mins = Math.floor(durationMs / 60000);
+    const secs = Math.floor((durationMs % 60000) / 1000);
+    document.getElementById("summaryDuration").textContent =
+        sessionStartTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
+        " — " + endTime.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) +
+        " (" + mins + "m " + secs + "s)";
+
+    // Conversation transcript
+    const convEntries = diaryEntries.filter(e => e.type === "user" || e.type === "assistant");
+    const $conv = document.getElementById("summaryTranscript");
+    if (convEntries.length === 0) {
+        $conv.innerHTML = '<div class="summary-empty">No conversation messages.</div>';
+    } else {
+        $conv.innerHTML = convEntries.map(e => {
+            const t = e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+            const label = e.type === "user" ? "You" : "Abide";
+            const color = e.type === "user" ? "var(--indigo)" : "var(--teal)";
+            return '<div class="summary-item"><span class="time">' + t +
+                '</span><span class="type-label" style="color:' + color + '">' +
+                label + '</span>' + escapeHtml(e.content) + '</div>';
+        }).join("");
+    }
+
+    // Activity log
+    const actEntries = diaryEntries.filter(e => e.type === "activity" || e.type === "fall" || e.type === "alert");
+    const $act = document.getElementById("summaryActivities");
+    if (actEntries.length === 0) {
+        $act.innerHTML = '<div class="summary-empty">No activity observations.</div>';
+    } else {
+        $act.innerHTML = actEntries.map(e => {
+            const t = e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+            const badge = e.type === "fall" ? '<span class="type-label" style="color:var(--rose)">FALL</span>' : "";
+            return '<div class="summary-item"><span class="time">' + t + '</span>' +
+                badge + escapeHtml(e.content) + '</div>';
+        }).join("");
+    }
+
+    // Analysis — show spinner, then fire async Claude call
+    const $analysis = document.getElementById("summaryAnalysis");
+    $analysis.innerHTML = '<div class="summary-spinner">Analyzing session with Claude…</div>';
+
+    $summaryOverlay.classList.add("show");
+
+    // Fire-and-forget the analysis request
+    fetchAnalysis().then(text => {
+        $analysis.innerHTML = '<div class="summary-analysis">' + escapeHtml(text) + '</div>';
+    }).catch(() => {
+        $analysis.innerHTML = '<div class="summary-empty">Could not generate analysis. Check your Anthropic API key.</div>';
+    });
+}
+
+async function fetchAnalysis() {
+    const convHistory = diaryEntries
+        .filter(e => e.type === "user" || e.type === "assistant")
+        .map(e => ({ role: e.type === "user" ? "user" : "assistant", content: e.content }));
+
+    // Include activity observations so Claude knows what Abide "saw"
+    const activityLog = diaryEntries
+        .filter(e => e.type === "activity" || e.type === "fall")
+        .map(e => e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " — " + e.content)
+        .join("\n");
+
+    const resp = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            history: convHistory,
+            activity_log: activityLog,
+            api_key: localStorage.getItem("anthropic_api_key"),
+        }),
+    });
+    if (!resp.ok) throw new Error("Analysis request failed");
+    const data = await resp.json();
+    return data.analysis;
+}
+
+// Summary overlay close handlers
+document.getElementById("summaryClose").addEventListener("click", () => {
+    $summaryOverlay.classList.remove("show");
+});
+$summaryOverlay.addEventListener("click", (e) => {
+    if (e.target === $summaryOverlay) $summaryOverlay.classList.remove("show");
+});
+
+// ── Stop ──
+function stop() {
+    setStatus("Ready");
+    $stopBtn.disabled = true;
+    $startBtn.disabled = false;
+    currentAssistantMsg = null;
+    stopPlayback();
+    stopVision();
+
+    if (workletNode) { workletNode.disconnect(); workletNode = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
+    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    updateMicRing(0);
+    $visionNotice.classList.remove("show");
+    $video.classList.remove("hidden");
+    $sceneChip.classList.add("empty");
+    $scene.textContent = "Waiting for camera...";
+    $hero.classList.remove("speaking");
+    hideFallAlert();
+
+    // Show session summary if there were any interactions
+    if (diaryEntries.length > 0) showSessionSummary();
+}
+
+$stopBtn.onclick = stop;
+</script>
+</body>
+</html>

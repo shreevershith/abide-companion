@@ -1,0 +1,64 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ── Secrets — NEVER commit ──
+.env
+.env.local
+.env.*.local
+
+# ── Claude Code local state ──
+.claude/
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ── OS junk ──
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# ── Docker ──
+# Don't ignore docker-compose.yml or Dockerfile — those are part of the project.
+# But do ignore any local override files.
+docker-compose.override.yml
+
+# ── Build / packaging outputs ──
+dist/
+build/
+*.whl
+
+# ── Logs ──
+*.log
+logs/
+
+# ── Torch / model weights (large, downloaded at build time) ──
+*.pt
+*.onnx
+*.bin
+!app/**/*.py
+
+# ── Node (not used, but just in case) ──
+node_modules/

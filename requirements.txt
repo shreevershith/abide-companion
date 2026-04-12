@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12.0
+numpy>=1.26
+torch>=2.0
+silero-vad>=4.0
+groq>=0.5
+httpx[http2]>=0.27
+h2>=4.1
+anthropic>=0.40
+langfuse>=2.60,<3.0
+python-dotenv>=1.0

@@ -1,0 +1,29 @@
+# Abide Companion — single-service compose file.
+#
+# Usage:
+#   docker compose up -d --build   # build + start in background
+#   docker compose logs -f         # watch logs
+#   docker compose down            # stop + remove container
+#
+# Notes:
+#  - .env is mounted via env_file at runtime so Langfuse keys never
+#    get baked into the image. User-entered API keys (Groq, Anthropic,
+#    OpenAI) come from the browser UI via WebSocket config messages
+#    and are NOT needed in .env.
+#  - Host port 8000 → container 8000. The browser connects via
+#    http://localhost:8000 and opens a WebSocket to ws://localhost:8000/ws.
+#  - `restart: unless-stopped` keeps the service up across machine
+#    reboots until the user explicitly runs `docker compose down`.
+
+services:
+  abide:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: abide-companion:latest
+    container_name: abide-companion
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
