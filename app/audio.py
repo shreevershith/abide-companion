@@ -312,7 +312,7 @@ async def transcribe(wav_bytes: bytes, api_key: str, speech_end_ts: float | None
     else:
         log.info("[TIMING] STT: Groq API %.0fms (audio %d bytes)", api_ms, len(wav_bytes))
 
-    transcript = result.text.strip()
+    transcript = (getattr(result, "text", "") or "").strip()
 
     # Confidence filter using Whisper's own uncertainty signals.
     #

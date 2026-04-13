@@ -4,6 +4,22 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
+## 12. Vision-reactive trigger lost when Abide is busy talking (Post-Phase-7)
+
+**Symptom**: User waved at the camera for ~12 seconds. Vision correctly detected "Waving hand." 4 times in a row. But no `[VISION-REACT]` log entry appeared and Abide never reacted. The user complained "You're not responding" and Abide apologized for a "delay or connection issue."
+
+**Root cause**: Two bugs compounding:
+
+1. **`_is_reactive_change()` always returned False** — it compared the new activity against `self.vision_buffer.latest`, but `vision_buffer.append(result)` had already been called before the check, so latest WAS the new activity. Every activity looked like a "duplicate" of itself. Fixed by comparing against `entries[-2]` (the entry before the just-appended one).
+
+2. **No queuing when busy** — even after fixing the comparison, the trigger was blocked by `not self.is_responding and not self.is_audible` guards because Abide was playing TTS from a previous response. By the time the audio finished, the user had stopped waving and subsequent vision frames showed "Sitting, looking at the camera." The reactive opportunity was permanently lost.
+
+**Fix**: Added `_pending_reactive_activity` field to Session. When a reactive gesture is detected but Abide is busy, the activity is queued. At the end of `_run_response()`'s `finally` block, the queued activity is consumed — after a 1-second delay and a final `is_audible` check, a new proactive response fires mentioning what Abide noticed while it was talking.
+
+**Files touched**: `app/session.py` — `_is_reactive_change()` comparison fix, `_pending_reactive_activity` field, queuing in `_run_vision()`, consumption in `_run_response()`.
+
+---
+
 ## 11. Security/performance audit: race conditions, unguarded sends, per-request client (Post-Phase-7)
 
 **Symptom**: During a code review audit, three categories of issues were identified:

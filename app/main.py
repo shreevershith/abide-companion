@@ -94,10 +94,12 @@ async def _on_shutdown() -> None:
         telemetry.flush(telemetry.init_langfuse())
     except Exception:
         pass
-    # Close module-level httpx clients
-    for client_name, client in [("analyze", _analyze_client)]:
+    # Close all module-level persistent httpx clients
+    from app.tts import aclose as tts_close
+    from app.vision import aclose as vision_close
+    for name, closer in [("analyze", _analyze_client.aclose), ("tts", tts_close), ("vision", vision_close)]:
         try:
-            await client.aclose()
+            await closer()
         except Exception:
             pass
 

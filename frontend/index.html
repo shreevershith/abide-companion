@@ -4,39 +4,90 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Abide Companion</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400;1,600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
+/* ── Abide Robotics brand palette ── */
+/* Dark mode (default) — warm charcoal + amber, matching abide-robotics.com dark theme */
 :root {
-    --bg: #0b0d14;
-    --bg-accent: #1a1d2e;
-    --surface: rgba(255, 255, 255, 0.04);
-    --surface-hi: rgba(255, 255, 255, 0.07);
-    --border: rgba(255, 255, 255, 0.08);
-    --border-hi: rgba(255, 255, 255, 0.14);
-    --text: #e7e9f2;
-    --text-dim: #9097a8;
-    --text-dimmer: #5c6375;
-    --indigo: #8b9dff;
-    --indigo-soft: rgba(139, 157, 255, 0.18);
-    --teal: #5fe3c1;
-    --teal-soft: rgba(95, 227, 193, 0.18);
-    --amber: #ffc16b;
-    --rose: #ff7a93;
-    --danger: #ff6478;
+    --bg: #0f0d0a;
+    --bg-accent: #1a1610;
+    --surface: rgba(212, 160, 57, 0.04);
+    --surface-hi: rgba(212, 160, 57, 0.08);
+    --border: rgba(212, 160, 57, 0.12);
+    --border-hi: rgba(212, 160, 57, 0.22);
+    --text: #ede6d8;
+    --text-dim: #a89a82;
+    --text-dimmer: #6b5f4e;
+    --accent: #d4a039;
+    --accent-soft: rgba(212, 160, 57, 0.18);
+    --accent-glow: rgba(212, 160, 57, 0.35);
+    --accent-secondary: #c8905a;
+    --accent-secondary-soft: rgba(200, 144, 90, 0.15);
+    --amber: #d4a039;
+    --rose: #d45050;
+    --danger: #c94040;
     --radius-lg: 20px;
     --radius-md: 14px;
     --radius-sm: 10px;
     --shadow-lg: 0 30px 80px rgba(0, 0, 0, 0.55);
     --shadow-md: 0 10px 30px rgba(0, 0, 0, 0.35);
+    --topbar-bg: rgba(15, 13, 10, 0.7);
+    --drawer-bg: rgba(15, 13, 10, 0.88);
+    --summary-bg: rgba(20, 18, 14, 0.95);
+    --chip-bg: rgba(15, 13, 10, 0.65);
+    --hero-bg: #080604;
+    --body-gradient: radial-gradient(ellipse at 50% -10%, #2a2015 0%, #0f0d0a 55%), #0f0d0a;
+    --mic-color: rgba(212, 160, 57, 0);
+}
+
+/* Light mode — warm cream + amber, matching abide-robotics.com light theme */
+[data-theme="light"] {
+    --bg: #f8f5ef;
+    --bg-accent: #ffffff;
+    --surface: rgba(0, 0, 0, 0.025);
+    --surface-hi: rgba(0, 0, 0, 0.05);
+    --border: rgba(180, 160, 120, 0.18);
+    --border-hi: rgba(180, 160, 120, 0.3);
+    --text: #1a1610;
+    --text-dim: #6b5f4e;
+    --text-dimmer: #a89a82;
+    --accent: #c28b2a;
+    --accent-soft: rgba(194, 139, 42, 0.12);
+    --accent-glow: rgba(194, 139, 42, 0.18);
+    --accent-secondary: #a07040;
+    --accent-secondary-soft: rgba(160, 112, 64, 0.1);
+    --amber: #c28b2a;
+    --rose: #c04040;
+    --danger: #b03030;
+    --shadow-lg: 0 20px 60px rgba(140, 120, 80, 0.12);
+    --shadow-md: 0 8px 24px rgba(140, 120, 80, 0.08);
+    --topbar-bg: rgba(248, 245, 239, 0.8);
+    --drawer-bg: rgba(255, 255, 255, 0.92);
+    --summary-bg: rgba(255, 255, 255, 0.96);
+    --chip-bg: rgba(248, 245, 239, 0.75);
+    --hero-bg: #2a2520;
+    --body-gradient: radial-gradient(ellipse at 50% -10%, #ede6d8 0%, #f8f5ef 55%), #f8f5ef;
+    --mic-color: rgba(194, 139, 42, 0);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body { height: 100%; }
+
+/* Smooth theme transition — scoped to key containers to avoid jank
+   on large DOM trees (100+ diary entries would cause reflow storms) */
+body, .topbar, .hero, .transcript-panel, .transcript-header,
+.scene-chip, .key-drawer .panel, .key-drawer .gear,
+.summary-overlay, .summary-modal, .fall-alert, .vision-notice,
+.tab-btn, button, .error-msg, .status-pill, .msg, .diary-entry {
+    transition: background-color 0.4s ease, color 0.3s ease,
+                border-color 0.4s ease, box-shadow 0.4s ease;
+}
 body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
-    background:
-        radial-gradient(ellipse at 50% -10%, #1a1d2e 0%, #0b0d14 55%),
-        var(--bg);
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--body-gradient);
     color: var(--text);
     font-size: 18px;
     line-height: 1.5;
@@ -49,19 +100,20 @@ body {
     position: sticky; top: 0; z-index: 20;
     display: flex; align-items: center; justify-content: space-between;
     padding: 18px 32px;
-    background: rgba(11, 13, 20, 0.6);
+    background: var(--topbar-bg);
     backdrop-filter: blur(14px);
     -webkit-backdrop-filter: blur(14px);
     border-bottom: 1px solid var(--border);
 }
 .wordmark {
-    display: flex; align-items: center; gap: 10px;
-    font-size: 18px; font-weight: 600; letter-spacing: -0.01em;
+    display: flex; align-items: center; gap: 12px;
+    font-family: "Playfair Display", Georgia, serif;
+    font-size: 24px; font-weight: 600; letter-spacing: -0.01em;
 }
 .wordmark .logo {
     width: 28px; height: 28px; border-radius: 8px;
-    background: linear-gradient(135deg, var(--indigo), var(--teal));
-    box-shadow: 0 0 20px rgba(139, 157, 255, 0.35);
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+    box-shadow: 0 0 16px var(--accent-glow);
     display: flex; align-items: center; justify-content: center;
     font-size: 14px;
 }
@@ -87,11 +139,11 @@ body {
     transition: all 0.3s ease;
     box-shadow: 0 0 0 0 rgba(0, 0, 0, 0);
 }
-.status-pill.listening .dot { background: var(--teal); box-shadow: 0 0 12px var(--teal-soft); animation: breathe 3s ease-in-out infinite; }
-.status-pill.hearing   .dot { background: var(--amber); box-shadow: 0 0 12px rgba(255, 193, 107, 0.4); animation: pulse-fast 0.7s ease-in-out infinite; }
-.status-pill.processing .dot { background: var(--indigo); animation: pulse-med 1.2s ease-in-out infinite; }
-.status-pill.thinking  .dot { background: var(--indigo); box-shadow: 0 0 12px var(--indigo-soft); animation: pulse-med 1.2s ease-in-out infinite; }
-.status-pill.speaking  .dot { background: var(--teal); box-shadow: 0 0 16px var(--teal-soft); animation: pulse-fast 0.55s ease-in-out infinite; }
+.status-pill.listening .dot { background: var(--accent); box-shadow: 0 0 12px var(--accent-soft); animation: breathe 3s ease-in-out infinite; }
+.status-pill.hearing   .dot { background: var(--amber); box-shadow: 0 0 12px var(--accent-glow); animation: pulse-fast 0.7s ease-in-out infinite; }
+.status-pill.processing .dot { background: var(--accent-secondary); animation: pulse-med 1.2s ease-in-out infinite; }
+.status-pill.thinking  .dot { background: var(--accent-secondary); box-shadow: 0 0 12px var(--accent-secondary-soft); animation: pulse-med 1.2s ease-in-out infinite; }
+.status-pill.speaking  .dot { background: var(--accent); box-shadow: 0 0 16px var(--accent-glow); animation: pulse-fast 0.55s ease-in-out infinite; }
 .status-pill.listening, .status-pill.hearing, .status-pill.processing, .status-pill.thinking, .status-pill.speaking {
     color: var(--text);
     border-color: var(--border-hi);
@@ -122,11 +174,12 @@ button:hover:not(:disabled) {
 }
 button:disabled { opacity: 0.35; cursor: not-allowed; }
 #startBtn {
-    background: linear-gradient(135deg, var(--indigo), #6c7fff);
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
     border-color: transparent;
-    box-shadow: 0 6px 20px rgba(108, 127, 255, 0.35);
+    box-shadow: 0 6px 20px var(--accent-glow);
+    color: #fff;
 }
-#startBtn:hover:not(:disabled) { box-shadow: 0 8px 28px rgba(108, 127, 255, 0.5); }
+#startBtn:hover:not(:disabled) { box-shadow: 0 8px 28px var(--accent-glow); }
 #stopBtn { }
 
 /* ── Main layout ── */
@@ -136,39 +189,51 @@ main {
     padding: 36px 32px 120px;
 }
 
-/* ── Hero video section ── */
+/* ── Hero video section (16:9 rounded rectangle with glowing ring) ── */
 .hero {
     position: relative;
     width: 100%;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: 16 / 9;
     max-height: 72vh;
     border-radius: var(--radius-lg);
-    overflow: hidden;
-    background: #05060b;
-    border: 1px solid var(--border);
+    /* NO overflow:hidden — the ::before glow ring must extend beyond */
+    background: var(--hero-bg);
+    border: 2px solid var(--border-hi);
     box-shadow: var(--shadow-lg);
-    margin-bottom: 32px;
+    margin-bottom: 12px;
 }
 .hero::before {
-    /* outer glow accent */
+    /* animated glow that follows the rectangle shape */
     content: "";
     position: absolute;
-    inset: -2px;
-    border-radius: calc(var(--radius-lg) + 2px);
-    background: linear-gradient(135deg, rgba(139,157,255,0.25), rgba(95,227,193,0.18));
-    z-index: -1;
-    filter: blur(24px);
-    opacity: 0.55;
+    inset: -8px;
+    border-radius: calc(var(--radius-lg) + 4px);
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary), var(--accent));
+    z-index: 0;
+    filter: blur(22px);
+    opacity: 0.35;
     pointer-events: none;
-    transition: opacity 0.4s ease;
+    transition: opacity 0.4s ease, filter 0.4s ease;
+    animation: glow-pulse 4s ease-in-out infinite;
 }
-.hero.speaking::before { opacity: 0.85; }
+.hero.speaking::before { opacity: 0.8; filter: blur(30px); animation: glow-pulse-active 2s ease-in-out infinite; }
+@keyframes glow-pulse {
+    0%, 100% { opacity: 0.3; filter: blur(22px); }
+    50%      { opacity: 0.5; filter: blur(28px); }
+}
+@keyframes glow-pulse-active {
+    0%, 100% { opacity: 0.7; filter: blur(28px); }
+    50%      { opacity: 1; filter: blur(36px); }
+}
 
 #videoPreview {
     width: 100%; height: 100%;
     object-fit: cover;
-    background: #000;
+    background: var(--hero-bg);
     display: block;
+    border-radius: var(--radius-lg);
+    position: relative;
+    z-index: 1;
     /* mirror horizontally — feels natural for a self-view */
     transform: scaleX(-1);
 }
@@ -181,6 +246,8 @@ main {
     inset: 0;
     width: 100%; height: 100%;
     pointer-events: none;
+    border-radius: var(--radius-lg);
+    z-index: 2;
     transform: scaleX(-1);
 }
 
@@ -189,7 +256,8 @@ main {
     position: absolute; inset: 0;
     border-radius: var(--radius-lg);
     pointer-events: none;
-    box-shadow: 0 0 0 0 rgba(95, 227, 193, 0) inset;
+    z-index: 3;
+    box-shadow: 0 0 0 0 var(--mic-color) inset;
     transition: box-shadow 80ms linear;
 }
 
@@ -203,7 +271,7 @@ main {
     display: flex;
     align-items: center;
     gap: 12px;
-    background: rgba(11, 13, 20, 0.62);
+    background: var(--chip-bg);
     backdrop-filter: blur(14px);
     -webkit-backdrop-filter: blur(14px);
     border: 1px solid var(--border);
@@ -212,12 +280,13 @@ main {
     font-size: 15px;
     box-shadow: var(--shadow-md);
     max-width: 70%;
+    z-index: 4;
 }
 .scene-chip .icon {
     flex-shrink: 0;
     width: 28px; height: 28px;
     border-radius: 8px;
-    background: var(--indigo-soft);
+    background: var(--accent-soft);
     display: flex; align-items: center; justify-content: center;
     font-size: 14px;
 }
@@ -344,18 +413,18 @@ main {
 }
 .msg.user {
     margin-left: auto;
-    background: linear-gradient(135deg, rgba(139,157,255,0.15), rgba(139,157,255,0.08));
-    border-color: rgba(139,157,255,0.25);
+    background: linear-gradient(135deg, var(--accent-soft), rgba(212, 160, 57, 0.05));
+    border-color: var(--accent-soft);
     border-bottom-right-radius: 4px;
 }
-.msg.user .label { color: var(--indigo); }
+.msg.user .label { color: var(--accent); }
 .msg.assistant {
     margin-right: auto;
-    background: linear-gradient(135deg, rgba(95,227,193,0.12), rgba(95,227,193,0.05));
-    border-color: rgba(95,227,193,0.22);
+    background: linear-gradient(135deg, var(--accent-secondary-soft), rgba(200, 144, 90, 0.03));
+    border-color: var(--accent-secondary-soft);
     border-bottom-left-radius: 4px;
 }
-.msg.assistant .label { color: var(--teal); }
+.msg.assistant .label { color: var(--accent-secondary); }
 
 /* ── Error line ── */
 .error-msg {
@@ -387,7 +456,7 @@ main {
     position: absolute;
     bottom: 58px; right: 0;
     width: 340px;
-    background: rgba(11, 13, 20, 0.85);
+    background: var(--drawer-bg);
     backdrop-filter: blur(20px);
     border: 1px solid var(--border-hi);
     border-radius: var(--radius-md);
@@ -426,9 +495,9 @@ main {
     outline: none;
     transition: border-color 0.15s ease;
 }
-.key-field input:focus { border-color: var(--indigo); }
+.key-field input:focus { border-color: var(--accent); }
 .key-field .saved {
-    font-size: 11px; color: var(--teal);
+    font-size: 11px; color: var(--accent);
     opacity: 0; transition: opacity 0.3s ease;
     display: inline-block; margin-left: 6px;
 }
@@ -446,7 +515,7 @@ main {
 
 /* Accessibility: focus rings */
 button:focus-visible, input:focus-visible, .gear:focus-visible {
-    outline: 2px solid var(--indigo);
+    outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
 
@@ -494,14 +563,14 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
     letter-spacing: 0.06em; padding: 2px 6px; border-radius: 4px;
     margin-right: 8px; display: inline-block;
 }
-.diary-entry.type-user { background: rgba(139,157,255,0.08); border-color: rgba(139,157,255,0.18); }
-.diary-entry.type-user .diary-type { color: var(--indigo); background: var(--indigo-soft); }
-.diary-entry.type-assistant { background: rgba(95,227,193,0.06); border-color: rgba(95,227,193,0.15); }
-.diary-entry.type-assistant .diary-type { color: var(--teal); background: var(--teal-soft); }
-.diary-entry.type-activity { background: rgba(255,193,107,0.06); border-color: rgba(255,193,107,0.15); }
-.diary-entry.type-activity .diary-type { color: var(--amber); background: rgba(255,193,107,0.18); }
-.diary-entry.type-alert, .diary-entry.type-fall { background: rgba(255,122,147,0.06); border-color: rgba(255,122,147,0.15); }
-.diary-entry.type-alert .diary-type, .diary-entry.type-fall .diary-type { color: var(--rose); background: rgba(255,122,147,0.18); }
+.diary-entry.type-user { background: var(--accent-soft); border-color: var(--accent-soft); }
+.diary-entry.type-user .diary-type { color: var(--accent); background: var(--accent-soft); }
+.diary-entry.type-assistant { background: var(--accent-secondary-soft); border-color: var(--accent-secondary-soft); }
+.diary-entry.type-assistant .diary-type { color: var(--accent-secondary); background: var(--accent-secondary-soft); }
+.diary-entry.type-activity { background: var(--accent-soft); border-color: var(--accent-soft); }
+.diary-entry.type-activity .diary-type { color: var(--accent); background: var(--accent-soft); }
+.diary-entry.type-alert, .diary-entry.type-fall { background: rgba(212, 80, 80, 0.08); border-color: rgba(212, 80, 80, 0.18); }
+.diary-entry.type-alert .diary-type, .diary-entry.type-fall .diary-type { color: var(--rose); background: rgba(212, 80, 80, 0.18); }
 
 /* ── Session summary overlay ── */
 .summary-overlay {
@@ -514,7 +583,7 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
 .summary-overlay.show { display: flex; }
 .summary-modal {
     width: 100%; max-width: 720px; margin: auto;
-    background: rgba(26,29,46,0.95); backdrop-filter: blur(20px);
+    background: var(--summary-bg); backdrop-filter: blur(20px);
     border: 1px solid var(--border-hi); border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg); display: flex; flex-direction: column;
 }
@@ -522,7 +591,7 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
     display: flex; align-items: center; justify-content: space-between;
     padding: 20px 24px; border-bottom: 1px solid var(--border);
 }
-.summary-header h2 { font-size: 18px; font-weight: 600; }
+.summary-header h2 { font-family: "Playfair Display", Georgia, serif; font-size: 22px; font-weight: 600; }
 .summary-close {
     width: 36px; height: 36px; border-radius: 50%;
     background: var(--surface); border: 1px solid var(--border);
@@ -563,10 +632,20 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
 }
 .summary-spinner::before {
     content: ""; width: 18px; height: 18px; border-radius: 50%;
-    border: 2px solid var(--border); border-top-color: var(--indigo);
+    border: 2px solid var(--border); border-top-color: var(--accent);
     animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Theme toggle ── */
+.theme-toggle {
+    width: 38px; height: 38px; border-radius: 50%;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text-dim); font-size: 18px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s ease; padding: 0; backdrop-filter: blur(8px);
+}
+.theme-toggle:hover { background: var(--surface-hi); color: var(--text); transform: none; }
 </style>
 </head>
 <body>
@@ -583,6 +662,7 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
     <div class="controls">
         <button id="startBtn">Start</button>
         <button id="stopBtn" disabled>Stop</button>
+        <button class="theme-toggle" id="themeToggle" title="Toggle light/dark mode">&#9788;</button>
     </div>
 </header>
 
@@ -678,6 +758,12 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
 </div>
 
 <script>
+// ── Theme toggle (runs immediately to avoid flash) ──
+(function() {
+    const saved = localStorage.getItem("theme") || "dark";
+    document.documentElement.dataset.theme = saved;
+})();
+
 const CHUNK_SIZE = 2048;
 
 // Vision sampling: capture 1 JPEG every CAPTURE_INTERVAL_MS, maintain a
@@ -759,6 +845,21 @@ const $diary    = document.getElementById("diary");
 const $tabConversation = document.getElementById("tabConversation");
 const $tabDiary = document.getElementById("tabDiary");
 const $summaryOverlay = document.getElementById("summaryOverlay");
+const $themeToggle = document.getElementById("themeToggle");
+
+// ── Theme toggle ──
+function applyThemeIcon() {
+    const t = document.documentElement.dataset.theme || "dark";
+    $themeToggle.innerHTML = t === "dark" ? "&#9788;" : "&#9790;";
+}
+applyThemeIcon();
+$themeToggle.addEventListener("click", () => {
+    const current = document.documentElement.dataset.theme || "dark";
+    const next = current === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem("theme", next);
+    applyThemeIcon();
+});
 
 // ── API key persistence ──
 $groqKey.value = localStorage.getItem("groq_api_key") || "";
@@ -991,12 +1092,12 @@ function drawOverlay() {
     const bh = Math.max(2, (y2 - y1) * H);
 
     // Translucent fill
-    ctx.fillStyle = "rgba(139, 157, 255, 0.14)";
+    ctx.fillStyle = "rgba(212, 160, 57, 0.10)";
     ctx.fillRect(bx, by, bw, bh);
 
-    // Border — dashed, soft indigo
+    // Border — dashed, warm amber
     ctx.lineWidth = Math.max(2, Math.round(3 * (W / 640)));
-    ctx.strokeStyle = "rgba(139, 157, 255, 0.92)";
+    ctx.strokeStyle = "rgba(212, 160, 57, 0.85)";
     ctx.setLineDash([Math.round(10 * (W / 640)), Math.round(6 * (W / 640))]);
     ctx.strokeRect(bx, by, bw, bh);
     ctx.setLineDash([]);
@@ -1004,7 +1105,7 @@ function drawOverlay() {
     // Corner ticks (gives it a "tracking" feel)
     const tick = Math.max(8, Math.round(14 * (W / 640)));
     ctx.lineWidth = Math.max(3, Math.round(4 * (W / 640)));
-    ctx.strokeStyle = "rgba(95, 227, 193, 0.95)";
+    ctx.strokeStyle = "rgba(200, 144, 90, 0.95)";
     // Top-left
     ctx.beginPath();
     ctx.moveTo(bx, by + tick); ctx.lineTo(bx, by); ctx.lineTo(bx + tick, by);
@@ -1033,8 +1134,8 @@ function drawOverlay() {
         const chipY = Math.max(0, by - chipH - 4);
 
         // Chip background
-        ctx.fillStyle = "rgba(11, 13, 20, 0.82)";
-        ctx.strokeStyle = "rgba(139, 157, 255, 0.4)";
+        ctx.fillStyle = "rgba(15, 13, 10, 0.82)";
+        ctx.strokeStyle = "rgba(212, 160, 57, 0.4)";
         ctx.lineWidth = 1;
         roundRect(ctx, chipX, chipY, chipW, chipH, 6);
         ctx.fill();
@@ -1209,7 +1310,7 @@ function updateMicRing(level) {
     const blur = 14 + intensity * 20;
     const spread = intensity * 6;
     $micRing.style.boxShadow =
-        `0 0 ${blur}px ${spread}px rgba(95, 227, 193, ${intensity * 0.35}) inset`;
+        `0 0 ${blur}px ${spread}px rgba(212, 160, 57, ${intensity * 0.35}) inset`;
 }
 
 // ── Start ──

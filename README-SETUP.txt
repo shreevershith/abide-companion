@@ -1,8 +1,6 @@
 Abide Companion — Setup
 ========================
 
-You do NOT need to edit any files. You do NOT need to use a terminal.
-
 --------------------------------------------------------------
  5 steps to run Abide
 --------------------------------------------------------------

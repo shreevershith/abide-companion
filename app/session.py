@@ -147,6 +147,10 @@ class Session:
         # Cooldown for vision-reactive responses (prevents spam)
         self._last_vision_react_ts: float = 0.0
 
+        # Queued reactive activity — set when a reactive gesture is detected
+        # while Abide is busy talking. Consumed at the end of _run_response().
+        self._pending_reactive_activity: str | None = None
+
         # Vision state
         self.vision_buffer: VisionBuffer = VisionBuffer()
         self._frame_task: asyncio.Task | None = None
@@ -413,37 +417,72 @@ class Session:
             )
 
             # Vision-reactive trigger: if the activity is "interesting"
-            # (waving, standing up, thumbs up, etc.) and Abide isn't
-            # already talking, trigger an immediate proactive response.
+            # (waving, standing up, thumbs up, etc.), react proactively.
             # Falls have their own dedicated urgent-context path above.
             if (
                 not result.is_fall
                 and self._engine_ref is not None
                 and self._is_reactive_change(result.activity)
-                and not self.is_responding
-                and not self.is_audible
                 and time.monotonic() - self._last_vision_react_ts >= _VISION_REACT_COOLDOWN_S
-                and ws.client_state == WebSocketState.CONNECTED
             ):
                 silence = time.monotonic() - self.last_user_speech_ts
                 if silence > 3.0:  # don't interrupt active conversation
-                    self._last_vision_react_ts = time.monotonic()
-                    log.info(
-                        "[VISION-REACT] Activity '%s' detected — triggering proactive response",
-                        result.activity,
-                    )
-                    react_text = (
-                        "[System: You just noticed the user doing something — "
-                        f"'{result.activity}'. React to it naturally in 1 sentence. "
-                        "Be warm and conversational, like noticing what a friend is doing.]"
-                    )
-                    self.start_response(
-                        ws, self._engine_ref, react_text, self._openai_key_ref,
-                    )
+                    if (
+                        not self.is_responding
+                        and not self.is_audible
+                        and ws.client_state == WebSocketState.CONNECTED
+                    ):
+                        # Abide is free — react immediately
+                        self._last_vision_react_ts = time.monotonic()
+                        self._pending_reactive_activity = None
+                        log.info(
+                            "[VISION-REACT] Activity '%s' detected — triggering proactive response",
+                            result.activity,
+                        )
+                        react_text = (
+                            "[System: You just noticed the user doing something — "
+                            f"'{result.activity}'. React to it naturally in 1 sentence. "
+                            "Be warm and conversational, like noticing what a friend is doing.]"
+                        )
+                        self.start_response(
+                            ws, self._engine_ref, react_text, self._openai_key_ref,
+                        )
+                    else:
+                        # Abide is busy talking — queue for after response
+                        self._pending_reactive_activity = result.activity
+                        log.info(
+                            "[VISION-REACT] Activity '%s' queued (Abide is busy)",
+                            result.activity,
+                        )
         except Exception as e:
             log.error("Vision worker error: %s", e)
 
     # ── Safe WebSocket send helpers ──
+    async def _fire_queued_reaction(self, ws: WebSocket, activity: str):
+        """Fire a queued vision-reactive response after a short delay."""
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            return
+        if self.is_audible or ws.client_state != WebSocketState.CONNECTED:
+            return
+        if self._engine_ref is None:
+            return
+        self._last_vision_react_ts = time.monotonic()
+        log.info(
+            "[VISION-REACT] Firing queued activity '%s' after response completed",
+            activity,
+        )
+        react_text = (
+            "[System: While you were speaking, you noticed the user "
+            f"was '{activity}'. Now that you've finished talking, "
+            "react to it naturally in 1 sentence.]"
+        )
+        try:
+            self.start_response(ws, self._engine_ref, react_text, self._openai_key_ref)
+        except Exception as e:
+            log.error("Queued vision-react failed: %s", e)
+
     async def _extract_user_facts(self, engine: ConversationEngine):
         """Fire-and-forget task: extract user facts from the last exchange."""
         try:
@@ -680,3 +719,20 @@ class Session:
             # and update the persistent UserContext. Non-blocking — the
             # voice loop is already back to "listening" above.
             asyncio.create_task(self._extract_user_facts(engine))
+
+            # Consume any queued vision-reactive activity that was detected
+            # while Abide was busy talking. Fire as a separate task with a
+            # short delay so the client has time to finish playback. Using
+            # create_task instead of await sleep() to avoid blocking the
+            # event loop in the finally block.
+            if (
+                self._pending_reactive_activity
+                and self._engine_ref is not None
+                and not self._cancelled
+                and ws.client_state == WebSocketState.CONNECTED
+            ):
+                react_activity = self._pending_reactive_activity
+                self._pending_reactive_activity = None
+                asyncio.create_task(
+                    self._fire_queued_reaction(ws, react_activity)
+                )

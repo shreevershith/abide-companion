@@ -158,7 +158,7 @@ Format for each entry:
 - **Trade-offs**: bbox coordinates from `gpt-4o-mini` are "roughly right" but not surgically accurate — the box is visually convincing as a tracker but wouldn't survive a real IoU benchmark. Documented as a known limitation.
 
 ### D22. Dark mode, Gemini-Live-inspired layout
-- **Decision**: Full-bleed dark theme (`#0b0d14` with radial gradient), 4:3 video hero as the main element, scene description as a glass chip overlaid on the bottom of the video, transcript collapsible below, API keys tucked into a gear drawer.
+- **Decision**: Full-bleed dark theme with radial gradient, 16:9 rounded-rectangle video hero as the main element (matching Logitech MeetUp's widescreen output), scene description as a glass chip overlaid on the bottom of the video, transcript collapsible below, API keys tucked into a gear drawer. Redesigned in D58 to match the Abide Robotics brand palette with light/dark mode toggle.
 - **Context**: Original UI looked like a dev tool (forms on top, chat below, video as thumbnail). Video-first layout communicates "this is a live companion", matches what Abide Robotics is building, and lets us tell a clearer demo story.
 - **Alternatives**: Keep utilitarian layout, split 50/50, light theme.
 - **Trade-offs**: More CSS surface area. Risk of contrast issues on cheap monitors — checked via spec for WCAG AA.
@@ -234,6 +234,12 @@ Format for each entry:
 
 ## Post-Phase-7: Code review hardening
 
+### D58. UI redesign: Abide Robotics brand palette + 16:9 hero with glow + light/dark mode
+- **Decision**: Complete visual overhaul of `frontend/index.html` to match the Abide Robotics corporate website (abide-robotics.com). Dark mode uses warm charcoal (`#0f0d0a`) with golden amber (`#d4a039`) accents; light mode uses warm cream (`#f8f5ef`) with slightly deeper amber. Video hero is a 16:9 rounded rectangle (matching Logitech MeetUp widescreen output) with an animated linear-gradient glow ring that pulses when speaking. Typography uses Playfair Display (serif) for headings and Inter (sans-serif) for body text. Theme toggle button (sun/moon) persists to localStorage. Theme transitions are smooth (0.3-0.4s) but scoped to key container elements to avoid reflow jank on large DOM trees.
+- **Context**: The evaluator is the Abide Robotics team. Matching their brand palette makes the prototype feel like a genuine internal product, not a generic demo. Their website has both light and dark modes with the same amber accent, so supporting both is brand-aligned. Initially tried a circular orb design but switched to 16:9 rectangle after realizing the Logitech MeetUp outputs widescreen — a circle would crop the left/right thirds of the frame, losing peripheral vision of the room.
+- **Key changes**: All hardcoded indigo/teal colors replaced with CSS variables (`--accent`, `--accent-secondary`); bounding box overlay colors updated to amber; `overflow: hidden` removed from hero so the `::before` glow ring can extend beyond; video/canvas/mic-ring individually clipped with `border-radius: var(--radius-lg)`.
+- **Trade-offs**: Google Fonts adds two external HTTP requests on first load (~50ms with preconnect). Playfair Display is ~100KB. Acceptable for a demo — the evaluator has a fast connection.
+
 ### D57. Input validation: sample_rate type coercion and range check
 - **Decision**: `main.py` config handler now wraps `data.get("sample_rate", 48000)` in `int()` coercion with a try/except fallback to 48000. Rejects values outside the range 8000–192000 Hz.
 - **Context**: A client sending `"sample_rate": "not_a_number"` or `"sample_rate": -100` would cause downstream crashes in `np.interp()` resampling. The field was not validated before — it was used directly from the JSON payload.
@@ -250,12 +256,12 @@ Format for each entry:
 - **Alternatives**: (a) asyncio.Lock — adds contention, complicates the simple fire-and-forget pattern. (b) Queue-based approach — over-engineered for at most 2-3 concurrent callers. (c) Check `is_responding` before calling — still has a TOCTOU race.
 - **Trade-offs**: The previous response is hard-cancelled, not gracefully drained. If the user's speech and a vision-reactive trigger fire within milliseconds of each other, the user's speech wins (it calls `start_response` after the vision task, cancelling the vision response). This is the correct priority — user speech should always take precedence.
 
-### D54. Vision-reactive proactive responses (immediate trigger on interesting activities)
-- **Decision**: `_run_vision()` in `session.py` now checks each new vision result against a `_REACTIVE_ACTIVITIES` keyword set (waving, thumbs up, standing up, gesturing, dancing, etc.). If the activity is "interesting" AND different from the previous observation AND Abide isn't already responding AND the user has been silent for >3 seconds AND the 15-second cooldown hasn't elapsed, it triggers an immediate `start_response()` with a system-generated prompt asking Claude to react to what it just saw.
-- **Context (the bug)**: During testing, the user waved at the camera but Abide stayed silent until the user spoke. The vision system correctly detected "Waving hand" and stored it in the buffer, but the only response triggers were user speech (STT path) and the 30-second silence timer. A companion in the room would react to a wave immediately.
-- **Guards**: 6-layer gate prevents spam and conflicts: (1) not a fall (falls have their own urgent-context path), (2) engine exists (config has been received), (3) activity is reactive AND changed from previous, (4) not already responding/playing, (5) 15-second cooldown between vision-reactive responses, (6) WebSocket still open, (7) user has been silent >3 seconds.
-- **Alternatives**: (a) Shorter check-in timer (10s instead of 30s) — reduces latency but fires too often on unchanging scenes. (b) Client-side detection that sends a "react" message — adds protocol complexity. (c) Every vision update triggers a response — overwhelming, one response every 3.6 seconds.
-- **Trade-offs**: The 15-second cooldown means a second wave within 15 seconds won't get a reaction. Acceptable — the first reaction covers the social need, and a second "I see you waving" would feel repetitive. The `_engine_ref` / `_openai_key_ref` stored on Session is slightly unclean architecturally but avoids threading engine through every method signature.
+### D54. Vision-reactive proactive responses with queuing (immediate or deferred trigger)
+- **Decision**: `_run_vision()` in `session.py` checks each new vision result against a `_REACTIVE_ACTIVITIES` keyword set (waving, thumbs up, standing up, gesturing, dancing, etc.). If the activity is "interesting" AND different from the previous observation AND the 15-second cooldown hasn't elapsed, it either: (a) triggers an immediate `start_response()` if Abide is free, or (b) queues the activity in `_pending_reactive_activity` if Abide is busy talking. The queued activity is consumed at the end of `_run_response()`'s finally block — after a 1-second delay and a final `is_audible` check, it fires a new response mentioning what Abide noticed.
+- **Context (the bug)**: First implementation (immediate-only) had a critical flaw: if the user waved while Abide was playing a response, the `is_audible` guard blocked the trigger. By the time audio finished, the user had stopped waving, and the opportunity was lost. The user complained "you're not responding to my wave" despite the vision system detecting "Waving hand" 4 times.
+- **The fix**: Queuing. When a reactive activity is detected but Abide is busy, it's stored in `_pending_reactive_activity`. At the end of `_run_response()`, the queued activity is consumed and a new response is fired. This ensures no reactive gesture is silently dropped.
+- **Guards**: 7-layer gate: (1) not a fall, (2) engine exists, (3) activity is reactive AND changed from second-to-last buffer entry (not latest, since append runs first), (4) 15-second cooldown, (5) user silent >3 seconds, (6) if free: respond immediately; if busy: queue, (7) queue consumed only after response + 1s delay + audible check.
+- **Trade-offs**: The 1-second delay after response completion means there's a brief pause before Abide reacts to the queued gesture. Acceptable — it feels like Abide is "finishing its thought" before noticing the wave, which is natural. The queue holds only ONE activity (latest wins if multiple happen while busy).
 
 ### D53. UserContext: persistent user fact extraction and injection
 - **Decision**: Added a `UserContext` dataclass to `session.py` that tracks: `name`, `mentioned_topics`, `preferences`, and `mood_signals`. After each Claude response, a lightweight non-streaming extraction call sends the last 2 turns to Claude with a structured JSON extraction prompt. Results are merged into the persistent context via `UserContext.update()`. The context is injected into every Claude turn via `user_context` parameter on `respond()`, formatted as "What I know about you: - Name: John, - We've talked about: garden, daughter Sarah, - You mentioned you like: morning tea, classical music".
@@ -445,3 +451,20 @@ Format for each entry:
 - **Streaming TTS** — currently each sentence is a separate, complete HTTP request. Moving to a streaming voice model (e.g. Cartesia Sonic, ElevenLabs Turbo streaming) would remove the ~800 ms first-byte latency per sentence.
 - **A real evaluation harness** — scripted test conversations with expected transcripts, automated latency measurement, canary fall-detection videos.
 - **Offline cache of the first 2–3 Abide replies** ("Hello", "How are you today?", "I'm here to help") so the very first turn of a session feels instant even on a cold API call.
+- **Production architecture for healthcare deployment** — The current 
+  prototype relies on three external cloud APIs (Groq, Anthropic, OpenAI) 
+  which is the right tradeoff for a 7-day evaluation on unknown hardware, 
+  but not appropriate for production deployment in a healthcare facility. 
+  For production I would make three changes: (1) Move STT and TTS to 
+  on-premise inference — Whisper on a facility GPU server and Kokoro TTS 
+  locally — eliminating two of three external API dependencies and ensuring 
+  audio of residents never leaves the building, which is critical for HIPAA 
+  compliance. (2) Replace GPT-4o vision with a lightweight edge model 
+  (MobileNet or mediapipe-pose) for basic activity detection, reserving 
+  cloud vision calls only for ambiguous situations like potential falls. 
+  (3) Add API fallback chains so a single vendor outage does not take down 
+  the companion for every resident in the facility. The conversation model 
+  (Claude) I would keep cloud-based in the near term — the quality 
+  difference matters for the warmth and naturalness of elder care 
+  interactions. Long term, a fine-tuned smaller model on-prem would be 
+  the right answer as model quality improves.

@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncGenerator
+
 import httpx
 
 log = logging.getLogger("abide.conversation")
@@ -337,6 +338,12 @@ class ConversationEngine:
                 return result
             return None
 
-        except (json.JSONDecodeError, Exception) as e:
+        except json.JSONDecodeError:
+            log.warning("User fact extraction: invalid JSON response")
+            return None
+        except httpx.TimeoutException:
+            log.warning("User fact extraction: timeout")
+            return None
+        except (httpx.RequestError, OSError) as e:
             log.warning("User fact extraction error: %s", type(e).__name__)
             return None

@@ -457,6 +457,7 @@ silent no-op. The voice loop never depends on telemetry.
 | `MIN_SPEECH_RMS` | `audio.py` | 0.015 | Min segment loudness |
 | `MAX_HISTORY` | `conversation.py` | 20 | Conversation window (messages) |
 | `CHECK_IN_INTERVAL_S` | `main.py` | 30 | Proactive check-in silence threshold (s) |
+| `_VISION_REACT_COOLDOWN_S` | `session.py` | 15.0 | Min seconds between vision-reactive responses |
 | `CAPTURE_INTERVAL_MS` | `index.html` | 1200 | Vision frame capture interval |
 | `SEND_EVERY_N` | `index.html` | 3 | Frames before sending to vision |
 
