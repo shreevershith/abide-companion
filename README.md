@@ -54,6 +54,14 @@ It runs on one machine with Docker Desktop. You double-click `start.bat`
 - **Proactive check-ins** — if the user is silent for 30 seconds, Abide
   initiates conversation based on what it sees on camera. It's a companion
   in the room, not a chatbot waiting for input.
+- **Welcome greeting** — on WebSocket connect, Abide plays a cached
+  "Hello, I'm Abide. How are you today?" instantly (no API call) so the
+  user hears a voice the moment the session starts.
+- **Diary export** — one-click download of the full session (transcript
+  + vision observations + alerts) as a timestamped plain-text file.
+- **Resume across refresh** — the last session's diary is kept in
+  `localStorage`; on reload, Abide offers to restore the transcript
+  for review. Starting a new session always clears it.
 - **User memory within session** — Abide extracts and remembers the user's
   name, topics discussed, preferences, and mood signals. These are injected
   into every Claude turn so responses feel personal ("John, I noticed you're
@@ -129,7 +137,7 @@ never pays a TLS handshake on their first turn.
 
 ## Quick Start
 
-### For a non-technical evaluator
+### For first-time users
 
 Follow `README-SETUP.txt`. In short:
 
@@ -183,10 +191,12 @@ abide-companion/
 |-- frontend/
 |   `-- index.html        Entire UI in one file: HTML + CSS + JS
 |                          - Conversation tab (real-time transcript)
-|                          - Diary tab (chronological event log)
+|                          - Diary tab (chronological event log) + Export button
 |                          - Session summary overlay (on Stop)
-|                          - Video overlay with bounding box
+|                          - Video overlay with bounding box + confidence badge
 |                          - Fall alert banner
+|                          - Resume-last-session banner (after refresh)
+|                          - Light/dark theme toggle (Abide Robotics brand)
 |-- Dockerfile            Python 3.12-slim + CPU torch + torchaudio + silero-vad
 |-- docker-compose.yml    Single service, .env mounted as env_file
 |-- start.bat             Windows launcher: docker compose up + open browser
@@ -194,8 +204,8 @@ abide-companion/
 |-- .env.example          Template for Langfuse env vars (developer only)
 |-- requirements.txt      Python dependencies
 |-- README.md             This file
-|-- README-SETUP.txt      Plain-English setup guide for the evaluator
-|-- DESIGN-NOTES.md       57 architectural decisions with context and trade-offs
+|-- README-SETUP.txt      Plain-English setup guide for end users
+|-- DESIGN-NOTES.md       65 architectural decisions with context and trade-offs
 |-- CLAUDE.md             Developer guidance for Claude Code sessions
 `-- TROUBLESHOOTING.md    10 bugs, root causes, and fixes
 ```
@@ -328,10 +338,10 @@ has four layers of defense (see D41, D48, Troubleshooting #8, #10):
 ## Key Design Decisions
 
 These are documented in full with alternatives and trade-offs in
-`DESIGN-NOTES.md` (57 entries across 8+ phases). Highlights:
+`DESIGN-NOTES.md` (65 entries across 8+ phases). Highlights:
 
 - **Single-file frontend, no framework** (D1) — build tools are a cold-start
-  liability for a zero-config evaluator experience.
+  liability for a zero-config first-run experience.
 - **Direct httpx instead of SDKs** (D5) — bypasses Windows SSL flakiness;
   HTTP/2 client reuse cuts ~500 ms off first-token latency.
 - **silero-vad on local CPU** (D3) — no API round-trip on the critical path.
@@ -360,6 +370,27 @@ These are documented in full with alternatives and trade-offs in
 - **UserContext persistence** (D53) — lightweight extraction call after each
   response extracts user facts (name, topics, preferences, mood) and
   injects them into every subsequent Claude turn.
+- **TTS cache for stock phrases** (D59) — 5 greetings/check-in phrases
+  pre-generated at session start serve in 0ms vs ~1500ms API call.
+- **Dynamic Whisper prompt biasing** (D60) — once the user's name is
+  extracted, it's appended to the STT prompt so Whisper recognizes it
+  correctly on subsequent utterances.
+- **Welcome greeting on connect** (D61) — on WebSocket open, Abide plays
+  "Hello, I'm Abide. How are you today?" from the TTS cache — no user
+  speech required, no Claude call, instant first impression.
+- **Vision confidence indicator** (D62) — scene chip appends a colored
+  badge: red `⚠ alert` for falls, amber `low confidence` for tiny bboxes,
+  green `confident` otherwise. Pure frontend heuristic.
+- **Activity stability filter** (D63) — `VisionBuffer` tracks consecutive
+  identical observations and suppresses redundant vision context when the
+  same activity has been stable for < 30s. Stops Claude from repeating
+  "still sitting" every turn.
+- **Diary export** (D64) — one-click download of the full session as a
+  plain-text `abide-session-YYYY-MM-DD.txt` file. No backend needed.
+- **Session persistence across refresh** (D65) — diary saved to
+  `localStorage` after every entry; on reload, optional "Resume last
+  session?" banner restores the transcript read-only. Clicking Start
+  always clears storage and begins a fresh session.
 - **Vision-reactive triggers** (D54) — waving, thumbs up, standing up etc.
   trigger an immediate Claude response within ~4 seconds, not waiting
   for the 30-second timer or user speech.
@@ -458,6 +489,9 @@ silent no-op. The voice loop never depends on telemetry.
 | `MAX_HISTORY` | `conversation.py` | 20 | Conversation window (messages) |
 | `CHECK_IN_INTERVAL_S` | `main.py` | 30 | Proactive check-in silence threshold (s) |
 | `_VISION_REACT_COOLDOWN_S` | `session.py` | 15.0 | Min seconds between vision-reactive responses |
+| `TTS_CACHE_PHRASES` | `main.py` | 5 phrases | Stock phrases pre-generated at session start (greetings, check-ins) |
+| `STABLE_REMIND_S` | `vision.py` | 30.0 | Seconds of stable activity before re-injecting vision context (D63) |
+| `SESSION_STORAGE_KEY` | `index.html` | `abide_last_session` | localStorage key for resume-across-refresh (D65) |
 | `CAPTURE_INTERVAL_MS` | `index.html` | 1200 | Vision frame capture interval |
 | `SEND_EVERY_N` | `index.html` | 3 | Frames before sending to vision |
 
@@ -473,14 +507,14 @@ Desktop, or run `docker compose down` in this folder.
 
 ## License
 
-Prototype / research code. No license granted.
+Proprietary. All rights reserved.
 
 ---
 
 ## Further Reading
 
 - `README-SETUP.txt` — one-page setup guide for the end user
-- `DESIGN-NOTES.md` — 57 architectural decisions with context and
+- `DESIGN-NOTES.md` — 65 architectural decisions with context and
   trade-offs across 8+ development phases
 - `TROUBLESHOOTING.md` — 10 bugs, root causes, and fixes
 - `CLAUDE.md` — developer instructions for Claude Code sessions

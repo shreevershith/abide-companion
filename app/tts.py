@@ -16,6 +16,17 @@ TTS_URL = "https://api.openai.com/v1/audio/speech"
 # Module-level persistent client. Created on first use so module import stays cheap.
 _client: httpx.AsyncClient | None = None
 
+# TTS cache: pre-generated opus audio for frequently-used stock phrases.
+# Populated by prewarm_cache() at session start. synthesize() checks this
+# first and serves the cached bytes instantly (0ms), bypassing the OpenAI
+# API call (~1000-2000ms). Keyed by _normalize_phrase(text).
+_tts_cache: dict[str, bytes] = {}
+
+
+def _normalize_phrase(text: str) -> str:
+    """Normalize a phrase for cache lookup: lowercased, stripped, collapsed whitespace."""
+    return " ".join(text.lower().strip().split())
+
 
 def _get_client() -> httpx.AsyncClient:
     global _client
@@ -64,9 +75,27 @@ async def aclose():
 async def synthesize(text: str, api_key: str, sentence_detected_ts: float | None = None) -> bytes:
     """Convert text to speech using OpenAI TTS. Returns raw opus audio bytes.
 
+    If the phrase is in the pre-generated cache (see prewarm_cache), the
+    cached bytes are returned instantly — no API call. Otherwise, streams
+    from OpenAI TTS and logs timing.
+
     If sentence_detected_ts (monotonic) is provided, logs the full timing breakdown:
       sentence boundary detected → API call start → first byte → last byte.
     """
+    # Cache hit path — instant return, bypass OpenAI entirely.
+    cache_key = _normalize_phrase(text)
+    cached = _tts_cache.get(cache_key)
+    if cached is not None:
+        if sentence_detected_ts is not None:
+            sentence_to_first_ms = (time.monotonic() - sentence_detected_ts) * 1000
+            log.info(
+                "[TTS-CACHE] Hit for '%s...' (sentence\u2192first=%.0fms, %dB)",
+                text[:40], sentence_to_first_ms, len(cached),
+            )
+        else:
+            log.info("[TTS-CACHE] Hit for '%s...' (%dB)", text[:40], len(cached))
+        return cached
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -127,3 +156,75 @@ async def synthesize(text: str, api_key: str, sentence_detected_ts: float | None
         )
 
     return audio
+
+
+# Hard cap on the cache size. The cache is module-level and persists
+# for the server process lifetime; this guard prevents unbounded growth
+# if someone ever passes a large phrase list to prewarm_cache().
+_TTS_CACHE_MAX_ENTRIES = 64
+
+
+async def _prewarm_single(phrase: str, api_key: str) -> None:
+    """Prewarm a single cache entry. Runs concurrently with siblings."""
+    key = _normalize_phrase(phrase)
+    if key in _tts_cache:
+        return
+    if len(_tts_cache) >= _TTS_CACHE_MAX_ENTRIES:
+        log.warning("[TTS-CACHE] Hit max size %d, skipping %r", _TTS_CACHE_MAX_ENTRIES, phrase[:40])
+        return
+    try:
+        t0 = time.monotonic()
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "tts-1",
+            "voice": "nova",
+            "input": phrase,
+            "response_format": "opus",
+        }
+        client = _get_client()
+        chunks: list[bytes] = []
+        async with client.stream("POST", TTS_URL, headers=headers, json=payload) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                log.warning(
+                    "[TTS-CACHE] Prewarm failed for %r: HTTP %d %s",
+                    phrase, resp.status_code, body[:100],
+                )
+                return
+            async for chunk in resp.aiter_bytes():
+                chunks.append(chunk)
+        audio = b"".join(chunks)
+        _tts_cache[key] = audio
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        log.info(
+            "[TTS-CACHE] Cached '%s...' in %.0fms (%dB)",
+            phrase[:40], elapsed_ms, len(audio),
+        )
+    except Exception as e:
+        log.warning("[TTS-CACHE] Prewarm error for %r: %s", phrase, e)
+
+
+async def prewarm_cache(phrases: list[str], api_key: str) -> None:
+    """Pre-generate TTS audio for stock phrases at session start.
+
+    All phrases are synthesized IN PARALLEL via asyncio.gather so total
+    wall-clock is ~one API call instead of N. Critical because the welcome
+    greeting waits ~1.2s for cache to populate; serial prewarming (5 × 1s)
+    would guarantee a cache miss and force a fallback API call for the
+    greeting.
+
+    Fired as a fire-and-forget task from main.py. Failures are logged but
+    non-fatal — synthesize() falls back to the API path on cache miss.
+    Cache persists for the lifetime of the server process (module-level),
+    bounded by _TTS_CACHE_MAX_ENTRIES.
+    """
+    import asyncio
+    if not phrases:
+        return
+    await asyncio.gather(
+        *(_prewarm_single(p, api_key) for p in phrases),
+        return_exceptions=True,  # don't let one failure cancel siblings
+    )

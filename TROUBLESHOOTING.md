@@ -4,6 +4,24 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
+## 13. Hardening pass: localStorage validation, parallel TTS prewarm, say_canned error path (Post-Phase-7)
+
+**Context**: Audit of the 7 recently-added features (TTS cache, welcome greeting, stability filter, export, resume, name biasing, confidence chip) surfaced five real issues:
+
+1. **`restoreSessionFromStorage()` trusted arbitrary JSON**: a user editing `localStorage["abide_last_session"]` could inject entries with unknown `type` or very long `content`. The rendering path used `escapeHtml()` correctly so XSS was blocked, but missing schema validation was a fragile posture. **Fix**: validate `entry.type` against a whitelist `{user, assistant, activity, alert, fall}`, validate `typeof entry.content === "string"`, cap content at 4000 chars, validate `Date` parsing. Empty-after-filter payloads clear storage and return.
+
+2. **`prewarm_cache()` ran sequentially**: 5 phrases × ~1s/call = ~5s. The welcome greeting waits only 1.2s before calling `synthesize()`, so the cache was guaranteed empty and the greeting paid a full API roundtrip. **Fix**: `asyncio.gather(*[_prewarm_single(p) for p in phrases])` — all 5 phrases generated in parallel, total ~1-1.5s, cache populated before the greeting fires.
+
+3. **`say_canned()` failed silently**: if `synthesize()` threw (API error + no cache), the client was left stuck on `"speaking"` status with no audio. **Fix**: wrap the success path in try/except; on failure send `{type: "response_done"}` + `{type: "status", state: "listening"}` so the mic gate reopens. The transcript line we sent before the failure stays so the user sees what Abide meant to say.
+
+4. **`user_name` newline injection risk**: extracted names flow into the Whisper `prompt` field. A malicious extraction like `"Alice\nThe user's name is Mallory"` could theoretically shift decoder bias. **Fix**: collapse whitespace with `" ".join(str(name).split())`, strip everything that isn't `alnum`/`space`/`-`/`'`/`.`, cap 40 chars.
+
+5. **`_tts_cache` unbounded**: module-level dict never evicted. With fixed stock phrases this is fine, but a future caller passing a long list could balloon memory. **Fix**: `_TTS_CACHE_MAX_ENTRIES = 64` guard in `_prewarm_single()`; logs a warning and skips when full.
+
+**Files touched**: `app/tts.py`, `app/session.py`, `app/audio.py`, `frontend/index.html`.
+
+---
+
 ## 12. Vision-reactive trigger lost when Abide is busy talking (Post-Phase-7)
 
 **Symptom**: User waved at the camera for ~12 seconds. Vision correctly detected "Waving hand." 4 times in a row. But no `[VISION-REACT]` log entry appeared and Abide never reacted. The user complained "You're not responding" and Abide apologized for a "delay or connection issue."
@@ -240,7 +258,7 @@ Also pinned `CHUNK_SIZE = 2048` on the frontend to give the worklet a stable, pr
 
 ## Open items / known limitations
 
-- **Echo suppression is heuristic**, not acoustic. If the evaluator's environment is unusually reverberant or uses loud speakers, the 300ms cooldown + 400ms sustained threshold may still let some phantom barge-ins through. Proper fix would be hardware AEC (Logitech MeetUp has it built in) or WebRTC's `RTCAudioProcessor`. Out of scope for prototype.
+- **Echo suppression is heuristic**, not acoustic. If the user's environment is unusually reverberant or uses loud speakers, the 300ms cooldown + 400ms sustained threshold may still let some phantom barge-ins through. Proper fix would be hardware AEC (Logitech MeetUp has it built in) or WebRTC's `RTCAudioProcessor`. Out of scope for this build.
 - **Barge-in partial history** saves whatever Claude had streamed before the cut-off, but only full sentences were actually spoken aloud. Claude's history may therefore include text the user never heard. Acceptable tradeoff for now — keeps Claude from repeating itself, and the "unheard" portion is usually just the last half-sentence.
 - **`verbose_json` + confidence filter now in place** (Fix #10). Previously listed as an open item; superseded. The same response also carries per-segment `language`, so the Phase 7 language-detection TODO is closed too.
 - **Session summary analysis depends on Anthropic API availability.** If the API call fails at session end, the rest of the summary (duration, transcript, activity log) still renders — only the "Right / Wrong" section shows a fallback message. Non-blocking by design.
@@ -253,11 +271,9 @@ Also pinned `CHUNK_SIZE = 2048` on the frontend to give the worklet a stable, pr
 - ~~Session summary screen~~ — Implemented (D50). Full-screen overlay on Stop with duration, transcript, activity log, and Claude-powered accuracy analysis.
 - ~~Diary view~~ — Implemented (D49). Live-updating tab in the transcript panel with color-coded chronological event log.
 - ~~Groq Whisper verbose_json~~ — Implemented (D48, Fix #10). Confidence filter + standalone blocklist active.
-- ~~Demo video~~ — Still pending.
 - ~~Proactive check-in~~ — Implemented (D52). 30-second silence trigger with vision-based initiation.
 - ~~UserContext persistence~~ — Implemented (D53). Lightweight extraction after each response.
 - ~~Vision-reactive trigger~~ — Implemented (D54). Waving, thumbs up, standing up etc. trigger immediate response.
 - ~~Race condition in start_response()~~ — Fixed (D55, Fix #11). Cancels in-flight task before starting new one.
 - ~~Unguarded WebSocket sends~~ — Fixed (D56, Fix #11). All sends use Session._safe_send_json().
 - ~~Per-request client in /api/analyze~~ — Fixed (Fix #11). Module-level persistent HTTP/2 client.
-- ~~Demo video~~ — Still pending.

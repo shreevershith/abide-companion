@@ -1,10 +1,9 @@
-# Abide Companion — AI Elderly Care Prototype
+# Abide Companion — AI Elderly Care Product
 
 ## Project Context
-Real-time multimodal AI companion for elderly care (Abide Robotics trial project).
-Evaluator is non-technical, Windows machine.
-Must work without developer involvement during setup and testing.
-Will be evaluated by Abide Robotics team.
+Real-time multimodal AI companion for elderly care (Abide Robotics).
+Primary target: non-technical end users on Windows (with Docker Desktop).
+Must work without developer involvement during first-run and daily use.
 
 ## Stack (non-negotiable)
 - Backend: FastAPI (Python)
@@ -16,8 +15,8 @@ Will be evaluated by Abide Robotics team.
 - VAD: silero-vad (runs locally — deliberate latency optimization, no API call)
 - Packaging: Docker + docker-compose + start.bat
 
-## Cold Start Requirements (CRITICAL)
-The evaluator must be able to run this with zero technical knowledge.
+## First-Run Experience (CRITICAL)
+End users install and run with zero technical knowledge.
 Acceptable steps:
 1. Install Docker Desktop (one link, one installer)
 2. Double-click start.bat
@@ -32,8 +31,8 @@ NOT acceptable:
 
 ## API Keys
 - Groq, Anthropic, OpenAI keys: entered in browser UI, stored in localStorage
-- Langfuse keys: stored server-side in .env (developer only, never shown to evaluator)
-- Evaluator needs exactly 3 keys: Groq, Anthropic, OpenAI
+- Langfuse keys: stored server-side in .env (developer-only, never shown in UI)
+- End user supplies exactly 3 keys: Groq, Anthropic, OpenAI
 
 ## Hard Requirements
 - Barge-in: fires at ~420ms (gated on 400ms sustained speech + RMS threshold)
@@ -78,9 +77,9 @@ Implementation: `showSessionSummary()` + `fetchAnalysis()` in `frontend/index.ht
 ## Diary View (COMPLETE — D49)
 Tab alongside "Conversation" in the transcript panel showing:
 - Full timestamped interaction history (user, assistant, vision, alerts)
-- Color-coded type badges (indigo/teal/amber/rose)
+- Color-coded type badges
 - Live-updating during session, scrollable after session ends
-- Cleared on next Start
+- Cleared on next Start; exportable to .txt; restorable after refresh
 Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in `frontend/index.html`.
 
 ## Vision Requirements
@@ -93,7 +92,7 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 - Fall detection: FALL: prefix → red alert banner + urgent Claude context
 - Prompt injection defense: vision context wrapped in <camera_observations> block
 
-## Build Order (completed phases)
+## Module Status
 1. ✅ Skeleton + audio loopback
 2. ✅ STT pipeline (silero-vad + Groq Whisper)
 3. ✅ Conversation engine (Claude streaming)
@@ -104,13 +103,19 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 8. ✅ Langfuse observability
 9. ✅ Session summary screen
 10. ✅ Diary view
-11. ⬜ Demo video
+11. ✅ TTS cache for stock phrases (D59)
+12. ✅ Whisper name biasing via UserContext (D60)
+13. ✅ Welcome greeting on connect (D61)
+14. ✅ Vision confidence indicator (D62)
+15. ✅ Activity stability filter in VisionBuffer (D63)
+16. ✅ Diary export button (D64)
+17. ✅ Session persistence across page refresh (D65)
 
 ## Never Do
 - Use React, Vue, or any frontend framework
 - Use <audio> element for TTS playback
 - Wait for full Claude response before starting TTS
-- Require terminal commands from the evaluator
+- Require terminal commands from the end user
 - Add unnecessary dependencies outside Docker
 - Create httpx/Groq/Anthropic clients per-request
 - Put user speech examples in Whisper prompt (causes hallucinations)
@@ -120,7 +125,7 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 
 ## Verification Checklist
 - [ ] Barge-in: speak mid-response, system stops within ~420ms
-- [ ] Cold start: follow README as non-technical user, zero errors
+- [ ] First-run: follow README as a non-technical user, zero errors
 - [ ] Stability: run 10-15 min continuously, no crashes
 - [ ] Corrections: say "no that's wrong" → handled gracefully
 - [ ] Partial input: mumble or speak out of frame → no crash
@@ -129,27 +134,6 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 - [ ] Session summary: click Stop → summary screen shows
 - [ ] Diary view: timestamped log visible and scrollable
 - [ ] Langfuse: traces visible in dashboard after session
-
-## Deliverables Checklist
-- [x] Working system
-- [x] README-SETUP.txt (plain English, 3 steps)
-- [x] DESIGN-NOTES.md (key decisions, limitations, tradeoffs)
-- [x] Session summary screen
-- [x] Diary view
-- [ ] 5-10 min demo video
-- [ ] WRITEUP.md (restructured from DESIGN-NOTES for submission)
-
-## Bonus Points Delivered
-- ✅ Local VAD via silero-vad
-- ✅ Multi-frame motion detection with fall alert
-- ✅ Gemini-Live-inspired UI with bounding box overlay
-- ✅ Langfuse observability (per-turn traces, vision traces, session summary)
-- ✅ Prompt injection defense on vision context
-- ✅ Whisper confidence filter (verbose_json + no_speech_prob threshold)
-- ✅ HTTP/2 persistent clients with connection prewarm
-- ✅ Proactive check-in (30s silence trigger) so Abide initiates conversation
-- ✅ UserContext fact extraction — Abide remembers name, topics, preferences within session
-- ❌ Logitech MeetUp pan/tilt (hardware not available, listed as bonus)
 
 ## File Structure
 abide-companion/
@@ -162,7 +146,7 @@ abide-companion/
 ├── start.sh
 ├── requirements.txt
 ├── README-SETUP.txt
-├── .env                 # Langfuse keys only (developer, not evaluator)
+├── .env                 # Langfuse keys only (developer-only)
 ├── .env.example         # Template with security warning header
 ├── app/
 │   ├── main.py          # FastAPI app, WebSocket, serves frontend
@@ -200,9 +184,10 @@ python-dotenv>=1.0
 - Vision bbox coordinates approximate, not surgical
 - Fall detection is best-effort, no emergency dispatch
 - Conversation history caps at 20 messages
-- No persistent session storage (in-memory only)
+- No persistent session storage across sessions (in-memory only)
 - English-only (language="en" passed to Whisper)
 - Direct httpx everywhere due to Windows SDK issues
+- Logitech MeetUp pan/tilt integration not built (hardware-specific, out of scope)
 
 ## Observability
 - Langfuse v2 (pinned <3.0)
@@ -216,3 +201,11 @@ python-dotenv>=1.0
 - Video frames analyzed and immediately discarded
 - Conversation history in-memory only, cleared on session end
 - Privacy notice displayed in UI
+
+## Living Documents
+- DESIGN-NOTES.md — source of truth for all architectural decisions
+  Add a new Dxx entry whenever a significant decision is made or changed
+- TROUBLESHOOTING.md — append-only bug log, newest entries at top
+  Add an entry whenever a non-trivial bug is found and fixed
+- CLAUDE.md — update immediately when any requirement changes
+  Never let CLAUDE.md drift from actual implementation state

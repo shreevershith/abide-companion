@@ -271,6 +271,48 @@ class Session:
         self.client_playing = False
         await self._safe_send_json(ws, {"type": "barge_in"})
 
+    async def say_canned(
+        self,
+        ws: WebSocket,
+        engine: ConversationEngine,
+        text: str,
+        openai_key: str | None,
+    ):
+        """Speak a canned phrase — bypass Claude entirely, serve from
+        TTS cache if possible. Used for the welcome greeting on connect
+        and other fixed utterances. Also appends to conversation history
+        so Claude knows what Abide has already said.
+        """
+        if not openai_key or ws.client_state != WebSocketState.CONNECTED:
+            return
+        try:
+            await self._safe_send_json(ws, {"type": "status", "state": "speaking"})
+            # Send the text to the transcript
+            await self._safe_send_json(ws, {"type": "response_chunk", "text": text})
+            # Synthesize (hits TTS cache for canned phrases)
+            t0 = time.monotonic()
+            audio = await synthesize(text, openai_key, t0)
+            if self._cancelled or ws.client_state != WebSocketState.CONNECTED:
+                return
+            await self._safe_send_bytes(ws, audio)
+            self.mark_tts_sent()
+            await self._safe_send_json(ws, {"type": "response_done"})
+            # Record in history so Claude knows what was already said
+            engine._history.append({"role": "assistant", "content": text})
+            await self._safe_send_json(ws, {"type": "status", "state": "listening"})
+            log.info("[CANNED] Said %r (%dB)", text[:50], len(audio))
+        except Exception as e:
+            # Surface the failure to the client so the UI doesn't get stuck
+            # showing "speaking" forever. The transcript line we sent above
+            # is left in place — the user at least sees what Abide meant to
+            # say. Reset status to listening so the mic gate re-opens.
+            log.error("say_canned failed: %s", e)
+            try:
+                await self._safe_send_json(ws, {"type": "response_done"})
+                await self._safe_send_json(ws, {"type": "status", "state": "listening"})
+            except Exception:
+                pass
+
     def start_response(
         self,
         ws: WebSocket,

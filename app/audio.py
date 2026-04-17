@@ -264,8 +264,20 @@ def _get_groq_client(api_key: str) -> AsyncGroq:
     return _groq_client
 
 
-async def transcribe(wav_bytes: bytes, api_key: str, speech_end_ts: float | None = None) -> str:
-    """Send WAV to Groq Whisper, return transcript text."""
+async def transcribe(
+    wav_bytes: bytes,
+    api_key: str,
+    speech_end_ts: float | None = None,
+    user_name: str | None = None,
+) -> str:
+    """Send WAV to Groq Whisper, return transcript text.
+
+    `user_name`, if provided, is appended to the Whisper prompt so the
+    decoder recognizes it as a proper noun. The name is extracted by
+    UserContext when the user introduces themselves, and persists across
+    the session. Dynamic prompt biasing — see D25c for the general rule
+    (only bias on rare-word disambiguation, never conversational filler).
+    """
     t_start = time.monotonic()
     client = _get_groq_client(api_key)
     # Whisper accepts a `prompt` string as a biasing hint — not part of
@@ -279,10 +291,19 @@ async def transcribe(wav_bytes: bytes, api_key: str, speech_end_ts: float | None
     # add conversational filler here; keep it strictly to rare-word
     # disambiguation (the assistant's name "Abide" gets mapped to "abide"
     # the verb, "a bide", "abyd", or "bye" without a hint).
-    STT_PROMPT = (
+    stt_prompt = (
         "The assistant's name is Abide, spelled A-B-I-D-E. "
         "Users may address it as Abide, Hey Abide, or Abide companion."
     )
+    if user_name:
+        # Sanitize: collapse whitespace/newlines (prevent the extracted
+        # name from breaking out of the intended sentence), cap length to
+        # avoid prompt bloat, strip control chars.
+        clean_name = " ".join(str(user_name).split())[:40]
+        # Drop anything that isn't a normal name character.
+        clean_name = "".join(c for c in clean_name if c.isalnum() or c in " -'.")
+        if clean_name:
+            stt_prompt += f" The user's name is {clean_name}."
     # response_format="verbose_json" gives us per-segment no_speech_prob
     # and avg_logprob, which are the standard Whisper hallucination
     # signals (same ones OpenAI's reference implementation uses to
@@ -293,7 +314,7 @@ async def transcribe(wav_bytes: bytes, api_key: str, speech_end_ts: float | None
         client.audio.transcriptions.create(
             file=("audio.wav", wav_bytes),
             model="whisper-large-v3",
-            prompt=STT_PROMPT,
+            prompt=stt_prompt,
             response_format="verbose_json",
             temperature=0.0,
             language="en",

@@ -148,34 +148,86 @@ class SceneEntry:
 
 @dataclass
 class VisionBuffer:
-    """Rolling buffer of the last N scene observations."""
+    """Rolling buffer of the last N scene observations with stability tracking."""
 
     entries: list[SceneEntry] = field(default_factory=list)
+    # Stability: count of consecutive identical activity descriptions.
+    # Used to suppress redundant "still sitting" injections into Claude's
+    # system prompt. See D61.
+    _consecutive_count: int = 0
+    # Monotonic timestamp of the first occurrence of the current stable
+    # activity. When this is None, nothing has stabilized yet.
+    _stable_since: float | None = None
+    # Monotonic timestamp of the last as_context() inject while stable —
+    # prevents re-injecting before STABLE_REMIND_S elapses.
+    _last_stable_inject_ts: float = 0.0
 
     def append(self, result: SceneResult):
         if not result or not result.activity:
             return
-        self.entries.append(SceneEntry(ts=time.monotonic(), result=result))
+        now = time.monotonic()
+        prev_activity = self.entries[-1].result.activity if self.entries else None
+        self.entries.append(SceneEntry(ts=now, result=result))
         if len(self.entries) > BUFFER_SIZE:
             self.entries = self.entries[-BUFFER_SIZE:]
+
+        # Stability accounting
+        if prev_activity is not None and result.activity == prev_activity:
+            self._consecutive_count += 1
+            if self._consecutive_count >= 3 and self._stable_since is None:
+                self._stable_since = now
+        else:
+            self._consecutive_count = 1
+            self._stable_since = None
+            # Reset the reminder clock on any activity change so the
+            # next injection after stabilization is immediate.
+            self._last_stable_inject_ts = 0.0
 
     @property
     def latest(self) -> str:
         return self.entries[-1].result.activity if self.entries else ""
 
+    @property
+    def is_stable(self) -> bool:
+        """True if the latest activity has been identical for 3+ consecutive
+        observations. Used by Session/main to decide whether to inject
+        vision context as 'new' information to Claude."""
+        return self._consecutive_count >= 3 and self._stable_since is not None
+
     def recent_texts(self) -> list[str]:
         return [e.result.activity for e in self.entries]
+
+    # Seconds after which a stable activity gets re-injected as a reminder.
+    # Below this, as_context() returns "" to avoid Claude repeating itself.
+    STABLE_REMIND_S = 30.0
 
     def as_context(self) -> str:
         """Format the buffer for injection into Claude's system prompt.
 
         Only the activity string is passed to Claude — bboxes are UI-only.
-        Returns empty string if there's no history yet. Includes relative
+        Returns empty string if there's no history yet, or if the activity
+        has been stable (same 3+ times) for less than STABLE_REMIND_S seconds
+        (suppresses redundant "still sitting" commentary). Includes relative
         timestamps so Claude has temporal awareness of activity changes.
         """
         if not self.entries:
             return ""
+
         now = time.monotonic()
+        # Stability suppression: if the activity hasn't changed recently
+        # AND we already injected less than STABLE_REMIND_S seconds ago,
+        # skip injection so Claude stops saying "I still see you sitting".
+        if self.is_stable:
+            since_last_inject = now - self._last_stable_inject_ts
+            if since_last_inject < self.STABLE_REMIND_S:
+                return ""
+            # Fall through and inject — this is the periodic reminder.
+            self._last_stable_inject_ts = now
+        else:
+            # Activity just changed (or still settling) — always inject
+            # and mark the time in case it stabilizes next.
+            self._last_stable_inject_ts = now
+
         lines = ["Recent activity history (most recent last):"]
         for e in self.entries:
             ago = now - e.ts
@@ -189,6 +241,8 @@ class VisionBuffer:
             else:
                 label = f"{int(ago // 3600)}h ago"
             lines.append(f"- {label}: {e.result.activity}")
+        if self.is_stable:
+            lines.append("(Note: this activity has been stable for a while.)")
         return "\n".join(lines)
 
     def clear(self):

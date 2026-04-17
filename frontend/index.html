@@ -297,6 +297,20 @@ main {
 }
 .scene-chip .scene-text { color: var(--text); font-weight: 500; }
 .scene-chip.empty .scene-text { color: var(--text-dim); font-style: italic; font-weight: 400; }
+.scene-chip .confidence {
+    display: inline-block;
+    margin-left: 10px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 2px 8px;
+    border-radius: 10px;
+    vertical-align: middle;
+}
+.confidence-confident { color: #3fb27f; background: rgba(63, 178, 127, 0.15); border: 1px solid rgba(63, 178, 127, 0.3); }
+.confidence-low       { color: var(--amber); background: var(--accent-soft); border: 1px solid rgba(212, 160, 57, 0.3); }
+.confidence-alert     { color: var(--rose); background: rgba(212, 80, 80, 0.15); border: 1px solid rgba(212, 80, 80, 0.4); }
 
 /* Camera-unavailable notice */
 .vision-notice {
@@ -363,6 +377,7 @@ main {
     font-size: 13px; font-weight: 600; color: var(--text-dim);
     text-transform: uppercase; letter-spacing: 0.08em;
 }
+.transcript-header-actions { display: flex; gap: 6px; }
 .transcript-header .toggle {
     font-size: 13px;
     color: var(--text-dim);
@@ -637,6 +652,35 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Resume-session banner ── */
+.resume-banner {
+    display: none;
+    position: fixed;
+    top: 76px; left: 50%; transform: translateX(-50%);
+    z-index: 50;
+    padding: 12px 18px;
+    background: var(--chip-bg);
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--border-hi);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    color: var(--text);
+    font-size: 14px;
+    align-items: center; gap: 12px;
+    max-width: 90vw;
+}
+.resume-banner.show { display: flex; }
+.resume-banner .resume-meta { color: var(--text-dim); font-size: 12px; }
+.resume-banner button {
+    padding: 6px 14px; font-size: 13px; border-radius: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); cursor: pointer;
+}
+.resume-banner button.primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+    border-color: transparent; color: #fff;
+}
+
 /* ── Theme toggle ── */
 .theme-toggle {
     width: 38px; height: 38px; border-radius: 50%;
@@ -698,7 +742,10 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
                 <button class="tab-btn active" id="tabConversation">Conversation</button>
                 <button class="tab-btn" id="tabDiary">Diary</button>
             </div>
-            <button class="toggle" id="transcriptToggle">Hide</button>
+            <div class="transcript-header-actions">
+                <button class="toggle" id="exportBtn" style="display:none;" title="Download diary as a .txt file">Export</button>
+                <button class="toggle" id="transcriptToggle">Hide</button>
+            </div>
         </div>
         <div id="transcript"><div class="empty">Press Start and speak to begin a conversation.</div></div>
         <div id="diary" style="display:none;"><div class="empty">Diary entries will appear here during the session.</div></div>
@@ -728,6 +775,16 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
 </div>
 
 <!-- Session summary overlay -->
+<!-- Resume last session banner -->
+<div class="resume-banner" id="resumeBanner" role="alert">
+    <div>
+        <div>Resume last session?</div>
+        <div class="resume-meta" id="resumeMeta"></div>
+    </div>
+    <button class="primary" id="resumeYes">Yes</button>
+    <button id="resumeNo">No</button>
+</div>
+
 <div class="summary-overlay" id="summaryOverlay">
     <div class="summary-modal">
         <div class="summary-header">
@@ -781,6 +838,32 @@ let currentAssistantMsg = null;
 // ── Session diary & summary state ──
 let sessionStartTime = null;
 let diaryEntries = []; // { timestamp: Date, type: "user"|"assistant"|"activity"|"alert"|"fall", content: string }
+
+// ── localStorage session persistence (CHANGE 7) ──
+// The last session's diary+metadata is saved on every change so a page
+// refresh can offer to resume. Clicking Start ALWAYS clears this — we
+// never merge a previous session's context into a fresh live session.
+const SESSION_STORAGE_KEY = "abide_last_session";
+function persistSession() {
+    if (!sessionStartTime || !diaryEntries.length) return;
+    try {
+        const payload = {
+            startTime: sessionStartTime.toISOString(),
+            entries: diaryEntries.map(e => ({
+                t: e.timestamp.toISOString(),
+                type: e.type,
+                content: e.content,
+            })),
+        };
+        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
+    } catch (e) {
+        // Quota exceeded or disabled — silently ignore, persistence is best-effort.
+        console.warn("Session persistence failed:", e);
+    }
+}
+function clearStoredSession() {
+    try { localStorage.removeItem(SESSION_STORAGE_KEY); } catch (e) {}
+}
 
 // ── Vision state ──
 let videoStream = null;
@@ -842,6 +925,7 @@ const $micRing  = document.getElementById("micRing");
 const $keyDrawer = document.getElementById("keyDrawer");
 const $keyGear  = document.getElementById("keyGear");
 const $diary    = document.getElementById("diary");
+const $exportBtn = document.getElementById("exportBtn");
 const $tabConversation = document.getElementById("tabConversation");
 const $tabDiary = document.getElementById("tabDiary");
 const $summaryOverlay = document.getElementById("summaryOverlay");
@@ -859,6 +943,102 @@ $themeToggle.addEventListener("click", () => {
     document.documentElement.dataset.theme = next;
     localStorage.setItem("theme", next);
     applyThemeIcon();
+});
+
+// ── Resume last session banner (CHANGE 7) ──
+const $resumeBanner = document.getElementById("resumeBanner");
+const $resumeMeta = document.getElementById("resumeMeta");
+const $resumeYes = document.getElementById("resumeYes");
+const $resumeNo = document.getElementById("resumeNo");
+
+function dismissResumeBanner() {
+    $resumeBanner.classList.remove("show");
+}
+
+function restoreSessionFromStorage() {
+    let payload;
+    try {
+        const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (!raw) return;
+        payload = JSON.parse(raw);
+        if (!payload || !Array.isArray(payload.entries) || !payload.entries.length) {
+            clearStoredSession();
+            return;
+        }
+    } catch (e) {
+        clearStoredSession();
+        return;
+    }
+    // Rehydrate diary entries — validate every item. Tampered localStorage
+    // could inject arbitrary fields; only accept known types and coerce
+    // content/timestamps to safe primitives.
+    const VALID_TYPES = new Set(["user", "assistant", "activity", "alert", "fall"]);
+    const startDate = new Date(payload.startTime);
+    if (isNaN(startDate.getTime())) { clearStoredSession(); return; }
+    sessionStartTime = startDate;
+    diaryEntries = payload.entries
+        .filter(e => e && typeof e === "object" && VALID_TYPES.has(e.type) && typeof e.content === "string")
+        .map(e => ({
+            timestamp: (function(){ const d = new Date(e.t); return isNaN(d.getTime()) ? new Date() : d; })(),
+            type: e.type,
+            content: e.content.slice(0, 4000), // cap runaway content
+        }));
+    if (!diaryEntries.length) { clearStoredSession(); return; }
+    // Clear placeholders
+    $diary.innerHTML = "";
+    $transcript.innerHTML = "";
+    // Render diary entries
+    for (const e of diaryEntries) renderDiaryEntry(e);
+    // Render user/assistant as transcript messages
+    for (const e of diaryEntries) {
+        if (e.type === "user") {
+            const div = document.createElement("div");
+            div.className = "msg user";
+            const time = e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            div.innerHTML = `<span class="label">You<span class="time">${time}</span></span>${escapeHtml(e.content)}`;
+            $transcript.appendChild(div);
+        } else if (e.type === "assistant") {
+            const div = document.createElement("div");
+            div.className = "msg assistant";
+            const time = e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            div.innerHTML = `<span class="label">Abide<span class="time">${time}</span></span><span class="text">${escapeHtml(e.content)}</span>`;
+            $transcript.appendChild(div);
+        }
+    }
+    if (!$transcript.childElementCount) {
+        $transcript.innerHTML = '<div class="empty">No conversation in the resumed session.</div>';
+    }
+    $transcript.scrollTop = $transcript.scrollHeight;
+}
+
+(function initResumeBanner() {
+    let payload;
+    try {
+        const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (!raw) return;
+        payload = JSON.parse(raw);
+        if (!payload || !Array.isArray(payload.entries) || !payload.entries.length) {
+            clearStoredSession();
+            return;
+        }
+    } catch (e) {
+        clearStoredSession();
+        return;
+    }
+    const start = new Date(payload.startTime);
+    const n = payload.entries.length;
+    $resumeMeta.textContent =
+        start.toLocaleString() + " · " + n + " entries";
+    $resumeBanner.classList.add("show");
+})();
+
+$resumeYes.addEventListener("click", () => {
+    restoreSessionFromStorage();
+    dismissResumeBanner();
+});
+$resumeNo.addEventListener("click", () => {
+    clearStoredSession();
+    dismissResumeBanner();
 });
 
 // ── API key persistence ──
@@ -903,16 +1083,54 @@ function switchTab(tabName) {
         $diary.style.display = "none";
         $tabConversation.classList.add("active");
         $tabDiary.classList.remove("active");
+        $exportBtn.style.display = "none";
     } else {
         $transcript.style.display = "none";
         $diary.style.display = "";
         $tabConversation.classList.remove("active");
         $tabDiary.classList.add("active");
         $diary.scrollTop = $diary.scrollHeight;
+        // Export is only useful when there's something to export
+        $exportBtn.style.display = (diaryEntries.length > 0) ? "" : "none";
     }
 }
 $tabConversation.addEventListener("click", () => switchTab("conversation"));
 $tabDiary.addEventListener("click", () => switchTab("diary"));
+
+// ── Export diary as plain text ──
+function exportDiary() {
+    if (!diaryEntries.length) return;
+    const startTs = sessionStartTime || diaryEntries[0].timestamp;
+    const endTs = diaryEntries[diaryEntries.length - 1].timestamp;
+    const durMs = endTs - startTs;
+    const mins = Math.floor(durMs / 60000);
+    const secs = Math.floor((durMs % 60000) / 1000);
+    const dateStr = startTs.toISOString().slice(0, 10);
+    const dateHuman = startTs.toLocaleString();
+    const typeLabels = { user: "You", assistant: "Abide", activity: "Vision", alert: "Alert", fall: "FALL" };
+    let out = "";
+    out += "Abide Companion — Session Transcript\n";
+    out += "======================================\n";
+    out += "Date:     " + dateHuman + "\n";
+    out += "Duration: " + mins + "m " + secs + "s\n";
+    out += "Entries:  " + diaryEntries.length + "\n";
+    out += "\n--- Log ---\n\n";
+    for (const e of diaryEntries) {
+        const t = e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        const label = typeLabels[e.type] || e.type;
+        out += "[" + t + "] " + label + ": " + e.content + "\n";
+    }
+    const blob = new Blob([out], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "abide-session-" + dateStr + ".txt";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+$exportBtn.addEventListener("click", exportDiary);
 
 // ── Diary helpers ──
 const _diaryTypeLabels = { user: "You", assistant: "Abide", activity: "Vision", alert: "Alert", fall: "Fall" };
@@ -921,6 +1139,13 @@ function addDiaryEntry(type, content) {
     const entry = { timestamp: new Date(), type, content };
     diaryEntries.push(entry);
     renderDiaryEntry(entry);
+    // Reveal the Export button if the diary tab is open and this was
+    // the first entry for this session.
+    if (diaryEntries.length === 1 && $tabDiary.classList.contains("active")) {
+        $exportBtn.style.display = "";
+    }
+    // Persist so a page refresh can offer to resume.
+    persistSession();
 }
 
 function renderDiaryEntry(entry) {
@@ -986,6 +1211,24 @@ function escapeHtml(s) {
     const d = document.createElement("div");
     d.textContent = s;
     return d.innerHTML;
+}
+
+// Heuristic confidence indicator for the scene chip.
+// - FALL: prefix           → red "⚠ alert"
+// - bbox area < 5%         → amber "low confidence"
+// - otherwise              → green "confident"
+function renderConfidenceBadge(activityText, bbox) {
+    if (!activityText) return "";
+    if (/^\s*fall\s*:/i.test(activityText)) {
+        return '<span class="confidence confidence-alert">⚠ alert</span>';
+    }
+    if (Array.isArray(bbox) && bbox.length === 4) {
+        const area = Math.max(0, bbox[2] - bbox[0]) * Math.max(0, bbox[3] - bbox[1]);
+        if (area < 0.05) {
+            return '<span class="confidence confidence-low">low confidence</span>';
+        }
+    }
+    return '<span class="confidence confidence-confident">confident</span>';
 }
 
 // ── Web Audio TTS playback (strictly sequential) ──
@@ -1330,6 +1573,11 @@ $startBtn.onclick = async () => {
     $diary.innerHTML = '<div class="empty">Diary entries will appear here during the session.</div>';
     // Reset transcript for new session
     $transcript.innerHTML = '<div class="empty">Press Start and speak to begin a conversation.</div>';
+    $exportBtn.style.display = "none";
+    // CRITICAL: starting a fresh live session always discards any
+    // stored previous session. We never merge stale context in.
+    clearStoredSession();
+    dismissResumeBanner();
 
     try {
         micStream = await navigator.mediaDevices.getUserMedia({
@@ -1417,9 +1665,9 @@ $startBtn.onclick = async () => {
                 // no-op
             } else if (msg.type === "scene") {
                 $sceneChip.classList.remove("empty");
-                $scene.textContent = msg.text;
                 latestActivity = msg.text || "";
                 latestBBox = Array.isArray(msg.bbox) && msg.bbox.length === 4 ? msg.bbox : null;
+                $scene.innerHTML = escapeHtml(msg.text) + renderConfidenceBadge(msg.text, latestBBox);
                 drawOverlay();
                 // If the scene itself declares a fall (redundant with the
                 // dedicated alert message but harmless), surface the banner.

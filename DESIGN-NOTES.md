@@ -1,6 +1,6 @@
 # Abide Companion — Design Notes
 
-A running log of architectural decisions, trade-offs, and known limitations. This file is the source of truth for the final write-up deliverable.
+A running log of architectural decisions, trade-offs, and known limitations. This file is the source of truth for why the codebase is the way it is.
 
 Format for each entry:
 - **Decision** — what we did
@@ -14,7 +14,7 @@ Format for each entry:
 
 ### D1. Single-file HTML frontend, no framework
 - **Decision**: The entire UI is a single `frontend/index.html` with inline CSS + JS. No React, no Vue, no build tools, no npm.
-- **Context**: The evaluator's experience must be zero-configuration — double-click `start.bat` and go. Any build step (transpilation, bundling, HMR) would bleed complexity into the cold-start experience.
+- **Context**: The end-user experience must be zero-configuration — double-click `start.bat` and go. Any build step (transpilation, bundling, HMR) would bleed complexity into the first-run experience.
 - **Alternatives**: React + Vite, plain React with `<script type="text/babel">`, Svelte.
 - **Trade-offs**: No component reuse, all state is module-global, CSS lives next to structure. For ~1000 lines of UI code this is a net win — fewer moving parts, nothing to "install", ships as a static asset from FastAPI.
 
@@ -28,7 +28,7 @@ Format for each entry:
 - **Decision**: Voice-activity detection is loaded from the `silero-vad` package and runs on CPU via PyTorch inside the FastAPI process. No network round-trip for VAD.
 - **Context**: VAD is on the critical path of the voice loop. Every audio chunk is a VAD decision. An API call per chunk (~30 ms) would inflate barge-in latency by hundreds of ms and would be cost-prohibitive.
 - **Alternatives**: Groq's server-side VAD, Deepgram, or a WebAudio-based energy threshold in the browser.
-- **Trade-offs**: Adds ~80 MB of PyTorch to the Docker image and a one-time model download on first run (cached). Accepted because VAD latency directly affects user perceived responsiveness and the CLAUDE.md brief explicitly calls out "Running VAD locally via silero-vad" as a bonus.
+- **Trade-offs**: Adds ~80 MB of PyTorch to the Docker image and a one-time model download on first run (cached). Accepted because VAD latency directly affects user perceived responsiveness and keeping the VAD off the critical network path makes barge-in feel instantaneous.
 
 ### D4. Linear interpolation for 48 kHz → 16 kHz downsampling
 - **Decision**: `app/audio.py` downsamples browser audio (typically 48 kHz) to silero-vad's required 16 kHz via simple linear interpolation, not `scipy.signal.resample` or a polyphase filter.
@@ -153,7 +153,7 @@ Format for each entry:
 
 ### D21. Bounding box in vision JSON output, rendered as overlay canvas
 - **Decision**: Vision now returns `{"activity": "...", "bbox": [x1, y1, x2, y2]}` via `response_format: json_object`. Frontend draws a dashed indigo rectangle with mint corner ticks and a glass label chip over a mirrored `<canvas>`.
-- **Context**: The CLAUDE.md brief explicitly rewards "more complex activity detection". Showing where the model is looking is a far stronger capability signal than text alone, and it's the kind of detail Abide Robotics will notice.
+- **Context**: Showing where the model is looking is a far stronger capability signal than text alone. A rendered bounding box turns abstract vision output into something a user can immediately verify or correct.
 - **Alternatives**: Text-only scene, separate bbox call (2 vision calls per tick = too expensive), segmentation mask (massive payload, overkill).
 - **Trade-offs**: bbox coordinates from `gpt-4o-mini` are "roughly right" but not surgically accurate — the box is visually convincing as a tracker but wouldn't survive a real IoU benchmark. Documented as a known limitation.
 
@@ -174,19 +174,19 @@ Format for each entry:
 - **Context**: Fall is the canonical elder-care safety event. It needs to trigger a user-visible alert AND cause Abide to proactively check in — not just describe the fall in the next scene chip.
 - **Alternatives**: Separate pose-estimation model (too heavy), hand-coded heuristics on bbox vertical position over time (brittle), no alert at all (irresponsible).
 - **Trade-offs**: False positives are low-cost (Abide gently asks "are you alright?" — a good failure mode). False negatives are expensive (missed fall). Prompt is biased toward flagging. The 20 s banner auto-hide and one-turn urgent-context lifetime prevent the system from getting stuck in "emergency mode" after a false alarm.
-- **Known limitation**: We do NOT auto-dial emergency services. Abide offers to call someone; the user still has to say yes. This is the right posture for a prototype but should be called out in the deliverable.
+- **Known limitation**: Abide does NOT auto-dial emergency services. It offers to call someone; the user still has to say yes. This is the right posture for a companion product — autonomous dialing requires regulatory compliance and reliability guarantees that are out of scope for this build.
 
 ### D25c. Whisper prompt hint for recognizing the assistant's name
 - **Decision**: `app/audio.py` `transcribe()` passes a minimal `prompt` string to the Groq Whisper API that *only* names the assistant and spells it out: `"The assistant's name is Abide, spelled A-B-I-D-E. Users may address it as Abide, Hey Abide, or Abide companion."`. Crucially, the prompt does NOT list any common conversational phrases ("hello", "thank you", "goodbye", etc.).
 - **Context**: Whisper's `prompt` parameter is a decoder bias — every token inside it has its output probability raised for the current call. It was originally added because Whisper was mapping the unfamiliar name "Abide" onto the nearest common English word ("bye"), starting a farewell path on turn one. The initial implementation grew to include a grab-bag of "common conversation" openers on the theory that more examples would help. That was the wrong model: the prompt is a logit-bias list, not a few-shot example list, and every extra phrase we added raised the prior that Whisper would emit that exact phrase on ambiguous audio. See the D48 / Troubleshooting #10 write-up for the specific failure this caused (`"Thank you"` hallucinations during normal use).
 - **Rule**: tokens in the Whisper prompt should only be words that disambiguate rare vocabulary the decoder cannot otherwise handle (here: the assistant's proper name). Never put user-side filler, greetings, or stock phrases in it — you will get them back whether the user said them or not.
-- **Alternatives**: (a) Pass `language="en"` — now done at the same call site (see D48); restricts to English but also skips Whisper's language-detection pass, which is itself a source of hallucinations on silence. (b) Use `response_format="verbose_json"` for segment-level confidence scoring — also now done (D48). (c) Fine-tune Whisper — absurd for a prototype.
+- **Alternatives**: (a) Pass `language="en"` — now done at the same call site (see D48); restricts to English but also skips Whisper's language-detection pass, which is itself a source of hallucinations on silence. (b) Use `response_format="verbose_json"` for segment-level confidence scoring — also now done (D48). (c) Fine-tune Whisper — infrastructure we don't have.
 - **Trade-offs**: Abide-the-name is the only rare word we bias toward. Users with unusual vocabulary (medical terms, family member names) are not helped, but adding more terms re-opens the hallucination footgun unless each term is vetted. A production system could scope per-user bias lists after the same review.
 
 ### D25b. RMS-gated barge-in to prevent TTS echo false positives (post-Phase-6b fix)
 - **Decision**: `AudioProcessor` tracks a running max-RMS over the current in-progress speech segment (`current_max_rms`). The barge-in decision in `main.py` now requires BOTH `SUSTAINED_SPEECH_MS` elapsed AND `processor.current_max_rms >= BARGE_IN_MIN_RMS` (0.015). If sustained speech is detected but its peak RMS is still below the threshold, we log a "too quiet, holding" message and leave the pending barge-in armed — if the user genuinely starts speaking loudly, the max RMS will climb and barge-in fires on the next chunk.
 - **Context**: A live session showed three separate false-positive barge-ins where silero-vad classified TTS echo (leaking through the mic despite `echoCancellation: true`) as "speech" for 400+ ms. Each one killed Abide's response mid-sentence, and the existing `[FILTER] Rejected quiet segment` check only fired AFTER the segment ended — too late. The echo segments had RMS ≈ 0.005–0.007, vs real speech in the same session at 0.03–0.08, giving a very clean separation threshold.
-- **Alternatives**: (a) raise `SUSTAINED_SPEECH_MS` to 600–800 ms — slower barge-in, still vulnerable to longer echo bursts; (b) extend `POST_TTS_COOLDOWN_MS` to cover the full TTS playback window — requires tracking client-side playback state on the server (complex); (c) dedicated webrtc echo-cancellation DSP — right answer for production, too much work for the prototype.
+- **Alternatives**: (a) raise `SUSTAINED_SPEECH_MS` to 600–800 ms — slower barge-in, still vulnerable to longer echo bursts; (b) extend `POST_TTS_COOLDOWN_MS` to cover the full TTS playback window — requires tracking client-side playback state on the server (complex); (c) dedicated webrtc echo-cancellation DSP — right answer for a hardware-integrated deployment, more engineering than the software-only path justifies.
 - **Trade-offs**: Barge-in is now gated on loudness, which means someone speaking very quietly during a response may not trigger barge-in. Acceptable — a whisper mid-response is an unusual case, and the same person can just wait for Abide to finish or speak up. Much better than killing every other response with phantom barge-ins. RMS threshold 0.015 is identical to the existing post-hoc `MIN_SPEECH_RMS` filter in `audio.py`, so the two gates share the same tuning decision.
 - **Related**: D14 (original 400 ms sustained-speech threshold), D18 (fire-and-forget vision worker that should never be affected by this).
 
@@ -220,9 +220,9 @@ Format for each entry:
 
 ### D29. Server-side Langfuse keys (via `os.environ`), not browser UI
 - **Decision**: Langfuse credentials are read from `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_HOST` environment variables in the server process. They are NOT added to the frontend's API key drawer.
-- **Context**: Telemetry is a developer-facing concern, not a user-facing feature. The evaluator should never have to supply Langfuse credentials. Keeping them server-side is consistent with the Phase 8 philosophy of evaluator-never-touches-config (even though Phase 8 is not yet implemented, this is the right posture for this specific config).
+- **Context**: Telemetry is a developer-facing concern, not a user-facing feature. End users should never have to supply Langfuse credentials. Keeping them server-side is consistent with the zero-config end-user experience.
 - **Alternatives**: Add a fourth key field to the drawer (wrong — exposes a developer detail to the user); hard-code keys in source (catastrophic security failure).
-- **Trade-offs**: If Phase 8 is skipped or the evaluator needs to override keys, they'll have to edit a `.env` file — but that's acceptable for telemetry, which is optional anyway.
+- **Trade-offs**: An operator who needs to override keys has to edit a `.env` file — acceptable for telemetry, which is optional anyway.
 
 ### D30. Graceful no-op when langfuse package or keys are missing
 - **Decision**: Every function in `app/telemetry.py` is wrapped in a `@_safe` decorator that swallows all exceptions. `init_langfuse()` returns `None` if keys are missing or the package is not importable. Pipeline code calls every helper unconditionally, passing `None` handles without branching.
@@ -234,11 +234,52 @@ Format for each entry:
 
 ## Post-Phase-7: Code review hardening
 
+### D65. Session persistence across page refresh with opt-in resume
+- **Decision**: On every diary entry, the current session (startTime + diaryEntries) is serialized to `localStorage["abide_last_session"]` as JSON (ISO timestamps). On page load, if stored data exists, a fixed-position "Resume last session?" banner appears with Yes/No. Yes rehydrates `diaryEntries` + re-renders the diary tab + renders user/assistant messages back into the transcript panel. No clears localStorage. Clicking **Start always clears localStorage** regardless of banner state — a new live session never inherits stale context.
+- **Context**: Accidental tab close / refresh during a long session was destroying the transcript. Users want to scroll back through what they just saw. But merging old context into a new live session would confuse Claude (it would see the new audio but also remember a conversation the user doesn't know about), so resume is explicitly view-only — it restores the diary/transcript display without restoring `engine._history` or `UserContext` on the server.
+- **Safeguards**: `try/catch` around every localStorage call (Safari private mode, quota errors); malformed JSON auto-clears the key; best-effort — if persistence fails silently, normal flow is unaffected.
+- **Trade-offs**: ~500 entries × ~100 bytes ≈ 50KB per session in localStorage. Well under the 5MB limit. Resume doesn't restart the voice loop (that requires Start); it's purely a transcript archive until the user clicks Start.
+
+### D64. Diary export button (plain-text download)
+- **Decision**: An "Export" button appears in the transcript header when the Diary tab is active AND there are entries. On click, generates a plain-text file `abide-session-YYYY-MM-DD.txt` with: session date, duration, entry count, then a log of every entry formatted as `[HH:MM:SS] Type: content`. Uses `Blob` + `URL.createObjectURL` + a synthetic `<a download>` click. Pure frontend.
+- **Context**: Care teams and family members want to share session transcripts offline without taking screenshots. Markdown/JSON exports were considered but plain text copies into emails, docs, and support tickets without any rendering step.
+- **Trade-offs**: No metadata beyond entries (no bbox coords, no per-entry timestamps in ISO). Good enough for human review; not a data interchange format.
+
+### D63. Activity stability filter in VisionBuffer
+- **Decision**: `VisionBuffer.append()` now tracks `_consecutive_count` of identical consecutive `activity` strings. When count ≥ 3, the buffer enters a "stable" state (`is_stable=True`). `as_context()` checks stability: if stable AND the last injection was < 30 seconds ago (`STABLE_REMIND_S`), returns `""` so Claude doesn't receive redundant "still sitting" context on every turn. A 30-second reminder injection re-adds the context (now annotated "this activity has been stable for a while") so Claude can decide whether to check in.
+- **Context**: User complaint in testing: "Abide keeps commenting that I'm sitting, I know." The vision pipeline fires every ~3.6s, so Claude was seeing the same observation every turn and naturally repeating it. This change converts repeated observations into implicit "no change" info by simply withholding them.
+- **Alternatives**: (a) Deduplicate on the client side — server-side is cleaner because Claude's system prompt is built server-side. (b) Let Claude deduplicate in the prompt — relies on model compliance, fragile. (c) Reduce vision frequency when stable — harder, loses the ability to detect quick activity changes. The stability filter is the simplest correct version.
+- **Trade-offs**: During 30s of stability, Claude has no recent vision context. If the user says something ambiguous during that window ("look at this"), Claude won't know what "this" is. Acceptable because the user would typically say something that triggers the next vision frame to differ (e.g., holding up the object), resetting the stability timer. The 30s reminder also bounds the staleness.
+
+### D62. Vision confidence indicator in scene chip (frontend)
+- **Decision**: The scene chip now appends a colored badge next to the activity text: `⚠ alert` (red) for `FALL:` prefixes, `low confidence` (amber) for bboxes covering < 5% of the frame, `confident` (green) otherwise. Pure heuristic, pure frontend — computed in `renderConfidenceBadge(activityText, bbox)` on every scene message.
+- **Context**: Users couldn't tell whether a weird activity description ("Something in the corner") was a real insight or a hallucination. The small/large bbox is a reasonable proxy for model spatial confidence — GPT-4o-mini tends to return very small bboxes when it's uncertain where the person is.
+- **Trade-offs**: Heuristic, not the model's own confidence score (GPT-4o-mini doesn't expose one). The 5% threshold is a calibration point that may need tuning if the camera is far from the subject. No server change.
+
+### D61. Welcome greeting on WebSocket connect
+- **Decision**: On successful WS connection + config receipt, Session fires an `asyncio.create_task(_welcome())` that waits 1.2 seconds (to let the TTS cache prewarm populate the first phrase) then calls `Session.say_canned()` with "Hello, I'm Abide. How are you today?". This bypasses Claude entirely, hits the TTS cache (D59), and serves instantly. The greeting text is recorded in `engine._history` so Claude knows it already greeted and the next turn continues naturally.
+- **Context**: Previous behavior required the user to speak first before Abide would do anything. First-time users sat silently for 30 seconds until the check-in fired. A cold greeting on connect signals "I'm here and listening" immediately.
+- **Alternatives**: (a) Start with a Claude-generated greeting — adds Claude latency to first interaction. (b) Hardcode the text client-side — would need the audio anyway, so use the cache. (c) Play audio without recording in history — Claude might then greet again on the first user turn. The chosen approach treats the greeting as a real assistant turn.
+- **Trade-offs**: If the TTS cache hasn't finished prewarming after 1.2s, `say_canned` falls through to an API call (still correct, just slower). The 1.2s delay is tuned to match typical prewarm time; slightly longer is safer than racing the cache.
+
+### D60. Dynamic Whisper prompt biasing with UserContext.name
+- **Decision**: `transcribe()` in `audio.py` accepts an optional `user_name` parameter. When set, appends `"The user's name is <Name>."` to the Whisper prompt. Main.py passes `session.user_context.name` on every STT call, so once the user introduces themselves (e.g., "I'm John") and the extraction pipeline (D53) captures it, subsequent utterances containing the name are transcribed correctly instead of being mapped to phonetically similar words.
+- **Context**: Whisper routinely mishears proper nouns it hasn't seen in the audio prompt. "Sarah" becomes "Sara" or "Saira"; "Abhishek" becomes "a besiege". The Whisper `prompt` field is exactly the right tool for this — the existing prompt already handles "Abide" the same way (D25c).
+- **Safeguards**: Name is stripped and capped at 40 chars to prevent prompt bloat. If `UserContext.name` is None (user hasn't introduced themselves), the call is unchanged. No hallucination risk because we're only biasing on an explicit user-supplied identity.
+- **Trade-offs**: Adds one fact to the prompt per call after the name is known. Negligible cost. Updates as soon as the user introduces themselves — no stale biasing if the user changes who they are mid-session.
+
+### D59. TTS cache for stock phrases
+- **Decision**: Added a module-level `_tts_cache: dict[str, bytes]` to `app/tts.py` that stores pre-generated opus audio for frequently-used stock phrases. `synthesize()` checks the cache first (normalized lowercase key) and returns the cached bytes instantly if hit. `prewarm_cache()` is called at session start from `main.py`'s config handler to pre-generate the 5 phrases in `TTS_CACHE_PHRASES`: "Hello, how are you today?", "I'm listening", "Could you repeat that?", "I'm here if you need me", "Are you alright?".
+- **Context**: OpenAI's `tts-1` endpoint has a first-byte latency of 800-2000ms per call, dominated by network + model cold-start. Abide's proactive check-in and welfare-check phrases are said repeatedly across sessions. Caching them trades ~30KB of memory per phrase (opus-compressed audio) for a 800-2000ms savings on each repeat utterance. 5 phrases × 30KB ≈ 150KB total.
+- **Implementation**: Cache is keyed by `_normalize_phrase()` (lowercased, stripped, whitespace-collapsed) so minor formatting differences still hit. Cache is module-level so it persists across WebSocket sessions for the lifetime of the server process. Prewarm runs as fire-and-forget alongside existing prewarm tasks; failures are non-fatal (synthesize falls back to the API on cache miss).
+- **Alternatives**: (a) LRU cache on every synthesized sentence — unbounded, most sentences are never repeated. (b) Disk-backed cache — adds complexity, sessions are already ephemeral. (c) Client-side cache in browser localStorage — doesn't help server-side latency measurements. The module-level in-memory dict is the right granularity.
+- **Trade-offs**: Only exact-match phrases hit the cache. "Hello there!" (Abide's actual greeting) doesn't match "Hello, how are you today?". The chosen 5 phrases should match prompts Abide's system prompt can be nudged toward, or the user should expand the list based on what Abide actually says in logs.
+
 ### D58. UI redesign: Abide Robotics brand palette + 16:9 hero with glow + light/dark mode
 - **Decision**: Complete visual overhaul of `frontend/index.html` to match the Abide Robotics corporate website (abide-robotics.com). Dark mode uses warm charcoal (`#0f0d0a`) with golden amber (`#d4a039`) accents; light mode uses warm cream (`#f8f5ef`) with slightly deeper amber. Video hero is a 16:9 rounded rectangle (matching Logitech MeetUp widescreen output) with an animated linear-gradient glow ring that pulses when speaking. Typography uses Playfair Display (serif) for headings and Inter (sans-serif) for body text. Theme toggle button (sun/moon) persists to localStorage. Theme transitions are smooth (0.3-0.4s) but scoped to key container elements to avoid reflow jank on large DOM trees.
-- **Context**: The evaluator is the Abide Robotics team. Matching their brand palette makes the prototype feel like a genuine internal product, not a generic demo. Their website has both light and dark modes with the same amber accent, so supporting both is brand-aligned. Initially tried a circular orb design but switched to 16:9 rectangle after realizing the Logitech MeetUp outputs widescreen — a circle would crop the left/right thirds of the frame, losing peripheral vision of the room.
+- **Context**: Matching the Abide Robotics brand palette (abide-robotics.com) makes the product feel cohesive with the rest of the company's surface area rather than a one-off tool. The website has both light and dark modes with the same amber accent, so supporting both is brand-aligned. Initially tried a circular orb design but switched to 16:9 rectangle after realizing the Logitech MeetUp outputs widescreen — a circle would crop the left/right thirds of the frame, losing peripheral vision of the room.
 - **Key changes**: All hardcoded indigo/teal colors replaced with CSS variables (`--accent`, `--accent-secondary`); bounding box overlay colors updated to amber; `overflow: hidden` removed from hero so the `::before` glow ring can extend beyond; video/canvas/mic-ring individually clipped with `border-radius: var(--radius-lg)`.
-- **Trade-offs**: Google Fonts adds two external HTTP requests on first load (~50ms with preconnect). Playfair Display is ~100KB. Acceptable for a demo — the evaluator has a fast connection.
+- **Trade-offs**: Google Fonts adds two external HTTP requests on first load (~50ms with preconnect). Playfair Display is ~100KB. Acceptable given a normal broadband connection; a future offline build could bundle the fonts.
 
 ### D57. Input validation: sample_rate type coercion and range check
 - **Decision**: `main.py` config handler now wraps `data.get("sample_rate", 48000)` in `int()` coercion with a try/except fallback to 48000. Rejects values outside the range 8000–192000 Hz.
@@ -265,34 +306,34 @@ Format for each entry:
 
 ### D53. UserContext: persistent user fact extraction and injection
 - **Decision**: Added a `UserContext` dataclass to `session.py` that tracks: `name`, `mentioned_topics`, `preferences`, and `mood_signals`. After each Claude response, a lightweight non-streaming extraction call sends the last 2 turns to Claude with a structured JSON extraction prompt. Results are merged into the persistent context via `UserContext.update()`. The context is injected into every Claude turn via `user_context` parameter on `respond()`, formatted as "What I know about you: - Name: John, - We've talked about: garden, daughter Sarah, - You mentioned you like: morning tea, classical music".
-- **Context**: Without this, Abide has no memory within a session beyond the rolling 20-message history window. A user who says "I'm John" on turn 1 would not be called by name on turn 15 after history truncation. The brief scores "natural conversational flow" — and real companions remember who they're talking to.
-- **Alternatives**: (a) Parse user messages with regex — fragile, misses nuance. (b) Store the full conversation forever — blows up token budget. (c) Use a separate embedding/RAG system — wildly over-engineered for a prototype.
+- **Context**: Without this, Abide has no memory within a session beyond the rolling 20-message history window. A user who says "I'm John" on turn 1 would not be called by name on turn 15 after history truncation. Natural conversational flow requires that a companion remember who they're talking to.
+- **Alternatives**: (a) Parse user messages with regex — fragile, misses nuance. (b) Store the full conversation forever — blows up token budget. (c) Use a separate embedding/RAG system — adds substantial infrastructure for a within-session feature where the simpler approach is sufficient.
 - **Trade-offs**: The extraction call adds ~500-1500ms of latency after each response, but it's fire-and-forget and non-blocking — the user hears Abide's reply normally while extraction runs in the background. Uses the same persistent HTTP/2 client so no connection overhead. Bounded lists (15 topics, 10 preferences, 5 moods) prevent context from growing unbounded.
 
 ### D52. Proactive check-in background task (30-second silence trigger)
 - **Decision**: A background asyncio loop fires every `CHECK_IN_INTERVAL_S` (30 seconds). If the user has been silent for at least that long, Abide is not already responding/playing, and there's vision context available, it calls `session.start_response()` with a system-generated prompt asking Claude to initiate conversation based on what it sees. The task is cancelled on WebSocket disconnect.
-- **Context**: The brief says Abide is "a companion who is actively present and engaged" — but without this, Abide only speaks in response to user speech. A real companion in the room would notice someone sitting quietly and say something. The 30-second interval balances attentiveness (long enough to not be annoying) with presence (short enough that the user feels noticed).
+- **Context**: Abide is positioned as a companion who is actively present and engaged — but without this, Abide only speaks in response to user speech. A real companion in the room would notice someone sitting quietly and say something. The 30-second interval balances attentiveness (long enough to not be annoying) with presence (short enough that the user feels noticed).
 - **Alternatives**: (a) Client-side timer that sends a "check-in" message — adds protocol complexity. (b) Shorter interval (15s) — too chatty, feels intrusive. (c) Longer interval (60s) — too passive for a demo. (d) Vision-change-triggered instead of timer — more complex, requires diffing scene descriptions.
 - **Trade-offs**: If vision context is empty (camera not working), no check-in fires — Abide stays silent rather than saying something generic. The check-in prompt uses a `[System: ...]` prefix to signal to Claude that this is a system-initiated turn, not user speech. The barge-in mechanism still works normally during check-in responses.
 
 ### D51. Proactive vision engagement in Claude system prompt
 - **Decision**: Rewrote the Claude system prompt in `conversation.py` to make vision engagement mandatory, not optional. The old prompt said "You *may* receive context about what the camera sees. Use it naturally... but don't over-describe." The new prompt says "You have a live camera feed. You MUST proactively comment on what you see — don't wait for the user to ask." Two new guidelines reinforce this: always react to camera observations, and notice activity changes between turns.
-- **Context**: During live testing, Abide had all the visual context it needed (the `<camera_observations>` block was populated correctly) but often ignored it, defaulting to generic conversational responses. The old prompt's "may receive" and "don't over-describe" framing gave Claude permission to stay passive. For an elderly care companion, proactive engagement is a core feature — noticing someone standing up, waving, or picking something up is the whole point. The evaluator brief explicitly scores "ability to interpret activity" and "ask clarifying questions."
+- **Context**: During live testing, Abide had all the visual context it needed (the `<camera_observations>` block was populated correctly) but often ignored it, defaulting to generic conversational responses. The old prompt's "may receive" and "don't over-describe" framing gave Claude permission to stay passive. For an elderly care companion, proactive engagement is a core feature — noticing someone standing up, waving, or picking something up is the whole point of having vision in the loop.
 - **Alternatives**: (a) Inject a per-turn "You must mention what you see" instruction alongside the vision context — fragile, easily ignored in long conversations. (b) Add a second Claude call dedicated to vision commentary — doubles latency and cost. (c) Make the vision observations part of the user message instead of system prompt — pollutes conversation history.
 - **Trade-offs**: Claude may now occasionally over-comment on unchanging scenes ("I see you're still sitting"). Acceptable — a friend who notices too much is better than one who notices nothing. The 2-3 sentence response guideline naturally constrains verbosity. Combined with D19's temporal timestamps, Claude can also skip redundant comments when the scene hasn't changed.
 
 ### D50. Session summary overlay with Claude-powered accuracy analysis
 - **Decision**: When the user clicks Stop, a full-screen glass-morphism overlay displays four sections: (1) session duration, (2) complete conversation transcript with timestamps, (3) activity log with timestamps (all vision observations and fall alerts), (4) "What Abide Got Right / Wrong" — a Claude-generated analysis of interpretation accuracy. The analysis is a one-shot non-streaming Claude call fired asynchronously after the overlay renders; a spinner shows while it loads, with graceful fallback on failure.
-- **Context**: The project brief explicitly requires "Summarize the conversation at the end, as well as what the system got right and wrong." Previously, session stats were only tracked internally via Langfuse telemetry — nothing was shown to the user. The evaluator needs to see a clear end-of-session review without having to access server logs.
+- **Context**: Previously, session stats were only tracked internally via Langfuse telemetry — nothing was shown to the user. Care teams and family reviewing a session need a clear end-of-session summary without access to server logs.
 - **Implementation**: All four sections are populated client-side from a `diaryEntries[]` array that accumulates timestamped entries throughout the session. The accuracy analysis uses a new `/api/analyze` POST endpoint in `app/main.py` (~60 lines) that proxies a single Claude call — required because Anthropic's API blocks browser CORS. The endpoint accepts conversation history + activity log and returns a structured text analysis. The prompt instructs Claude to identify correct interpretations (user confirmed or didn't correct), incorrect ones (user said "no", "that's wrong", etc.), and ambiguous cases.
 - **Alternatives**: (a) Pure client-side heuristic matching "no"/"wrong" in user messages — too brittle, misses nuance. (b) Direct browser `fetch()` to Anthropic API — blocked by CORS. (c) WebSocket-based analysis request — adds complexity to the existing WS protocol for a one-shot call.
 - **Trade-offs**: The analysis adds 2-5 seconds of latency after Stop (one Claude call), but it's non-blocking — the rest of the summary is visible immediately. The `/api/analyze` endpoint creates a fresh `httpx.AsyncClient` per call (not persistent) since it runs once per session; acceptable overhead for a one-shot operation.
 
 ### D49. Diary tab: chronological timestamped interaction history
 - **Decision**: The transcript panel now has two tabs — "Conversation" (original transcript) and "Diary" (chronological log of ALL events). The diary mixes user messages, assistant responses, vision observations, and alerts in a single timestamped feed. Each entry type has color-coded badges: indigo for user, teal for Abide, amber for vision, rose for alerts/falls. The diary is live-updating during the session and remains scrollable after Stop.
-- **Context**: The brief requires a "logged interaction history / diary of what the user did and said." The existing transcript panel only showed conversation messages — vision observations were displayed ephemerally on the video overlay chip and lost once overwritten.
+- **Context**: Care teams need a logged interaction history — a diary of what the user did and said — for continuity of care and hand-off between shifts. The existing transcript panel only showed conversation messages — vision observations were displayed ephemerally on the video overlay chip and lost once overwritten.
 - **Implementation**: A `diaryEntries[]` array (shared with D50) is populated from hooks in `addUserMsg()`, `finalizeAssistantMsg()`, and the WebSocket `scene`/`alert` handlers. Each entry is rendered live into a `#diary` div via `renderDiaryEntry()`. Tab switching is handled by `switchTab()` which toggles `display` on `#transcript` vs `#diary`. Collapse behavior (existing toggle) applies to both tabs via CSS `.collapsed #diary { display: none }`.
-- **Trade-offs**: Vision scene messages arrive every ~3.6 seconds, so the diary can accumulate many entries in a long session. This is acceptable — the panel is scrollable and the entries are compact. A production system could debounce identical consecutive observations, but for the prototype the raw log is more useful for evaluators reviewing what Abide saw vs. what it said.
+- **Trade-offs**: Vision scene messages arrive every ~3.6 seconds, so the diary can accumulate many entries in a long session. This is acceptable — the panel is scrollable and the entries are compact. A future version could debounce identical consecutive observations; the current raw log is useful for care-team review of exactly what Abide saw vs. what it said.
 
 ### D48. Whisper confidence filter via `verbose_json` + standalone hallucination list
 - **Decision**: `transcribe()` in `app/audio.py` now requests `response_format="verbose_json"`, `temperature=0.0`, and `language="en"` from Groq Whisper. The response carries a `segments` list; each segment has `no_speech_prob` (P(segment is silence)) and `avg_logprob` (mean log-probability of the emitted tokens). A segment is dropped when `no_speech_prob > 0.6 AND avg_logprob < -1.0`. If every segment in the response fails the check, the whole transcript is dropped and routed through the existing "Empty transcript, skipping" path. In addition, a `_STANDALONE_HALLUCINATIONS` set (`"thank you"`, `"thanks"`, `"bye"`, `"you"`, `"uh"`, `"hmm"`, `"mm-hmm"`, …) is matched against the entire stripped/lowercased transcript; on a match the transcript is also dropped. The existing D41 regex blocklist still runs alongside as defense in depth.
@@ -335,7 +376,7 @@ Format for each entry:
 ### D37. Bounded `turn_latencies_ms` rolling window and capped `tts_queue`
 - **Decision**: `Session.stats["turn_latencies_ms"]` is now capped at 100 entries via an explicit slice; `tts_queue` in `_run_response` is now `asyncio.Queue(maxsize=32)`.
 - **Context**: Two findings from the performance review: (1) the per-turn latencies list grew unbounded over long sessions, bloating memory and making the end-of-session `min/max` calls O(n); (2) the TTS queue was unbounded, so a runaway Claude output could in principle spawn hundreds of TTS tasks before the consumer drains them. Both are defense-in-depth — neither was causing a user-visible issue — but the fixes are one-liners.
-- **Trade-offs**: If a session exceeds 100 turns, the latency stats become a rolling window instead of a full record. Fine for the prototype scope.
+- **Trade-offs**: If a session exceeds 100 turns, the latency stats become a rolling window instead of a full record. Acceptable — the min/max/avg over the last 100 turns is representative for sessions of any length.
 
 ### D38. Input validation on `np.frombuffer` audio chunks
 - **Decision**: `main.py` validates incoming binary audio frames before passing them to `np.frombuffer`: must be non-empty, must be a bytes-like object, must be ≤ `MAX_AUDIO_CHUNK_BYTES`, and must be a multiple of 4 (sizeof float32). Any mismatch logs a warning and drops the chunk instead of propagating a `ValueError` up the loop.
@@ -349,7 +390,7 @@ Format for each entry:
 
 ### D46. Dockerfile runs as non-root `abide` user (uid 10001)
 - **Decision**: Added `RUN useradd --create-home --shell /usr/sbin/nologin --uid 10001 abide && chown -R abide:abide /app` + `USER abide` to the Dockerfile right before `EXPOSE`. The container now runs as `abide` (uid 10001) instead of root.
-- **Context**: Review flagged missing `USER` directive. Localhost single-user prototype so it's not directly exploitable, but it's a classic container-security footgun if the image is ever deployed networked. Fix costs 2 lines; value is real.
+- **Context**: Review flagged missing `USER` directive. Localhost single-user deployment means it's not directly exploitable today, but it's a classic container-security footgun if the image is ever deployed networked. Fix costs 2 lines; value is real.
 - **Trade-offs**: The file layout is set up with `WORKDIR /app` owned by `abide`; Python can read the code it needs. `silero-vad` weights are cached in the Python site-packages at build time (as root), which are world-readable by default, so the switch to non-root doesn't affect the cached model. No runtime regressions expected.
 
 ### D45. 60-second staleness clamp on `client_playing`
@@ -367,8 +408,8 @@ Format for each entry:
 ### D43. `load_dotenv` CWD fallback removed + parse errors caught
 - **Decision**: `app/main.py`'s `.env` loading is now ONLY from the explicit `_PROJECT_ROOT / ".env"` path — no `or load_dotenv()` fallback that would walk the current working directory. The call is also wrapped in `try/except` so a malformed `.env` logs a warning and keeps running (falling back to process env vars) instead of crashing.
 - **Context**: Review flagged that the previous `load_dotenv(_DOTENV_PATH) or load_dotenv()` fallback would search CWD for a `.env` if the project path didn't exist. An attacker who controlled CWD (shared machine, symlink, bad directory layout) could plant a malicious `.env` and trick the user into running `start.bat` from there, exfiltrating secrets.
-- **Alternatives considered**: Strict mode (`raise_on_error=True`) — would trade one foot-gun for another (malformed .env would prevent startup entirely). Settings library like pydantic-settings — extra dependency for marginal benefit on a prototype.
-- **Trade-offs**: If the evaluator runs `start.bat` from a directory other than the project, `.env` is not loaded at all and Langfuse is disabled. The startup banner `"Langfuse: disabled (no keys)"` makes this obvious. Dockerfile always runs from `/app` so the container path is deterministic.
+- **Alternatives considered**: Strict mode (`raise_on_error=True`) — would trade one foot-gun for another (malformed .env would prevent startup entirely). Settings library like pydantic-settings — extra dependency for marginal benefit given that only three env vars are read.
+- **Trade-offs**: If a user runs `start.bat` from a directory other than the project, `.env` is not loaded at all and Langfuse is disabled. The startup banner `"Langfuse: disabled (no keys)"` makes this obvious. Dockerfile always runs from `/app` so the container path is deterministic.
 
 ### D42. Startup hook wrapped + `auth_check` moved to background task
 - **Decision**: `@app.on_event("startup")` in `main.py` now wraps `init_langfuse()` in a `try/except` that logs and continues instead of propagating. Credential verification (`auth_check()`) was moved out of `init_langfuse()` into a new async helper `telemetry.verify_langfuse_async(timeout=3.0)` that the startup hook fires as a fire-and-forget `asyncio.create_task`. The connectivity probe in the WebSocket accept path was similarly moved into a background task so it never blocks `ws.accept()`.
@@ -401,50 +442,51 @@ Format for each entry:
 
 ---
 
-## Known limitations (to raise in the write-up)
+## Known limitations
 
 - **Barge-in latency ≈ 420 ms, not ≤ 100 ms** (see D14). Caused by echo-suppression tolerance. Now additionally gated on audio RMS (see D25b) so echo never triggers false barge-ins. As of D40, barge-in also works during the "pure playback" window after the server is done streaming (previously went deaf for 5-15 s). Production fix would require a dedicated echo-cancellation DSP (webrtc-audio-processing or equivalent) which would let us drop the sustained-speech threshold to ~100 ms.
 - **Vision bbox coordinates are approximate** (see D21). Convincing visual tracker but not surgical.
 - **Fall detection is best-effort and prototype-grade** (see D24). No emergency dispatch, no reliability SLA, biased toward false positives over false negatives.
 - **Conversation history caps at 20 messages** (see D7). Older context is forgotten.
-- **No persistent session storage** — conversations vanish when the tab closes. Acceptable for a prototype; CLAUDE.md explicitly lists "in-memory only, cleared on session end" under privacy.
+- **No persistent cross-session storage** — conversations vanish when the tab closes (the resume-refresh banner is a view-only transcript restore, not full continuity). This is a deliberate privacy posture: "in-memory only, cleared on session end."
 - **Windows-specific SDK issues led us to direct httpx everywhere** (see D5). Works across platforms but is harder to maintain than SDK wrappers would be.
 - **Auto-GPT-4o-mini for vision is cheaper but spatially imprecise**. Full `gpt-4o` would give better bounding boxes and fall detection at 3–5× the latency and 10× the cost.
 - **Whisper occasionally hallucinates on short audio fragments** (see D41, D48, Troubleshooting #8, #10). Four-layer defense now in place: RMS/length pre-filter, minimal STT prompt (no conversational filler), `verbose_json` confidence filter (`no_speech_prob > 0.6 AND avg_logprob < -1.0`), and a regex + standalone-phrase blocklist. The underlying model will keep trying — it's a property of the training data — but the filters catch the vast majority of cases.
 
 ---
 
-## Bonus features delivered
+## Notable capabilities
 
-- ✅ Local VAD via silero-vad (bonus per CLAUDE.md)
-- ✅ Multi-frame motion detection with fall-alert safety path (exceeds brief)
-- ✅ Modern Gemini-Live-inspired UI with bounding box overlay (exceeds brief)
-- ✅ Langfuse observability with per-turn traces, vision traces, and session summary
-- ✅ Session summary with Claude-powered accuracy analysis (D50)
-- ✅ Live diary tab with color-coded chronological event log (D49)
-- ✅ Four-layer Whisper hallucination defense (D41, D48)
-- ✅ Prompt injection defense on vision context
-- ✅ HTTP/2 persistent clients with connection prewarm
-- ✅ Proactive check-in loop — 30s silence trigger initiates conversation from vision (D52)
-- ✅ UserContext fact extraction — remembers name, topics, preferences within session (D53)
-- ✅ Vision-reactive triggers — waving, thumbs up, standing up trigger immediate response (D54)
-- ✅ Concurrent response mutex — prevents orphaned tasks from race conditions (D55)
-- ✅ Safe WebSocket sends — all main.py sends guarded against close races (D56)
-- ❌ Logitech MeetUp pan/tilt (not attempted — would require hardware access layer; explicitly a bonus)
+- Local VAD via silero-vad — no API call on the barge-in critical path
+- Multi-frame motion detection with fall-alert safety path
+- Abide Robotics branded UI with bounding box overlay and light/dark modes
+- Langfuse observability with per-turn traces, vision traces, and session summary
+- Session summary with Claude-powered accuracy analysis (D50)
+- Live diary tab with color-coded chronological event log (D49)
+- Four-layer Whisper hallucination defense (D41, D48)
+- Prompt injection defense on vision context
+- HTTP/2 persistent clients with connection prewarm
+- Proactive check-in loop — 30s silence trigger initiates conversation from vision (D52)
+- UserContext fact extraction — remembers name, topics, preferences within session (D53)
+- Vision-reactive triggers — waving, thumbs up, standing up trigger immediate response (D54)
+- Concurrent response mutex — prevents orphaned tasks from race conditions (D55)
+- Safe WebSocket sends — all main.py sends guarded against close races (D56)
+- TTS cache for stock phrases — 0ms serve for greetings and check-ins (D59)
+- Dynamic Whisper prompt biasing — user's name injected once known (D60)
 
 ---
 
-## Things NOT built and why
+## Out of scope (not built)
 
-- **Logitech MeetUp PTZ control** — requires a hardware SDK layer and we do not have the device available for testing. Listed as a bonus in the brief, de-prioritized in favor of software-only robustness.
-- **Persistent conversation history** — explicitly out of scope per CLAUDE.md privacy section.
-- **User accounts / multi-user support** — single-session prototype.
+- **Logitech MeetUp PTZ control** — requires a hardware SDK layer and the device is not available for testing in this build. De-prioritized in favor of software-only robustness.
+- **Persistent conversation history across sessions** — explicitly out of scope for privacy reasons.
+- **User accounts / multi-user support** — single-session by design.
 - **Offline fallback** — all three AI providers must be reachable. Graceful degradation is limited to "show an error, don't crash".
 - **Non-English support** — never exercised; Groq Whisper handles many languages but Claude and OpenAI TTS were not tested for them.
 
 ---
 
-## What we would improve with more time
+## Future directions
 
 - **Tune barge-in threshold downward** by using a mic-reference echo-cancellation DSP (webrtc-audio-processing or equivalent) so we can drop from 400 ms to ≤150 ms sustained-speech requirement.
 - **Pose-estimation preprocessing** (mediapipe-pose, runs in the browser in WASM) to generate better bounding boxes and more reliable fall detection without relying on the vision model for localization.
@@ -468,3 +510,4 @@ Format for each entry:
   difference matters for the warmth and naturalness of elder care 
   interactions. Long term, a fine-tuned smaller model on-prem would be 
   the right answer as model quality improves.
+  At facility scale (50-200 residents), a single on-prem GPU server running FastAPI with Redis session state handles the full load. At network scale (multiple facilities), standard horizontal scaling with stateless FastAPI instances behind a load balancer applies — the framework choice remains correct, only the deployment topology changes.

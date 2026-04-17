@@ -38,7 +38,7 @@ else:
 from app.audio import AudioProcessor, transcribe
 from app.conversation import ConversationEngine
 from app.session import Session
-from app.tts import prewarm as tts_prewarm
+from app.tts import prewarm as tts_prewarm, prewarm_cache as tts_prewarm_cache
 from app.vision import prewarm as vision_prewarm
 from app import telemetry
 
@@ -224,6 +224,19 @@ async def root():
 # like a present companion, not a passive chatbot waiting for input.
 CHECK_IN_INTERVAL_S = 30
 
+# ── TTS cache phrases ──
+# Pre-generated at session start so these common utterances are served
+# in 0ms instead of paying the ~1000-2000ms OpenAI TTS API call. Covers
+# greetings, acknowledgements, and welfare check-in phrases that Abide
+# uses repeatedly. Cache persists for the server process lifetime.
+TTS_CACHE_PHRASES = [
+    "Hello, I'm Abide. How are you today?",
+    "I'm listening.",
+    "Could you repeat that?",
+    "I'm here if you need me.",
+    "Are you alright?",
+]
+
 
 async def _proactive_checkin_loop(
     ws: WebSocket,
@@ -397,6 +410,12 @@ async def websocket_endpoint(ws: WebSocket):
                         t_tts.add_done_callback(_log_prewarm_exception("TTS"))
                         t_vision = asyncio.create_task(vision_prewarm(openai_key))
                         t_vision.add_done_callback(_log_prewarm_exception("Vision"))
+                        # Pre-generate TTS for stock phrases so they serve
+                        # instantly on first use (greetings, check-ins, etc.)
+                        t_cache = asyncio.create_task(
+                            tts_prewarm_cache(TTS_CACHE_PHRASES, openai_key)
+                        )
+                        t_cache.add_done_callback(_log_prewarm_exception("TTS cache"))
 
                     # Launch the proactive check-in background loop.
                     # Every CHECK_IN_INTERVAL_S seconds of user silence, Abide
@@ -406,6 +425,22 @@ async def websocket_endpoint(ws: WebSocket):
                     )
 
                     await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
+
+                    # Welcome greeting: play the cached "Hello, I'm Abide..."
+                    # immediately on connect so the user knows Abide is alive.
+                    # Waits briefly for the cache prewarm to populate that
+                    # phrase, then falls through to the API path if needed.
+                    # Runs as a task so it doesn't block the WS receive loop.
+                    if engine is not None and openai_key:
+                        async def _welcome():
+                            # Let the cache prewarm generate the first phrase
+                            # (~1s). If it's not ready by then, synthesize()
+                            # will just call the API directly — still correct.
+                            await asyncio.sleep(1.2)
+                            await session.say_canned(
+                                ws, engine, TTS_CACHE_PHRASES[0], openai_key,
+                            )
+                        asyncio.create_task(_welcome())
 
                 elif msg_type == "frame":
                     # Legacy single-frame message from browser (kept for
@@ -579,7 +614,12 @@ async def websocket_endpoint(ws: WebSocket):
 
                     try:
                         stt_t0 = time.monotonic()
-                        text = await transcribe(wav_bytes, groq_key, processor.last_speech_end_ts)
+                        text = await transcribe(
+                            wav_bytes,
+                            groq_key,
+                            processor.last_speech_end_ts,
+                            user_name=session.user_context.name,
+                        )
                         stt_latency_ms = (time.monotonic() - stt_t0) * 1000
                         if text:
                             log.info("Transcript: %s", text)
