@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 
@@ -39,6 +40,7 @@ from app.audio import AudioProcessor, transcribe
 from app.conversation import ConversationEngine
 from app.session import Session
 from app.tts import prewarm as tts_prewarm, prewarm_cache as tts_prewarm_cache
+from app.tts_cache_store import learned_phrases, stats as tts_store_stats
 from app.vision import prewarm as vision_prewarm
 from app import telemetry
 
@@ -190,14 +192,26 @@ async def analyze_session(request: Request) -> JSONResponse:
 # Echo suppression tunables
 POST_TTS_COOLDOWN_MS = 300   # ignore VAD this long after last TTS chunk sent
 SUSTAINED_SPEECH_MS = 400    # require this much continuous speech before firing barge-in
-# Also require the speech-in-progress to have a real voice-level RMS.
-# TTS echo leaking through the mic is around ~0.005; real speech is ~0.03+.
-# Matches MIN_SPEECH_RMS in audio.py (the post-hoc quiet-segment filter).
-BARGE_IN_MIN_RMS = 0.015
+# Require SUSTAINED above-threshold audio, not just a peak. Each VAD
+# window is ~32ms at 16kHz (VAD_CHUNK=512). 6 windows ≈ 192ms of
+# cumulative audio whose per-window RMS cleared MIN_SPEECH_RMS (0.015).
+# This matches the post-hoc aggregate-RMS filter in audio.py: a single
+# loud keypress/cough/click no longer qualifies, only real speech does.
+# Previously the gate used peak-RMS, which let spikes through even when
+# the full segment averaged below threshold and got discarded anyway.
+BARGE_IN_MIN_LOUD_WINDOWS = 6
 
 # Defensive limits on client-supplied payloads
 MAX_FRAME_B64_CHARS = 500_000  # ~350 KB decoded — well above our 512x384 JPEGs (~15-40 KB)
 MAX_AUDIO_CHUNK_BYTES = 32_768  # 2048 float32 samples = 8192 bytes; 4x headroom
+
+# Cheap character-class validator for base64 frame payloads. Faster than
+# a full b64decode roundtrip (regex is ~1000x quicker on 40 KB strings)
+# and sufficient to catch client bugs / garbage injection before we pass
+# the string on to OpenAI's vision API. Full decode validation would
+# defeat the purpose of pass-through (the previous code decoded then
+# re-encoded inside vision.py, costing ~20-40 ms per vision cycle).
+_FRAME_B64_RE = re.compile(r'^[A-Za-z0-9+/=\s]*$')
 
 
 def _log_prewarm_exception(name: str):
@@ -225,17 +239,69 @@ async def root():
 CHECK_IN_INTERVAL_S = 30
 
 # ── TTS cache phrases ──
-# Pre-generated at session start so these common utterances are served
-# in 0ms instead of paying the ~1000-2000ms OpenAI TTS API call. Covers
-# greetings, acknowledgements, and welfare check-in phrases that Abide
-# uses repeatedly. Cache persists for the server process lifetime.
-TTS_CACHE_PHRASES = [
+# Baseline seed list — phrases we prewarm on a fresh install before the
+# auto-populated cache (tts_cache_store) has accumulated any data. Once
+# the system has seen a few sessions, `learned_phrases()` returns the
+# phrases Claude actually emits repeatedly, and those get merged in.
+# The seed stays as a floor so first-run UX is still snappy.
+#
+# Cache hit is exact-string-after-normalization (see _normalize_phrase
+# in tts.py), so hits depend on Claude producing matching punctuation
+# + wording. The system prompt nudges toward short acknowledgements,
+# and the learning layer picks up whatever sentences actually occur.
+TTS_CACHE_SEED_PHRASES = [
+    # Stock greetings / check-ins (used for welcome + proactive prompts).
+    # The first four are the time-of-day welcome variants; select_welcome_greeting()
+    # picks one based on the browser-reported local hour.
+    "Good morning! I'm Abide. How are you today?",
+    "Good afternoon! I'm Abide. How are you today?",
+    "Good evening! I'm Abide. How are you today?",
+    "Hello, I'm Abide. How are you tonight?",
+    # Generic fallback used when the browser hasn't reported a timezone yet.
     "Hello, I'm Abide. How are you today?",
+    "Hello there!",
     "I'm listening.",
     "Could you repeat that?",
     "I'm here if you need me.",
     "Are you alright?",
+    # Short acknowledgements that pair with the SYSTEM_PROMPT nudge
+    # encouraging Claude to open replies briefly.
+    "That's good.",
+    "That's good to hear.",
+    "That sounds nice.",
+    "I see.",
+    "Oh really?",
+    "Tell me more.",
 ]
+
+
+def _select_welcome_greeting(session: "Session") -> str:
+    """Pick a time-of-day-appropriate welcome based on the browser-reported
+    local hour. Falls back to the generic greeting when the timezone hasn't
+    been reported yet (shouldn't happen in practice — the config message
+    arrives before the 1.2s welcome delay — but defensive).
+    All returned strings are in TTS_CACHE_SEED_PHRASES so they'll hit the
+    cache instead of paying the ~1000ms OpenAI TTS roundtrip."""
+    bucket = session.time_of_day_bucket()
+    return {
+        "morning": "Good morning! I'm Abide. How are you today?",
+        "afternoon": "Good afternoon! I'm Abide. How are you today?",
+        "evening": "Good evening! I'm Abide. How are you today?",
+        "night": "Hello, I'm Abide. How are you tonight?",
+    }.get(bucket, "Hello, I'm Abide. How are you today?")
+
+# Hard cap on how many phrases we prewarm per session start. Prewarm is
+# parallel via asyncio.gather, so too many at once can spike concurrent
+# OpenAI TTS requests. 30 is generous and well under `_TTS_CACHE_MAX_ENTRIES`.
+_PREWARM_TOTAL_CAP = 30
+
+
+def _prewarm_phrase_list() -> list[str]:
+    """Baseline seed + phrases learned from prior sessions, deduped and
+    bounded. Dedup preserves first-seen order so the seed wins ties."""
+    learned = learned_phrases(limit=_PREWARM_TOTAL_CAP)
+    merged = list(dict.fromkeys(TTS_CACHE_SEED_PHRASES + learned))
+    return merged[:_PREWARM_TOTAL_CAP]
 
 
 async def _proactive_checkin_loop(
@@ -380,6 +446,18 @@ async def websocket_endpoint(ws: WebSocket):
                             source_rate = 48000
                     except (TypeError, ValueError):
                         source_rate = 48000
+                    # Browser-reported timezone offset (JS getTimezoneOffset).
+                    # Validate to a sane range (-14h to +14h in minutes) so a
+                    # malicious/buggy client can't throw off time-of-day
+                    # buckets in silly ways.
+                    try:
+                        tz_raw = data.get("timezone_offset_minutes")
+                        if tz_raw is not None:
+                            tz_val = int(tz_raw)
+                            if -840 <= tz_val <= 840:
+                                session.tz_offset_minutes = tz_val
+                    except (TypeError, ValueError):
+                        pass
 
                     if anthropic_key:
                         engine = ConversationEngine(api_key=anthropic_key)
@@ -410,10 +488,17 @@ async def websocket_endpoint(ws: WebSocket):
                         t_tts.add_done_callback(_log_prewarm_exception("TTS"))
                         t_vision = asyncio.create_task(vision_prewarm(openai_key))
                         t_vision.add_done_callback(_log_prewarm_exception("Vision"))
-                        # Pre-generate TTS for stock phrases so they serve
-                        # instantly on first use (greetings, check-ins, etc.)
+                        # Pre-generate TTS for the seed list + whatever
+                        # Claude has said repeatedly in prior sessions
+                        # (auto-populated from app/tts_cache_store.py).
+                        prewarm_list = _prewarm_phrase_list()
+                        log.info(
+                            "[TTS-CACHE] Prewarming %d phrases (store: %s)",
+                            len(prewarm_list),
+                            tts_store_stats(),
+                        )
                         t_cache = asyncio.create_task(
-                            tts_prewarm_cache(TTS_CACHE_PHRASES, openai_key)
+                            tts_prewarm_cache(prewarm_list, openai_key)
                         )
                         t_cache.add_done_callback(_log_prewarm_exception("TTS cache"))
 
@@ -431,16 +516,23 @@ async def websocket_endpoint(ws: WebSocket):
                     # Waits briefly for the cache prewarm to populate that
                     # phrase, then falls through to the API path if needed.
                     # Runs as a task so it doesn't block the WS receive loop.
+                    # `say_canned` resets status to "listening" on failure,
+                    # so the done_callback here is just to surface any
+                    # exception that bubbles out of that recovery path —
+                    # otherwise silent task deaths leave the UI frozen on
+                    # "speaking". Mirrors the prewarm-task pattern above.
                     if engine is not None and openai_key:
                         async def _welcome():
                             # Let the cache prewarm generate the first phrase
                             # (~1s). If it's not ready by then, synthesize()
                             # will just call the API directly — still correct.
                             await asyncio.sleep(1.2)
+                            greeting = _select_welcome_greeting(session)
                             await session.say_canned(
-                                ws, engine, TTS_CACHE_PHRASES[0], openai_key,
+                                ws, engine, greeting, openai_key,
                             )
-                        asyncio.create_task(_welcome())
+                        t_welcome = asyncio.create_task(_welcome())
+                        t_welcome.add_done_callback(_log_prewarm_exception("Welcome"))
 
                 elif msg_type == "frame":
                     # Legacy single-frame message from browser (kept for
@@ -454,12 +546,13 @@ async def websocket_endpoint(ws: WebSocket):
                             len(b64),
                         )
                         continue
-                    try:
-                        jpeg_bytes = base64.b64decode(b64, validate=False)
-                    except Exception as e:
-                        log.warning("Frame decode failed: %s", e)
-                    else:
-                        session.process_frames([jpeg_bytes], openai_key, ws)
+                    if not _FRAME_B64_RE.fullmatch(b64):
+                        log.warning("Frame b64 has invalid characters, dropping")
+                        continue
+                    # Pass the base64 string through as-is — vision.py
+                    # constructs the data URL directly, avoiding a decode/
+                    # re-encode cycle on the hot path.
+                    session.process_frames([b64], openai_key, ws)
 
                 elif msg_type == "frames":
                     # Multi-frame sequence from browser (oldest → newest).
@@ -472,7 +565,7 @@ async def websocket_endpoint(ws: WebSocket):
                     if len(b64_list) > 8:
                         log.warning("Frames batch too large (%d), truncating", len(b64_list))
                         b64_list = b64_list[:8]
-                    jpegs: list[bytes] = []
+                    valid_b64s: list[str] = []
                     for b64 in b64_list:
                         if not isinstance(b64, str):
                             continue
@@ -482,12 +575,12 @@ async def websocket_endpoint(ws: WebSocket):
                                 len(b64),
                             )
                             continue
-                        try:
-                            jpegs.append(base64.b64decode(b64, validate=False))
-                        except Exception as e:
-                            log.warning("Frame decode failed: %s", e)
-                    if jpegs:
-                        session.process_frames(jpegs, openai_key, ws)
+                        if not _FRAME_B64_RE.fullmatch(b64):
+                            log.warning("Frame in batch has invalid b64 chars, skipping")
+                            continue
+                        valid_b64s.append(b64)
+                    if valid_b64s:
+                        session.process_frames(valid_b64s, openai_key, ws)
 
                 elif msg_type == "playback_start":
                     # Browser has started playing buffered TTS audio.
@@ -574,11 +667,13 @@ async def websocket_endpoint(ws: WebSocket):
                 ):
                     elapsed_ms = (now - pending_barge_in_start) * 1000
                     if elapsed_ms >= SUSTAINED_SPEECH_MS:
+                        loud_windows = processor.current_loud_window_count
                         max_rms = processor.current_max_rms
-                        if max_rms >= BARGE_IN_MIN_RMS:
+                        if loud_windows >= BARGE_IN_MIN_LOUD_WINDOWS:
                             log.info(
-                                "Sustained speech confirmed (%.0fms, RMS=%.4f) — firing barge-in!",
+                                "Sustained speech confirmed (%.0fms, loud_windows=%d, max_rms=%.4f) — firing barge-in!",
                                 elapsed_ms,
+                                loud_windows,
                                 max_rms,
                             )
                             await session.cancel(ws)
@@ -586,18 +681,20 @@ async def websocket_endpoint(ws: WebSocket):
                             # Keep current VAD state — user is still speaking.
                             # The speech already collected will complete naturally.
                             continue
-                        # Too quiet to be real speech. This is almost certainly
-                        # TTS echo leaking through the mic. Do NOT fire barge-in.
-                        # Leave pending_barge_in_start set so we can re-evaluate
-                        # on the next chunk — if the user DOES actually start
-                        # speaking loudly, max_rms will climb and we'll fire then.
+                        # Not enough sustained loudness. Likely a spike from
+                        # TTS echo / keypress / cough rather than real speech.
+                        # Do NOT fire barge-in. Leave pending_barge_in_start set
+                        # so we can re-evaluate on the next chunk — if the user
+                        # DOES start speaking, the counter will climb past the
+                        # threshold and we'll fire then.
                         # Log only once every ~500ms of elapsed to avoid spam.
                         if int(elapsed_ms) % 500 < 50:
                             log.info(
-                                "Barge-in candidate too quiet (%.0fms, RMS=%.4f < %.4f) — likely echo, holding",
+                                "Barge-in candidate not sustained (%.0fms, loud_windows=%d < %d, max_rms=%.4f) — likely spike, holding",
                                 elapsed_ms,
+                                loud_windows,
+                                BARGE_IN_MIN_LOUD_WINDOWS,
                                 max_rms,
-                                BARGE_IN_MIN_RMS,
                             )
                 elif pending_barge_in_start is not None and not processor.is_speech:
                     # Speech stopped before the sustained threshold — false alarm (echo).

@@ -62,3 +62,6 @@ logs/
 
 # ── Node (not used, but just in case) ──
 node_modules/
+
+# ── Runtime-learned TTS cache frequencies (auto-populated) ──
+tts_cache/

@@ -20,6 +20,7 @@ from starlette.websockets import WebSocketState
 
 from app.conversation import ConversationEngine, MODEL as CLAUDE_MODEL
 from app.tts import synthesize
+from app.tts_cache_store import record_phrase
 from app.vision import VisionBuffer, analyze_frames
 from app import telemetry
 
@@ -39,21 +40,31 @@ _TTS_QUEUE_MAXSIZE = 32
 # Maximum wall-clock duration the `client_playing` flag is trusted.
 _CLIENT_PLAYING_STALENESS_S = 60.0
 
-# Activities that should trigger an immediate proactive response when
-# detected as a NEW activity (different from the previous observation).
-# These are gestures or movements that clearly invite engagement —
-# a companion in the room would notice and react immediately, not wait
-# for the person to speak.
-_REACTIVE_ACTIVITIES = frozenset({
-    "waving", "wave", "thumbs up", "pointing", "beckoning",
-    "standing up", "getting up", "picked up", "picking up",
-    "holding up", "raised hand", "gesturing", "reaching",
-    "dancing", "exercising", "stretching",
-})
-
 # Minimum seconds between vision-reactive responses. Without this,
 # a sustained wave would trigger a response every ~3.6s (vision cycle).
 _VISION_REACT_COOLDOWN_S = 15.0
+
+# Whether an observed scene is "noteworthy" is decided by the vision
+# model itself (see SceneResult.noteworthy in app/vision.py). Previously
+# this was a hard-coded keyword allowlist here — `_REACTIVE_ACTIVITIES`
+# like {"waving", "standing up", ...}. The list had to grow by hand for
+# every new activity and couldn't judge intent from context. Now the
+# vision model returns a semantic flag alongside the activity, grounded
+# in its own motion_cues reasoning. We just check the flag.
+
+# Minimum seconds of user silence before a vision-reactive trigger
+# may fire. Matches the "WHEN USER IS SILENT (10+ seconds)" rule in
+# conversation.py's SYSTEM_PROMPT. Previously 3s, which let Abide
+# interrupt the user during brief conversational pauses.
+_VISION_REACT_MIN_SILENCE_S = 10.0
+
+# Names that must never be stored as the user's name. Defence-in-depth
+# against extract_user_facts() drift: if Claude ever mis-tags "Abide"
+# (the assistant's own name) or another role label as the user, we drop
+# it here before it reaches the system prompt or Whisper biasing.
+_NAME_BLOCKLIST = frozenset({
+    "abide", "assistant", "ai", "user", "companion", "robot",
+})
 
 
 @dataclass
@@ -74,7 +85,11 @@ class UserContext:
         if not facts:
             return
         if facts.get("name") and not self.name:
-            self.name = facts["name"]
+            candidate = str(facts["name"]).strip()
+            if candidate and candidate.lower() not in _NAME_BLOCKLIST:
+                self.name = candidate
+            else:
+                log.info("[CONTEXT] Rejected name candidate: %r", facts["name"])
         for topic in facts.get("topics", []):
             if topic and topic not in self.mentioned_topics:
                 self.mentioned_topics.append(topic)
@@ -135,6 +150,15 @@ class Session:
 
         # User context — accumulates facts about the user across the session
         self.user_context: UserContext = UserContext()
+
+        # Browser-reported timezone offset in minutes (JS
+        # `getTimezoneOffset()`: UTC = local + offset, so offset=360 means
+        # UTC-6 Central Daylight Time). Used by `time_of_day_context()` to
+        # compute local hour so Claude's greetings and check-ins reference
+        # the time of day naturally ("Good morning", "It's getting late").
+        # Stays None until the first `config` WS message arrives; all
+        # time-aware paths fall back to generic wording when None.
+        self.tz_offset_minutes: int | None = None
 
         # Timestamp of last user speech (for proactive check-in timing)
         self.last_user_speech_ts: float = time.monotonic()
@@ -232,6 +256,56 @@ class Session:
 
     def mark_tts_sent(self):
         self.last_tts_send_ts = time.monotonic()
+
+    def _local_hour(self) -> int | None:
+        """Compute the user's current local hour (0-23) from the server
+        UTC clock + the browser-reported timezone offset. Returns None
+        if the browser hasn't reported its offset yet."""
+        if self.tz_offset_minutes is None:
+            return None
+        from datetime import datetime, timezone, timedelta
+        # JS getTimezoneOffset(): UTC = local + offset_minutes →
+        # local = UTC - offset_minutes.
+        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        local = utc_now - timedelta(minutes=self.tz_offset_minutes)
+        return local.hour
+
+    def time_of_day_bucket(self) -> str | None:
+        """Return one of {"morning", "afternoon", "evening", "night"} or
+        None if the user's timezone hasn't been reported yet. Buckets
+        chosen for natural-language greeting/check-in fit, not strict
+        clock convention."""
+        hour = self._local_hour()
+        if hour is None:
+            return None
+        if 5 <= hour < 12:
+            return "morning"
+        if 12 <= hour < 17:
+            return "afternoon"
+        if 17 <= hour < 21:
+            return "evening"
+        return "night"
+
+    def time_of_day_context(self) -> str:
+        """Short context string about the current local time, intended
+        for injection into Claude's system prompt. Returns empty when
+        the timezone is unknown so Claude falls back to generic wording.
+
+        Kept as one concise line + instruction so it doesn't balloon
+        the prompt: ~35 tokens. Claude is told to reference it naturally,
+        not shoehorn it into every reply."""
+        bucket = self.time_of_day_bucket()
+        hour = self._local_hour()
+        if bucket is None or hour is None:
+            return ""
+        h12 = hour % 12 or 12
+        ampm = "AM" if hour < 12 else "PM"
+        return (
+            f"Local time where the user is: {bucket} (around {h12} {ampm}). "
+            f"Reference the time of day naturally when it fits — in "
+            f"greetings, welfare check-ins, or moments where a friend "
+            f"would notice the hour. Do not force it into every reply."
+        )
 
     async def cancel(self, ws: WebSocket):
         """Cancel the current response (if any) and tell the client to
@@ -355,55 +429,69 @@ class Session:
             vision_context = (urgent + "\n\n" + vision_context).strip()
             self._pending_fall_alert = None
         user_context = self.user_context.as_prompt()
+        time_context = self.time_of_day_context()
         self._response_task = asyncio.create_task(
-            self._run_response(ws, engine, text, openai_key, vision_context, user_context)
+            self._run_response(
+                ws, engine, text, openai_key,
+                vision_context, user_context, time_context,
+            )
         )
 
-    def _is_reactive_change(self, new_activity: str) -> bool:
-        """Return True if the new activity is 'interesting' and different
-        from the previous observation — worth triggering a proactive response.
+    def _is_reactive_change(self, result) -> bool:
+        """Return True if the new scene is worth a proactive reaction.
 
-        NOTE: This is called AFTER vision_buffer.append(), so the new
-        activity is already the latest entry. We compare against the
-        second-to-last entry to detect actual changes.
+        Two conditions must hold:
+          1. The vision model flagged the scene as `noteworthy` — its own
+             semantic judgment that this is the kind of event a friend
+             would stop and remark on (waving, standing up, dancing,
+             etc.) vs routine behavior (sitting, talking with gestures).
+          2. The activity text has actually CHANGED since the previous
+             observation. Without this, a sustained wave would re-trigger
+             on every 3.6s vision cycle. The cooldown in _run_vision is
+             a second layer of protection; this is belt-and-suspenders.
+
+        NOTE: called AFTER vision_buffer.append(), so `result` is already
+        the latest entry. We compare against the second-to-last entry to
+        detect actual changes.
         """
-        low = new_activity.lower()
-        # Check if any reactive keyword appears in the activity text
-        if not any(kw in low for kw in _REACTIVE_ACTIVITIES):
+        if not getattr(result, "noteworthy", False):
             return False
-        # Compare against the PREVIOUS entry (second-to-last, since the
-        # new activity was already appended to the buffer by _run_vision)
         entries = self.vision_buffer.entries
         if len(entries) >= 2:
             prev = entries[-2].result.activity.lower()
-            if low == prev:
+            if result.activity.lower() == prev:
                 return False
         return True
 
     def process_frames(
         self,
-        jpegs: list[bytes],
+        frames_b64: list[str],
         openai_key: str | None,
         ws: WebSocket,
     ):
         """Kick off a vision analysis for a short frame sequence.
 
+        Frames are passed as pre-validated base64 strings (the browser
+        already encoded them; main.py validates the b64 character class
+        and size). Passing strings through avoids a decode/re-encode
+        cycle in vision.py — about 20-40 ms per vision cycle.
+
         Fire-and-forget. Drops the batch if a previous analysis is still
         in flight — we don't queue, we don't want cost explosion if the
         API is slow.
         """
-        if not openai_key or not jpegs:
+        if not openai_key or not frames_b64:
             return
         if self._frame_task is not None and not self._frame_task.done():
             # Previous analysis still in flight — drop this batch.
             return
         self._frame_task = asyncio.create_task(
-            self._run_vision(jpegs, openai_key, ws)
+            self._run_vision(frames_b64, openai_key, ws)
         )
 
     async def _run_vision(
         self,
-        jpegs: list[bytes],
+        frames_b64: list[str],
         openai_key: str,
         ws: WebSocket,
     ):
@@ -415,18 +503,20 @@ class Session:
         try:
             prior = self.vision_buffer.recent_texts()
             with telemetry.Timer() as tmr:
-                result = await analyze_frames(jpegs, openai_key, prior)
+                result = await analyze_frames(frames_b64, openai_key, prior)
             if not result or not result.activity:
                 return
             self.vision_buffer.append(result)
             self.stats["vision_calls"] += 1
 
-            # Telemetry: one standalone trace per vision call.
-            total_bytes = sum(len(j) for j in jpegs if j)
+            # Telemetry: one standalone trace per vision call. Approximate
+            # byte count from b64 length (a decoded jpeg is ~3/4 of its
+            # base64 length) to avoid decoding just for a log number.
+            total_bytes = sum(len(s) for s in frames_b64 if s) * 3 // 4
             telemetry.observe_vision(
                 self.telemetry_client,
                 self.telemetry_session_id or "unknown",
-                num_frames=len(jpegs),
+                num_frames=len(frames_b64),
                 image_bytes=total_bytes,
                 activity=result.activity,
                 bbox=result.bbox,
@@ -458,17 +548,18 @@ class Session:
                 },
             )
 
-            # Vision-reactive trigger: if the activity is "interesting"
-            # (waving, standing up, thumbs up, etc.), react proactively.
-            # Falls have their own dedicated urgent-context path above.
+            # Vision-reactive trigger: react proactively when the vision
+            # model flags the scene as `noteworthy` AND the activity has
+            # actually changed since the last observation. Falls have
+            # their own dedicated urgent-context path above.
             if (
                 not result.is_fall
                 and self._engine_ref is not None
-                and self._is_reactive_change(result.activity)
+                and self._is_reactive_change(result)
                 and time.monotonic() - self._last_vision_react_ts >= _VISION_REACT_COOLDOWN_S
             ):
                 silence = time.monotonic() - self.last_user_speech_ts
-                if silence > 3.0:  # don't interrupt active conversation
+                if silence > _VISION_REACT_MIN_SILENCE_S:  # don't interrupt active conversation
                     if (
                         not self.is_responding
                         and not self.is_audible
@@ -565,6 +656,7 @@ class Session:
         openai_key: str | None,
         vision_context: str = "",
         user_context: str = "",
+        time_context: str = "",
     ):
         """Stream Claude + parallel TTS, checking for cancellation."""
         full_response: list[str] = []
@@ -578,7 +670,7 @@ class Session:
             try:
                 await self._safe_send_json(ws, {"type": "status", "state": "thinking"})
 
-                async for chunk in engine.respond(text, vision_context=vision_context, user_context=user_context):
+                async for chunk in engine.respond(text, vision_context=vision_context, user_context=user_context, time_context=time_context):
                     if self._cancelled:
                         log.info("Barge-in: stopping Claude stream")
                         break
@@ -587,29 +679,48 @@ class Session:
                         ws, {"type": "response_chunk", "text": chunk}
                     )
                     full_response.append(chunk)
+
+                    # Only scan the newly-appended region (plus a 1-char
+                    # overlap so a terminator at the tail of the prior
+                    # chunk + leading whitespace in this chunk still
+                    # matches). Previously this did `_SENTENCE_RE.split`
+                    # over the entire accumulated buffer on every chunk,
+                    # which is O(len(text_buf)) per chunk and ~2 KB of
+                    # wasted regex work per turn.
+                    scan_from = max(0, len(text_buf) - 1)
                     text_buf += chunk
 
-                    sentences = _SENTENCE_RE.split(text_buf)
-                    if len(sentences) > 1:
-                        for sentence in sentences[:-1]:
-                            sentence = sentence.strip()
-                            if sentence and openai_key and not self._cancelled:
-                                ts = time.monotonic()
-                                log.info("[TIMING] Sentence boundary: %r", sentence[:60])
-                                # Launch TTS as a concurrent task — do NOT await here.
-                                # Next iteration of the Claude stream will start,
-                                # and the TTS task will run in parallel.
-                                task = asyncio.create_task(
-                                    synthesize(sentence, openai_key, ts)
-                                )
-                                tts_queue.put_nowait((sentence, task, ts))
-                        text_buf = sentences[-1]
+                    match = _SENTENCE_RE.search(text_buf, scan_from)
+                    while match:
+                        sentence = text_buf[:match.start()].strip()
+                        if sentence and openai_key and not self._cancelled:
+                            ts = time.monotonic()
+                            log.info("[TIMING] Sentence boundary: %r", sentence[:60])
+                            # Record for the auto-populated TTS cache —
+                            # sentences heard repeatedly across sessions
+                            # get prewarmed next startup.
+                            record_phrase(sentence)
+                            # Launch TTS as a concurrent task — do NOT await here.
+                            # Next iteration of the Claude stream will start,
+                            # and the TTS task will run in parallel.
+                            task = asyncio.create_task(
+                                synthesize(sentence, openai_key, ts)
+                            )
+                            tts_queue.put_nowait((sentence, task, ts))
+                        # Advance the buffer past this boundary. The
+                        # remaining text is what comes after the
+                        # whitespace separator; rescan from the start
+                        # of the (now shorter) buffer for more
+                        # boundaries in the same chunk.
+                        text_buf = text_buf[match.end():]
+                        match = _SENTENCE_RE.search(text_buf)
 
                 # Final tail (text after the last sentence boundary or an un-terminated last sentence)
                 text_buf = text_buf.strip()
                 if text_buf and openai_key and not self._cancelled:
                     ts = time.monotonic()
                     log.info("[TIMING] Final tail: %r", text_buf[:60])
+                    record_phrase(text_buf)
                     task = asyncio.create_task(
                         synthesize(text_buf, openai_key, ts)
                     )
@@ -733,6 +844,27 @@ class Session:
                 },
             )
         finally:
+            # Drain any TTS tasks still sitting in the queue. On the happy
+            # path the consumer already processed everything up to the
+            # sentinel, so the queue is empty and this loop is a no-op.
+            # On the error / cancellation path (Claude stream error, hard
+            # cancel during barge-in, network failure mid-turn) the
+            # asyncio.gather above cancels the consumer before it drains
+            # the queue — any TTS tasks enqueued but not yet awaited would
+            # continue running in the background, completing an OpenAI TTS
+            # API call whose audio never gets played. Cancelling them here
+            # saves ~1-3 wasted requests per mid-stream error.
+            while True:
+                try:
+                    leftover = tts_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if leftover is None:
+                    continue  # sentinel; keep draining in case consumer died first
+                _, leftover_task, _ = leftover
+                if not leftover_task.done():
+                    leftover_task.cancel()
+
             # End the turn trace with summary metadata + update session stats
             total_turn_ms = (time.monotonic() - t_turn_start) * 1000
             try:

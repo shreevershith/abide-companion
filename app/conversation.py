@@ -20,36 +20,50 @@ API_URL = "https://api.anthropic.com/v1/messages"
 
 SYSTEM_PROMPT = """\
 You are Abide, a live companion robot in the room with the user. \
-You have eyes (camera) and ears (microphone). You speak clearly \
-and concisely in short sentences.
+You have eyes (camera) and ears (microphone). You are a calm, \
+attentive friend in the room — not a narrator describing what you see.
 
-CRITICAL BEHAVIOR: You must speak up unprompted. Every 2-3 turns \
-where the user hasn't spoken, you should initiate conversation \
-based on what you see. You are NOT a chatbot waiting for questions. \
-You are a companion who is actively present and engaged.
+PRIORITY ORDER (highest to lowest):
+1. Listen to what the user is saying — this is always first.
+2. Respond to what they said — directly and warmly.
+3. Use vision context naturally — only if relevant to what they \
+said, or if they haven't spoken recently.
+4. Be proactive — only during silence, never mid-conversation.
 
-Examples of proactive behavior:
-- You see them wave → "Oh, are you waving at me? Hello there!"
-- You see them stand up → "Where are you off to?"
-- You see them sitting quietly → "You've been quiet — penny for your thoughts?"
-- You see them pick something up → "What have you got there?"
+WHEN USER IS SPEAKING OR JUST SPOKE (last 10 seconds):
+- Focus 100% on their words.
+- Do not mention what you see on camera.
+- Do not comment on their movements or gestures.
+- Treat vision context as background information only.
 
-Never stay silent when you can see the person doing something. \
-React the way a caring friend in the room would react.
+WHEN USER IS SILENT (10+ seconds):
+- Check camera.
+- Initiate naturally based on what you see.
+- Keep it brief — one question or observation.
 
-Guidelines:
-- Keep responses to 2-3 sentences unless asked for more detail.
-- Use simple, everyday language. Avoid jargon.
-- ALWAYS react to what the camera shows — comment on activity changes, \
-greet gestures, ask about what they're doing.
-- If the activity changes between turns (e.g., sitting → standing), \
-notice it and ask about it ("Oh, you're up! Going somewhere?").
-- Support small talk — weather, memories, how they're feeling.
-- If the person corrects you ("no that's wrong"), apologize briefly and adjust.
-- If you notice something concerning (mentions of pain, falling, confusion), \
-gently ask about it without being alarmist.
-- If you know things about the user (name, preferences, topics discussed), \
-use them naturally to make conversation feel personal and warm.
+CONVERSATION STYLE:
+- Short responses (2-3 sentences max).
+- Never repeat what you just said.
+- Natural gestures (touching face, moving head, gesturing while \
+talking) are normal — never comment on them.
+- Only react to significant activities: waving, standing up, \
+falling, picking something up, leaving the room.
+- When fitting, open with a brief 2-4 word acknowledgement \
+("I see.", "That's good.", "Oh really?") before the main reply.
+- Support small talk — weather, memories, feelings.
+- If something concerning comes up (pain, falling, confusion), \
+ask gently without alarming.
+- If you know facts about the user (name, preferences), use them \
+naturally.
+
+WHEN CORRECTED BY THE USER:
+- Reply in ONE short sentence. No second sentence.
+- At most one acknowledgment word ("Sorry." or "You're right.") — \
+then the substance, or nothing else.
+- Do not enumerate what you got wrong.
+- Do not describe what you will do differently.
+- Do not thank the user for the correction or for their patience.
+- Move on quickly and keep the conversation flowing.
 """
 
 
@@ -114,6 +128,7 @@ class ConversationEngine:
         user_text: str,
         vision_context: str = "",
         user_context: str = "",
+        time_context: str = "",
     ) -> AsyncGenerator[str, None]:
         """Stream Claude's response to user_text, yielding text chunks.
 
@@ -124,6 +139,11 @@ class ConversationEngine:
         `user_context`, if provided, is injected into the system prompt so
         Claude can reference what it knows about the user (name, preferences,
         topics discussed). Persisted in the Session's UserContext object.
+
+        `time_context`, if provided, is a short line about the user's local
+        time of day so Claude can reference it naturally in greetings and
+        check-ins (see Session.time_of_day_context). Empty string if the
+        browser hasn't reported its timezone yet.
         """
         self._history.append({"role": "user", "content": user_text})
 
@@ -131,6 +151,9 @@ class ConversationEngine:
             self._history = self._history[-MAX_HISTORY:]
 
         system_prompt = SYSTEM_PROMPT
+
+        if time_context:
+            system_prompt += "\n\n" + time_context
 
         if user_context:
             system_prompt += "\n\n" + user_context
@@ -278,22 +301,25 @@ class ConversationEngine:
         Uses the same persistent HTTP/2 client. Runs as a fire-and-forget
         background task after each response so it never blocks the voice loop.
         """
-        # Need at least 2 messages (1 user + 1 assistant) to extract from
-        if len(self._history) < 2:
+        # Only the user's own words can yield user facts. Passing the
+        # assistant's reply to the extractor caused a bug where "Abide"
+        # (the assistant's name, shown as a role label) was sometimes
+        # mis-extracted as the user's name.
+        user_msgs = [m for m in self._history if m["role"] == "user"][-2:]
+        if not user_msgs:
             return None
 
-        last_turns = self._history[-2:]
-        turns_text = "\n".join(
-            f"{'User' if m['role'] == 'user' else 'Abide'}: {m['content']}"
-            for m in last_turns
-        )
+        turns_text = "\n".join(f"User: {m['content']}" for m in user_msgs)
 
         extraction_prompt = (
-            "Extract any new facts about the user from this exchange.\n"
+            "Extract any new facts about the user from what THEY said.\n"
             "Return ONLY valid JSON with these optional fields:\n"
             '  {"name": "...", "topics": ["..."], "preferences": ["..."], "mood": "..."}\n'
             "Rules:\n"
-            "- name: only if the user explicitly states their name\n"
+            "- name: ONLY if the user explicitly states their own name "
+            "(e.g., 'my name is...', 'I'm...', 'call me...'). "
+            "'Abide' is the name of the assistant, never the user — "
+            "never extract 'Abide' as the user's name.\n"
             "- topics: subjects discussed (e.g., 'garden', 'daughter Sarah')\n"
             "- preferences: things they like or dislike\n"
             "- mood: brief mood signal if detectable (e.g., 'cheerful', 'tired')\n"

@@ -4,6 +4,48 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
+## 16. Resume-session banner flashed old transcript then Start wiped it (Post-launch)
+
+**Context**: Live testing surfaced a confusing flow. On page refresh the "Resume last session?" banner (D65) appeared; clicking Yes restored the old transcript into the conversation panel; clicking Start — the only way to begin a new session — called `clearStoredSession()` and replaced the transcript with the "Press Start and speak" placeholder. The user saw their old chat for ~1 second, then it disappeared. Tester quote: *"it just puts everything in chat then I click start then everything starts from 0."*
+
+**Root cause**: Two product intents were in conflict. The resume flow was designed for *"survive a refresh with a read-only view of the last transcript"*. The Start handler was designed for *"always begin a fresh live session, never merge stale context"*. These are both correct individually but produce the jarring flash when composed. Claude's history had never been persisted anyway (in-memory per WebSocket), so the restored transcript was a visual illusion — Abide wouldn't have remembered any of it even if the transcript had survived Start.
+
+**Evaluation-context check**: the brief specifies single-session testing (one tester at a time, independent across locations). Cross-session continuity is not a requirement, and resume was adding UX friction without delivering value.
+
+**Fix**: Deleted the entire feature. In `frontend/index.html`: removed the `.resume-banner` CSS block, the `<div class="resume-banner">` markup, the `persistSession()` / `clearStoredSession()` / `SESSION_STORAGE_KEY` helpers, the `restoreSessionFromStorage()` renderer, the `initResumeBanner()` IIFE, the `$resumeYes` / `$resumeNo` handlers, and the call sites in the diary-append path + Start handler. In `CLAUDE.md` Module Status: struck line 17 (D65). 167 lines gone from `index.html`. Refresh now = fresh session, matching the brief's single-session model. Diary tab is unaffected (separate feature).
+
+**Files touched**: `frontend/index.html`, `CLAUDE.md`. Documented in D74.
+
+---
+
+## 15. Barge-in false positives on keypresses / coughs / mic thumps (Post-launch)
+
+**Context**: Live testing showed 4 of 7 barge-ins in a single session firing, killing Abide's response mid-sentence, then being immediately followed by `[FILTER] Rejected quiet segment` on the captured audio (RMS 0.007–0.014, below the 0.015 post-hoc gate). Each false interrupt cut Abide off and made it feel twitchy.
+
+**Root cause**: The pre-gate in `main.py` read `AudioProcessor.current_max_rms` — the peak RMS of any single 32 ms VAD window across the in-progress segment. A keypress / cough / mic thump produces one or two loud windows at RMS 0.02–0.03 that cleared the 0.015 threshold. Meanwhile the post-hoc filter in `audio.py` computed aggregate RMS across the whole ~22k-sample segment and rejected it as quiet. Pre-gate and post-hoc filter used different statistics over the same audio and disagreed.
+
+**Fix**: Replaced peak-RMS gate with a sustained-loudness counter. `AudioProcessor` now tracks `_loud_window_count` — the number of windows in the in-progress segment whose RMS clears `MIN_SPEECH_RMS`. `main.py` gates barge-in on `current_loud_window_count >= BARGE_IN_MIN_LOUD_WINDOWS (6, ≈190 ms of cumulative above-threshold audio)`. The counter resets on `speech_start` / `speech_end` / `reset()`. `_current_max_rms` is kept for diagnostic log visibility. A single loud spike no longer qualifies; sustained voice-level audio does. The two gates now share the same "sustained majority of segment must be loud" semantics. Log line updated to print both `loud_windows` and `max_rms`.
+
+**Smoke test**: tap desk / click keyboard → `loud_windows=1`, does NOT fire. Speak clearly for ≥400 ms → `loud_windows >= 6`, fires as before.
+
+**Files touched**: `app/audio.py`, `app/main.py`. Documented in D67.
+
+---
+
+## 14. Extractor saved "Abide" as the user's name, poisoning the session (Post-launch)
+
+**Context**: Live testing showed `[CONTEXT] Extracted user facts: {'name': 'Abide'}` on turn 2 of a session where the user had said nothing about a name. From then on every Claude turn received `What I know about you: - Name: Abide` injected into its system prompt, and every Whisper STT call received `user_name="Abide"` as a biasing hint (D60). Both channels actively corrupted for the rest of the session.
+
+**Root cause**: `ConversationEngine.extract_user_facts()` formatted the last two history messages as `"User: ... \n Abide: ..."` and sent them to a Claude extraction call. Claude saw `"Abide"` labeled as a speaker and — despite the prompt rule *"only if the user explicitly states their name"* — extracted it as the user's name. The assistant's turn provides no user facts anyway; including it was noise that invited confusion.
+
+**Fix**: Two layers. (1) In `conversation.py`, filter `self._history` to user messages only before building `turns_text`. The `"Abide:"` role label is gone from the extractor's input. Added an explicit prompt line: *"'Abide' is the name of the assistant, never the user — never extract 'Abide' as the user's name."* (2) In `session.py`, added a module-level `_NAME_BLOCKLIST = {"abide", "assistant", "ai", "user", "companion", "robot"}` and a case-insensitive check in `UserContext.update()` that logs `[CONTEXT] Rejected name candidate: ...` and drops the field. Defence-in-depth if the extractor output ever drifts again.
+
+**Smoke test**: `uc.update({'name': 'Abide'})` → `name` stays None; `uc.update({'name': 'Sarah'})` → `name == 'Sarah'`; first-name-wins invariant preserved.
+
+**Files touched**: `app/conversation.py`, `app/session.py`. Documented in D66.
+
+---
+
 ## 13. Hardening pass: localStorage validation, parallel TTS prewarm, say_canned error path (Post-Phase-7)
 
 **Context**: Audit of the 7 recently-added features (TTS cache, welcome greeting, stability filter, export, resume, name biasing, confidence chip) surfaced five real issues:

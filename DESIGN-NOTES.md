@@ -10,6 +10,72 @@ Format for each entry:
 
 ---
 
+## Post-launch iteration (Phases A–I + easter egg)
+
+After the initial launch, live testing with real microphone + camera input surfaced several quality issues that weren't visible in the scripted development loop. The fixes below address them. Where possible the fix is structural (reshape the prompt or schema) rather than patch-like (add a keyword to a list) — see the `feedback_no_scenario_hardcoding.md` memory for the principle.
+
+### D75. Time-of-day awareness — welcome + system-prompt injection (easter egg)
+- **Decision**: Frontend sends the user's local timezone offset (JS `new Date().getTimezoneOffset()`) in the `config` WebSocket message. Server computes the local hour and a bucket — `morning` / `afternoon` / `evening` / `night` — and (a) picks a matching welcome greeting from a 4-variant cache, (b) injects a one-line `"Local time where the user is: evening (around 7 PM). Reference the time of day naturally..."` into every Claude system prompt (greetings, check-ins, vision-react, fall alert replies).
+- **Context**: The brief's evaluation criteria include "Surprise or Easter Egg features you add." Reviewed a dozen ideas (idle breathing exercise, wind-down mode, medication reminder, two-person awareness). Most were presumptuous (guesses wrong about user state) or competed with existing features (dark-mode toggle). Time-of-day wins because it (a) never misfires — time is objective, (b) triggers in every session regardless of what the user does, (c) costs nothing to activate, (d) Ruben + Abide team members at different geographic locations each get contextually appropriate greetings.
+- **Alternatives**: (a) server clock only — wrong if Docker container runs UTC but user is in Dallas or Mumbai; (b) frontend sends IANA timezone name (`America/Chicago`) — more info but requires `zoneinfo` and a larger payload; the offset-in-minutes is sufficient for hour-of-day buckets. (c) embed in the Whisper prompt too for STT biasing — rejected; not a biasing signal.
+- **Trade-offs**: +35 tokens per Claude turn for the injection line. Welcome-cache grows from 1 greeting to 4 variants (prewarmed in parallel, same latency). Claude's prompt is told to reference time naturally "not force it into every reply" so it doesn't become repetitive. Falls back silently to generic wording if the browser hasn't reported a timezone yet (shouldn't happen — config arrives before the 1.2s welcome delay).
+
+### D74. Removed the "Resume last session?" banner (reverts D65)
+- **Decision**: Deleted the resume-across-refresh banner + `persistSession` / `clearStoredSession` / `SESSION_STORAGE_KEY` + the `restoreSessionFromStorage` render path + CSS + HTML markup. Page refresh now = fresh session.
+- **Context**: The original D65 design was "save last session's diary to `localStorage` so a refresh can offer to restore the transcript read-only". In practice users clicked Resume → saw the old transcript → then clicked Start → transcript got wiped and `localStorage` cleared because Start always clears stored state (documented constraint). Net effect: the feature flashed the user's old chat for 1 second then deleted it. Evaluation brief asks for a single-session test — resume was adding confusion without value.
+- **Alternatives**: (a) keep the banner but have Start preserve the resumed transcript with a visible divider; (b) add true cross-session memory (Phase E) so Resume actually continues the conversation. Both added surface area for bugs on a system being judged on stability.
+- **Trade-offs**: If a tester accidentally refreshes mid-session they lose the on-screen transcript. The diary tab is separate and continues to function in-session. Claude's history was never persisted anyway, so accepting the visual loss matches what the system actually remembers.
+
+### D73. Auto-populated TTS cache via `app/tts_cache_store.py` (Phase I)
+- **Decision**: Every sentence Claude completes is recorded to a persistent frequency counter at `./tts_cache/phrase_counts.json`. Phrases heard ≥`_MIN_COUNT_TO_PREWARM` (default 2) times across prior sessions are returned by `learned_phrases()` and merged with a 12-phrase seed list (`TTS_CACHE_SEED_PHRASES`) at session start. Prewarm total capped at `_PREWARM_TOTAL_CAP` (30). File size bounded to top-200 entries by count. Atomic write via `tmp + replace`.
+- **Context**: The original `TTS_CACHE_PHRASES` was a hand-curated list of 5 phrases I picked by scanning live logs. Same structural problem as `_REACTIVE_ACTIVITIES` (see D72): a static list that has to grow by hand and doesn't match Abide's actual voice.
+- **Alternatives**: (a) keep curating by hand; (b) per-resident learned caches keyed on some user ID (splits frequency counts, wastes prewarm budget, violates the "no cross-session identity" constraint from the evaluation brief).
+- **Trade-offs**: First run is identical to today (seed list only). Cache converges on Abide's real voice over a few sessions. Plaintext on disk (gitignored). Same writer-last-wins concurrency story as every other persistent state in the system.
+
+### D72. Vision-emitted `noteworthy` flag replaces `_REACTIVE_ACTIVITIES` keyword list (Phase H)
+- **Decision**: The vision model now emits a `noteworthy: bool` alongside each scene. Session's vision-react trigger fires only when that flag is true AND the activity text changed since the last observation AND the user has been silent ≥10 s. The hard-coded frozenset `_REACTIVE_ACTIVITIES` (7 keywords) is deleted.
+- **Context**: Phase D had already narrowed the list from 16 keywords to 7, but the structural problem remained: the list had to grow by hand every time someone did a new "significant" thing, and it couldn't judge intent from context. The vision model already reasons about the scene via `motion_cues` — let it also judge engagement-worthiness.
+- **Alternatives**: (a) keep narrowing the keyword list; (b) multi-classifier approach (separate pose estimation + intent model); (c) rule-based heuristic on motion magnitude. All brittle against open-ended user behavior in live testing.
+- **Trade-offs**: We're trusting the vision model's semantic judgment. Mitigations in the prompt: default to FALSE, positive/negative example pairs, and the separate "different from previous" check in Session prevents spam on sustained gestures. Falls still go through the `FALL:` prefix path (orthogonal, always-on).
+
+### D71. Correction-response shape rule in Claude system prompt (Phase G)
+- **Decision**: Claude's SYSTEM_PROMPT gets a dedicated `WHEN CORRECTED BY THE USER:` section with shape-based rules: one short sentence, at most one acknowledgment word, no enumeration of what was wrong, no future-action promises, no "thanks for your patience" coda.
+- **Context**: Live testing showed Claude Sonnet 4 producing four apologetic sentences per correction. The previous one-liner rule (*"acknowledge briefly and move on"*) was ignored. Sycophantic apology is a known behavior pattern of this model family, not a user-scenario edge case.
+- **Alternatives**: Phrase blocklist ("never say 'I should have'..."). Brittle — the model routes around specific phrases.
+- **Trade-offs**: Shape constraints generalize across phrasings. A hard-coded rule about a known model-failure-mode is acceptable per the no-scenario-hardcoding principle.
+
+### D70. Vision prompt restructured around motion-scope + chain-of-thought (Phase F)
+- **Decision**: `VISION_SYSTEM_PROMPT` now requires an ordered JSON output: `motion_cues` (chain-of-thought grounding, <=15 words) → `activity` (<=10 words, scope-matched) → `noteworthy` (boolean, per D72) → `bbox`. Four motion scopes (WHOLE-BODY / LIMB / HAND-OBJECT / STATIC) with a "pick the largest visible" tiebreak rule. 14 diverse few-shot examples covering the elderly-care activity spectrum including two "natural talking gesture" negatives that anchor `noteworthy=false`. FALL safety expanded to near-falls (slipping, stumbling, catching themselves).
+- **Context**: Live testing showed dancing being labeled as "Waving hand in front" — the model defaulted to the narrow single-joint label because the hand was prominent. Structural fix rather than a dance-vs-wave disambiguation rule. Techniques drawn from CoT-VLA (CVPR 2025), GetStream's GPT-4o vision guide, and OpenAI's structured-outputs documentation.
+- **Alternatives**: (a) specific rules per activity pair; (b) bump to 5 frames per call (evaluated as deferred — try if prompt alone is insufficient); (c) migrate to `response_format: json_schema strict: true` (deferred — doesn't improve label choice, only enforces parsing).
+- **Trade-offs**: Vision prompt grew from ~620 to ~1623 tokens (~2.5x). GPT-4o-mini input cost is ~$0.0001/call extra; latency impact modest. Accepted in exchange for grounded classification across activities we can't enumerate.
+
+### D69. Priority-hierarchy system prompt + narrowed reactive triggers + 10 s silence gate (Phase D)
+- **Decision**: Claude's SYSTEM_PROMPT rewritten with explicit priority order (listen → respond → use vision only if relevant → be proactive only in silence), a "when user speaking or just spoke (last 10 s)" rule that says "do not mention what you see on camera", and a "natural gestures are normal — never comment on them" clause. In `app/session.py`: `_REACTIVE_ACTIVITIES` narrowed from 16 keywords to 7 (later deleted entirely in D72), and `_VISION_REACT_MIN_SILENCE_S = 10.0` replaces the hardcoded `3.0` silence gate so code matches prompt.
+- **Context**: Live testing showed Abide interrupting active conversations to narrate "I see you gesturing with your hands" or "I notice you keep reaching for your neck" — exactly the behavior a companion in the room wouldn't exhibit. Two bugs: a weak prompt and a too-eager silence gate.
+- **Alternatives**: (a) keep current reactive behavior, tune cooldowns only. Didn't fix the core "narrator vs listener" mismatch.
+- **Trade-offs**: SYSTEM_PROMPT grew from ~275 tokens (Phase C) to ~407 tokens. Worth the tokens for the behavior clarity.
+
+### D68. System prompt trim + TTS cache seed expansion + short-acknowledgement nudge (Phase C)
+- **Decision**: Claude's SYSTEM_PROMPT trimmed from ~450 to ~275 tokens (merged redundant guidelines, dropped the "proactive behavior examples" block that duplicated other rules). Added a nudge for Claude to open with a 2-4 word acknowledgement when fitting. `TTS_CACHE_PHRASES` expanded from 5 to 15 seed phrases. (Later: Phases D/G/H each added more to the prompt; current size ~484 tokens.)
+- **Context**: Initial latency measurement showed first-sentence-boundary was the main lever for time-to-first-audio on uncached turns. Shorter opening → faster boundary → earlier TTS start. More cache phrases = more 0 ms hits.
+- **Alternatives**: (a) use Haiku for short replies (quality hit); (b) flush TTS on first comma (audibly choppy per D-prior). Rejected.
+- **Trade-offs**: Subsequent phases (D/G/H) added back some of the trimmed tokens. Net result post-Phase-G: ~484 tokens, still below the original 450. Acceptable.
+
+### D67. Barge-in gate switched from peak-RMS to loud-window-count (Phase B)
+- **Decision**: `AudioProcessor` now tracks `_loud_window_count` — the number of 32 ms VAD windows in the in-progress segment whose RMS clears `MIN_SPEECH_RMS`. `main.py` gates barge-in on `current_loud_window_count >= BARGE_IN_MIN_LOUD_WINDOWS (6, ~190 ms cumulative)` instead of `current_max_rms >= BARGE_IN_MIN_RMS`.
+- **Context**: Live testing showed 4/7 barge-ins in one session were false positives — fired, killed Abide's response, then `[FILTER] Rejected quiet segment` on the captured audio with aggregate RMS ~0.007. Root cause: the pre-gate (D25b) used peak RMS across any single window; a keypress / cough / mic thump produces one loud window at RMS 0.02–0.03 that cleared the 0.015 threshold even when the full segment averaged below. The pre-gate and post-hoc filter used different statistics over the same audio and disagreed.
+- **Alternatives**: (a) raise the RMS threshold (same statistic, just different tuning — still fires on spikes); (b) switch to mean RMS (computing running mean or buffering full segment — fine, but a counter is simpler and easier to tune).
+- **Trade-offs**: The counter is cheap (one integer increment per VAD window). `_current_max_rms` is kept for diagnostic logging. The two gates now share the same "sustained majority of segment must be loud" semantics.
+
+### D66. Extract-user-facts only on user turns + name blocklist (Phase A)
+- **Decision**: `ConversationEngine.extract_user_facts()` filters `self._history` to user messages only before formatting `turns_text`. The `User:/Abide:` role labeling is gone — only `User:` appears. Extraction prompt explicitly states "'Abide' is the name of the assistant, never the user". A module-level `_NAME_BLOCKLIST` in `session.py` rejects `{"abide", "assistant", "ai", "user", "companion", "robot"}` at the `UserContext.update()` boundary as defence-in-depth.
+- **Context**: Live testing showed the extractor saving `Name: Abide` to the user context on turn 2. The user never stated a name. The injected "What I know about you: Name: Abide" poisoned every subsequent Claude turn AND the Whisper STT biasing prompt (D60 passes `user_name` to Groq).
+- **Alternatives**: (a) prompt-only fix (still passes assistant turn as noise); (b) blocklist-only fix (fragile if the extractor's output format drifts). Both together is belt-and-suspenders.
+- **Trade-offs**: The blocklist is a hard-coded list — acceptable per the hardcoding principle because it addresses a known model-failure-mode (role-label confusion in fact extraction), not a user-scenario edge case.
+
+---
+
 ## Phase 1–2: Foundation
 
 ### D1. Single-file HTML frontend, no framework

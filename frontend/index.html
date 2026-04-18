@@ -652,35 +652,6 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── Resume-session banner ── */
-.resume-banner {
-    display: none;
-    position: fixed;
-    top: 76px; left: 50%; transform: translateX(-50%);
-    z-index: 50;
-    padding: 12px 18px;
-    background: var(--chip-bg);
-    backdrop-filter: blur(14px);
-    border: 1px solid var(--border-hi);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
-    color: var(--text);
-    font-size: 14px;
-    align-items: center; gap: 12px;
-    max-width: 90vw;
-}
-.resume-banner.show { display: flex; }
-.resume-banner .resume-meta { color: var(--text-dim); font-size: 12px; }
-.resume-banner button {
-    padding: 6px 14px; font-size: 13px; border-radius: 8px;
-    background: var(--surface); border: 1px solid var(--border);
-    color: var(--text); cursor: pointer;
-}
-.resume-banner button.primary {
-    background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
-    border-color: transparent; color: #fff;
-}
-
 /* ── Theme toggle ── */
 .theme-toggle {
     width: 38px; height: 38px; border-radius: 50%;
@@ -775,16 +746,6 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
 </div>
 
 <!-- Session summary overlay -->
-<!-- Resume last session banner -->
-<div class="resume-banner" id="resumeBanner" role="alert">
-    <div>
-        <div>Resume last session?</div>
-        <div class="resume-meta" id="resumeMeta"></div>
-    </div>
-    <button class="primary" id="resumeYes">Yes</button>
-    <button id="resumeNo">No</button>
-</div>
-
 <div class="summary-overlay" id="summaryOverlay">
     <div class="summary-modal">
         <div class="summary-header">
@@ -838,32 +799,6 @@ let currentAssistantMsg = null;
 // ── Session diary & summary state ──
 let sessionStartTime = null;
 let diaryEntries = []; // { timestamp: Date, type: "user"|"assistant"|"activity"|"alert"|"fall", content: string }
-
-// ── localStorage session persistence (CHANGE 7) ──
-// The last session's diary+metadata is saved on every change so a page
-// refresh can offer to resume. Clicking Start ALWAYS clears this — we
-// never merge a previous session's context into a fresh live session.
-const SESSION_STORAGE_KEY = "abide_last_session";
-function persistSession() {
-    if (!sessionStartTime || !diaryEntries.length) return;
-    try {
-        const payload = {
-            startTime: sessionStartTime.toISOString(),
-            entries: diaryEntries.map(e => ({
-                t: e.timestamp.toISOString(),
-                type: e.type,
-                content: e.content,
-            })),
-        };
-        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
-    } catch (e) {
-        // Quota exceeded or disabled — silently ignore, persistence is best-effort.
-        console.warn("Session persistence failed:", e);
-    }
-}
-function clearStoredSession() {
-    try { localStorage.removeItem(SESSION_STORAGE_KEY); } catch (e) {}
-}
 
 // ── Vision state ──
 let videoStream = null;
@@ -943,102 +878,6 @@ $themeToggle.addEventListener("click", () => {
     document.documentElement.dataset.theme = next;
     localStorage.setItem("theme", next);
     applyThemeIcon();
-});
-
-// ── Resume last session banner (CHANGE 7) ──
-const $resumeBanner = document.getElementById("resumeBanner");
-const $resumeMeta = document.getElementById("resumeMeta");
-const $resumeYes = document.getElementById("resumeYes");
-const $resumeNo = document.getElementById("resumeNo");
-
-function dismissResumeBanner() {
-    $resumeBanner.classList.remove("show");
-}
-
-function restoreSessionFromStorage() {
-    let payload;
-    try {
-        const raw = localStorage.getItem(SESSION_STORAGE_KEY);
-        if (!raw) return;
-        payload = JSON.parse(raw);
-        if (!payload || !Array.isArray(payload.entries) || !payload.entries.length) {
-            clearStoredSession();
-            return;
-        }
-    } catch (e) {
-        clearStoredSession();
-        return;
-    }
-    // Rehydrate diary entries — validate every item. Tampered localStorage
-    // could inject arbitrary fields; only accept known types and coerce
-    // content/timestamps to safe primitives.
-    const VALID_TYPES = new Set(["user", "assistant", "activity", "alert", "fall"]);
-    const startDate = new Date(payload.startTime);
-    if (isNaN(startDate.getTime())) { clearStoredSession(); return; }
-    sessionStartTime = startDate;
-    diaryEntries = payload.entries
-        .filter(e => e && typeof e === "object" && VALID_TYPES.has(e.type) && typeof e.content === "string")
-        .map(e => ({
-            timestamp: (function(){ const d = new Date(e.t); return isNaN(d.getTime()) ? new Date() : d; })(),
-            type: e.type,
-            content: e.content.slice(0, 4000), // cap runaway content
-        }));
-    if (!diaryEntries.length) { clearStoredSession(); return; }
-    // Clear placeholders
-    $diary.innerHTML = "";
-    $transcript.innerHTML = "";
-    // Render diary entries
-    for (const e of diaryEntries) renderDiaryEntry(e);
-    // Render user/assistant as transcript messages
-    for (const e of diaryEntries) {
-        if (e.type === "user") {
-            const div = document.createElement("div");
-            div.className = "msg user";
-            const time = e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-            div.innerHTML = `<span class="label">You<span class="time">${time}</span></span>${escapeHtml(e.content)}`;
-            $transcript.appendChild(div);
-        } else if (e.type === "assistant") {
-            const div = document.createElement("div");
-            div.className = "msg assistant";
-            const time = e.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-            div.innerHTML = `<span class="label">Abide<span class="time">${time}</span></span><span class="text">${escapeHtml(e.content)}</span>`;
-            $transcript.appendChild(div);
-        }
-    }
-    if (!$transcript.childElementCount) {
-        $transcript.innerHTML = '<div class="empty">No conversation in the resumed session.</div>';
-    }
-    $transcript.scrollTop = $transcript.scrollHeight;
-}
-
-(function initResumeBanner() {
-    let payload;
-    try {
-        const raw = localStorage.getItem(SESSION_STORAGE_KEY);
-        if (!raw) return;
-        payload = JSON.parse(raw);
-        if (!payload || !Array.isArray(payload.entries) || !payload.entries.length) {
-            clearStoredSession();
-            return;
-        }
-    } catch (e) {
-        clearStoredSession();
-        return;
-    }
-    const start = new Date(payload.startTime);
-    const n = payload.entries.length;
-    $resumeMeta.textContent =
-        start.toLocaleString() + " · " + n + " entries";
-    $resumeBanner.classList.add("show");
-})();
-
-$resumeYes.addEventListener("click", () => {
-    restoreSessionFromStorage();
-    dismissResumeBanner();
-});
-$resumeNo.addEventListener("click", () => {
-    clearStoredSession();
-    dismissResumeBanner();
 });
 
 // ── API key persistence ──
@@ -1144,8 +983,6 @@ function addDiaryEntry(type, content) {
     if (diaryEntries.length === 1 && $tabDiary.classList.contains("active")) {
         $exportBtn.style.display = "";
     }
-    // Persist so a page refresh can offer to resume.
-    persistSession();
 }
 
 function renderDiaryEntry(entry) {
@@ -1574,10 +1411,6 @@ $startBtn.onclick = async () => {
     // Reset transcript for new session
     $transcript.innerHTML = '<div class="empty">Press Start and speak to begin a conversation.</div>';
     $exportBtn.style.display = "none";
-    // CRITICAL: starting a fresh live session always discards any
-    // stored previous session. We never merge stale context in.
-    clearStoredSession();
-    dismissResumeBanner();
 
     try {
         micStream = await navigator.mediaDevices.getUserMedia({
@@ -1619,6 +1452,11 @@ $startBtn.onclick = async () => {
                 anthropic_api_key: $anthropicKey.value.trim(),
                 openai_api_key: $openaiKey.value.trim(),
                 sample_rate: audioCtx.sampleRate,
+                // JS getTimezoneOffset(): minutes where UTC = local + offset.
+                // Server uses this to bucket the local hour (morning /
+                // afternoon / evening / night) and reference time-of-day
+                // naturally in greetings and check-ins.
+                timezone_offset_minutes: new Date().getTimezoneOffset(),
             }));
 
             $stopBtn.disabled = false;

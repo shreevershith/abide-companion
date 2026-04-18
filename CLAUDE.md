@@ -1,5 +1,23 @@
 # Abide Companion — AI Elderly Care Product
 
+## Product Context
+Abide Robotics (abide-robotics.com) builds a three-tier care product:
+
+1. **Resident Companion** — an in-room robotic companion for older adults.
+   Voice-first, 24/7, supports daily routine (medications, meals, hydration).
+   Target hardware: Reachy Mini by Pollen Robotics.
+2. **Caretaker Mobile App** — alert inbox + context portal for care staff.
+3. **Facility Dashboard** — live overview + longitudinal trend data.
+
+**This codebase implements tier 1 — the Resident Companion.** It runs on
+commodity hardware (Logitech MeetUp, or any webcam + mic + speaker) today
+and is designed to port cleanly to Reachy Mini when the hardware ships.
+Tiers 2 and 3 are out of scope for this build; integration points
+(Langfuse session traces, fall-alert events) are in place so a future
+caretaker app can subscribe to them.
+
+Mission: *to care for those who can't care for themselves.*
+
 ## Project Context
 Real-time multimodal AI companion for elderly care (Abide Robotics).
 Primary target: non-technical end users on Windows (with Docker Desktop).
@@ -35,7 +53,7 @@ NOT acceptable:
 - End user supplies exactly 3 keys: Groq, Anthropic, OpenAI
 
 ## Hard Requirements
-- Barge-in: fires at ~420ms (gated on 400ms sustained speech + RMS threshold)
+- Barge-in: fires at ~420ms (gated on 400ms sustained speech + ≥6 loud VAD windows, ≈190ms cumulative above-threshold audio — matches post-hoc segment filter)
 - Use Web Audio API for playback (NOT <audio> element)
 - TTS starts on first sentence boundary, not after full Claude response
 - Latency target: <1.5s to first audio after user finishes speaking
@@ -60,7 +78,7 @@ NOT acceptable:
 - UserContext persistence: extracts name, topics, preferences, mood from conversation
 - User facts injected into every Claude turn ("What I know about you: ...")
 - Vision activity buffer: last 5 observations with relative timestamps
-- Vision-reactive trigger: waving, thumbs up, standing up etc. trigger immediate response (D54)
+- Vision-reactive trigger: the vision model emits a `noteworthy` boolean alongside each scene; Session fires a proactive turn when `noteworthy` is true AND the activity text changed since the last observation AND the user has been silent ≥10s. No hard-coded activity allowlist — the model decides semantically (D54)
 Implementation: `CHECK_IN_INTERVAL_S` + `_proactive_checkin_loop()` in `app/main.py`,
 `UserContext` dataclass + `_extract_user_facts()` in `app/session.py`,
 `extract_user_facts()` in `app/conversation.py`.
@@ -79,17 +97,17 @@ Tab alongside "Conversation" in the transcript panel showing:
 - Full timestamped interaction history (user, assistant, vision, alerts)
 - Color-coded type badges
 - Live-updating during session, scrollable after session ends
-- Cleared on next Start; exportable to .txt; restorable after refresh
+- Cleared on next Start; exportable to .txt. Refresh ends the session (no restore)
 Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in `frontend/index.html`.
 
 ## Vision Requirements
 - Multi-frame: 3 JPEGs per call, 1.2s apart, sent every 3.6s
-- Detect activities: sitting, standing, moving, speaking, falling,
-  folding clothes, putting on shirt
-- Bounding box overlay rendered on canvas
-- Ask clarifying questions: "It looks like you're sitting — am I correct?"
+- Output schema emits `motion_cues` (chain-of-thought grounding) → `activity` → `noteworthy` → `bbox`. Model must reason about observed frame differences before classifying.
+- Scope-matching label rule (WHOLE-BODY / LIMB / HAND-OBJECT / STATIC) — label granularity must match motion scope. When motion spans scopes, pick the largest visible. Generalizes across activities we don't enumerate (dance, fall, slip, jump, lift-a-leg, wave, reach, bend, stretch, eat, drink).
+- `noteworthy: bool` is the vision model's own judgment on whether the scene is worth a proactive reaction. Replaces the old `_REACTIVE_ACTIVITIES` keyword allowlist in `session.py`.
+- Bounding box overlay rendered on canvas (computed from the LAST frame)
 - Rolling buffer of last 5 scene descriptions with relative timestamps
-- Fall detection: FALL: prefix → red alert banner + urgent Claude context
+- Fall detection: `FALL:` prefix → red alert banner + urgent Claude context. Covers near-falls (slipping, stumbling, catching themselves on furniture) — err on the side of flagging.
 - Prompt injection defense: vision context wrapped in <camera_observations> block
 
 ## Module Status
@@ -97,7 +115,7 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 2. ✅ STT pipeline (silero-vad + Groq Whisper)
 3. ✅ Conversation engine (Claude streaming)
 4. ✅ TTS pipeline (OpenAI, sentence-boundary, parallel producer/consumer)
-5. ✅ Barge-in (cooperative cancellation, RMS-gated, client_playing flag)
+5. ✅ Barge-in (cooperative cancellation, loud-window-count gated, client_playing flag)
 6. ✅ Vision pipeline (multi-frame, bbox, fall detection)
 7. ✅ Docker packaging
 8. ✅ Langfuse observability
@@ -109,7 +127,8 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 14. ✅ Vision confidence indicator (D62)
 15. ✅ Activity stability filter in VisionBuffer (D63)
 16. ✅ Diary export button (D64)
-17. ✅ Session persistence across page refresh (D65)
+17. ✅ Auto-populated TTS cache — runtime-learned phrase frequencies replace the hand-curated seed list (Phase I)
+18. ✅ Time-of-day awareness — browser-reported timezone drives 4-variant welcome + system-prompt injection in every Claude turn (D75, easter egg)
 
 ## Never Do
 - Use React, Vue, or any frontend framework
@@ -155,6 +174,7 @@ abide-companion/
 │   ├── vision.py        # GPT-4o multi-frame analysis
 │   ├── conversation.py  # Claude API streaming (direct httpx, no SDK)
 │   ├── tts.py           # OpenAI TTS streaming (opus, parallel)
+│   ├── tts_cache_store.py # Runtime-learned phrase frequency store (auto-prewarm list)
 │   └── telemetry.py     # Langfuse tracing (graceful no-op if missing)
 ├── frontend/
 │   └── index.html       # Single-file UI

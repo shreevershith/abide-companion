@@ -55,17 +55,32 @@ It runs on one machine with Docker Desktop. You double-click `start.bat`
   initiates conversation based on what it sees on camera. It's a companion
   in the room, not a chatbot waiting for input.
 - **Welcome greeting** — on WebSocket connect, Abide plays a cached
-  "Hello, I'm Abide. How are you today?" instantly (no API call) so the
-  user hears a voice the moment the session starts.
+  time-of-day-appropriate greeting instantly (no API call): "Good
+  morning!", "Good afternoon!", "Good evening!", or "Hello, I'm Abide.
+  How are you tonight?" depending on the browser's local hour. User
+  hears a voice the moment the session starts.
 - **Diary export** — one-click download of the full session (transcript
   + vision observations + alerts) as a timestamped plain-text file.
-- **Resume across refresh** — the last session's diary is kept in
-  `localStorage`; on reload, Abide offers to restore the transcript
-  for review. Starting a new session always clears it.
 - **User memory within session** — Abide extracts and remembers the user's
   name, topics discussed, preferences, and mood signals. These are injected
   into every Claude turn so responses feel personal ("John, I noticed you're
-  back in your chair — how was your walk?").
+  back in your chair — how was your walk?"). Defence-in-depth name filter
+  rejects the assistant's own name or generic role labels if the extractor
+  ever mistags them.
+- **Auto-populated TTS cache** — every sentence Claude completes is
+  recorded to a small on-disk frequency counter; phrases heard repeatedly
+  across sessions are prewarmed at next startup so the cache naturally
+  tracks Abide's actual voice instead of a hand-curated list.
+- **Time-of-day awareness** — the browser reports its timezone offset on
+  connect; the server buckets the local hour and picks a matching cached
+  welcome ("Good morning! / Good afternoon! / Good evening! / Hello, I'm
+  Abide. How are you tonight?") and injects a one-line context into every
+  Claude turn so greetings and check-ins reference the hour naturally.
+- **Vision-emitted "noteworthy" flag** — the vision model itself decides
+  whether a scene is engagement-worthy (waving, standing up, dancing,
+  falling) or background (sitting, talking with natural gestures). No
+  hard-coded activity allowlist — proactive reactions generalize to
+  activities we didn't enumerate.
 - **Low latency** — target is under 1.5 seconds from end-of-speech to
   first audio response. Achieved via persistent HTTP/2 clients, streaming
   LLM to streaming TTS on sentence boundaries, and parallel TTS
@@ -189,14 +204,15 @@ abide-companion/
 |   |-- vision.py         GPT-4o-mini multi-frame vision with JSON bbox output
 |   `-- telemetry.py      Langfuse wrapper with graceful no-op
 |-- frontend/
-|   `-- index.html        Entire UI in one file: HTML + CSS + JS
+|   |-- index.html        Entire UI in one file: HTML + CSS + JS
 |                          - Conversation tab (real-time transcript)
 |                          - Diary tab (chronological event log) + Export button
 |                          - Session summary overlay (on Stop)
 |                          - Video overlay with bounding box + confidence badge
 |                          - Fall alert banner
-|                          - Resume-last-session banner (after refresh)
 |                          - Light/dark theme toggle (Abide Robotics brand)
+|-- app/tts_cache_store.py  Persistent phrase-frequency counter that
+|                            auto-populates the TTS prewarm list (Phase I)
 |-- Dockerfile            Python 3.12-slim + CPU torch + torchaudio + silero-vad
 |-- docker-compose.yml    Single service, .env mounted as env_file
 |-- start.bat             Windows launcher: docker compose up + open browser
@@ -247,18 +263,48 @@ fire-and-forget background task:
 2. Ring buffer holds last 3 frames (~3.6 seconds of motion)
 3. Every 3rd capture, the full 3-frame batch is sent to the server
 4. Server sends the batch to GPT-4o-mini with a structured prompt
-5. Response includes: activity description (max 10 words) + bounding box
+5. Response includes: `motion_cues` (chain-of-thought grounding),
+   `activity` description (max 10 words), `noteworthy` flag,
+   and bounding box
 6. Result displayed on the frontend: scene chip + canvas overlay
 7. Last 5 scene descriptions with relative timestamps injected into Claude's system prompt
 
-**Activities detected:** sitting, standing, walking, waving, dancing,
-reaching, bending, stretching, folding clothes, putting on a shirt,
-holding a cup, reading, typing, exercising, falling, lying down
+**Motion-cues chain-of-thought.** The model writes a short grounded
+observation (e.g. *"Hips sway side to side; both arms up; feet shift"*)
+before it classifies the activity. This forces it to commit to observed
+evidence before picking a label — prevents defaulting to a narrow
+single-pose label (*"Waving"*) when the whole body is moving
+(*"Dancing"*). Cues are logged server-side for diagnostics, not sent to
+Claude.
+
+**Scope-matching label rule.** The prompt teaches four motion scopes
+(WHOLE-BODY / LIMB / HAND-OBJECT / STATIC) and instructs the model to
+match the label's granularity to the scope of the motion observed.
+When motion spans scopes, pick the largest one visible. This
+generalizes across activities we didn't enumerate.
+
+**Activities the system handles:** dancing, walking, running, jumping,
+standing up, sitting down, bending over, turning, exercising, lifting
+a leg, waving, reaching, pointing, stretching, holding a cup, eating,
+drinking, typing, folding, putting on a shirt, brushing teeth,
+sitting still, standing still, lying down, falling, slipping,
+stumbling. The list isn't hard-coded — the prompt's scope rule and
+diverse few-shot examples cover the elderly-care activity spectrum.
 
 **Fall detection:** Vision prompt enforces a `FALL:` prefix when a fall
-is observed. The frontend shows a red pulsing alert banner that
-auto-hides after 20 seconds. Claude's next reply opens with a welfare
-check-in question.
+or near-fall (slip, stumble, catching oneself on furniture) is
+observed — erring on the side of flagging. The frontend shows a red
+pulsing alert banner that auto-hides after 20 seconds. Claude's next
+reply opens with a welfare check-in question.
+
+**`noteworthy` flag.** Alongside the activity text, the model emits a
+`noteworthy: bool` judgment — "would a friend in the room stop and
+react to this?". True for waving, standing up, dancing, starting to
+eat. False for sitting still, talking with natural gestures,
+continuing an ongoing activity. The server fires a proactive Claude
+turn only when `noteworthy=true` AND the activity changed since the
+last observation AND the user has been silent ≥10 s. Replaced an
+earlier hard-coded activity allowlist in `session.py`.
 
 ---
 
@@ -303,8 +349,12 @@ Abide can be interrupted mid-sentence. The system uses a multi-layer gate:
    to suppress echo blips
 2. **SUSTAINED_SPEECH_MS (400 ms)** — require continuous speech before
    firing, not a single spike
-3. **BARGE_IN_MIN_RMS (0.015)** — require real voice-level energy,
-   rejecting TTS echo (~0.005 RMS) leaking through the mic
+3. **BARGE_IN_MIN_LOUD_WINDOWS (6)** — require ≥6 VAD windows (≈190 ms
+   of cumulative audio) to clear `MIN_SPEECH_RMS` in the same segment.
+   Previously a peak-RMS threshold, which let single loud spikes through
+   (keypresses, coughs, mic thumps) even when the full segment averaged
+   below the post-hoc filter. The loud-window count matches the
+   post-hoc filter's aggregate semantics so the two gates agree.
 4. **Cooperative cancellation** — on barge-in, the server sets a flag
    checked between sentence boundaries; partial response is saved to
    history so Claude doesn't repeat itself
@@ -312,8 +362,9 @@ Abide can be interrupted mid-sentence. The system uses a multi-layer gate:
    callbacks from the cancelled response
 
 Total barge-in latency: ~420 ms from user speech onset to Abide going
-silent. The tradeoff is documented in D14 — lowering it further requires
-acoustic echo cancellation (AEC) hardware or DSP, not just timing gates.
+silent. The tradeoff is documented in D14 / D25b — lowering it further
+requires acoustic echo cancellation (AEC) hardware or DSP, not just
+timing gates.
 
 ---
 
@@ -370,14 +421,22 @@ These are documented in full with alternatives and trade-offs in
 - **UserContext persistence** (D53) — lightweight extraction call after each
   response extracts user facts (name, topics, preferences, mood) and
   injects them into every subsequent Claude turn.
-- **TTS cache for stock phrases** (D59) — 5 greetings/check-in phrases
-  pre-generated at session start serve in 0ms vs ~1500ms API call.
+- **TTS cache for stock phrases** (D59, extended by Phase I + D75) — a
+  16-phrase seed (4 time-of-day welcome variants, generic fallback,
+  check-ins, short acknowledgements) is pre-generated at session start so
+  they serve in 0 ms. On top of that, every sentence Claude completes is
+  recorded to a persistent on-disk frequency counter
+  (`app/tts_cache_store.py`); phrases heard ≥2 times across prior sessions
+  are merged into the prewarm list. Cache naturally converges on Abide's
+  real voice instead of a hand-curated list.
 - **Dynamic Whisper prompt biasing** (D60) — once the user's name is
   extracted, it's appended to the STT prompt so Whisper recognizes it
   correctly on subsequent utterances.
-- **Welcome greeting on connect** (D61) — on WebSocket open, Abide plays
-  "Hello, I'm Abide. How are you today?" from the TTS cache — no user
-  speech required, no Claude call, instant first impression.
+- **Welcome greeting on connect** (D61, extended by D75) — on WebSocket
+  open, Abide plays a time-of-day-appropriate greeting ("Good morning!",
+  "Good afternoon!", "Good evening!", or a night-time variant) from the
+  TTS cache — no user speech required, no Claude call, instant first
+  impression. Variant chosen from the browser-reported timezone offset.
 - **Vision confidence indicator** (D62) — scene chip appends a colored
   badge: red `⚠ alert` for falls, amber `low confidence` for tiny bboxes,
   green `confident` otherwise. Pure frontend heuristic.
@@ -387,13 +446,12 @@ These are documented in full with alternatives and trade-offs in
   "still sitting" every turn.
 - **Diary export** (D64) — one-click download of the full session as a
   plain-text `abide-session-YYYY-MM-DD.txt` file. No backend needed.
-- **Session persistence across refresh** (D65) — diary saved to
-  `localStorage` after every entry; on reload, optional "Resume last
-  session?" banner restores the transcript read-only. Clicking Start
-  always clears storage and begins a fresh session.
-- **Vision-reactive triggers** (D54) — waving, thumbs up, standing up etc.
-  trigger an immediate Claude response within ~4 seconds, not waiting
-  for the 30-second timer or user speech.
+- **Vision-reactive triggers** (D54, restructured by Phase H) — the
+  vision model itself emits a `noteworthy: bool` flag per scene. The
+  server fires a proactive Claude turn when that flag is true AND the
+  activity text changed since the last observation AND the user has
+  been silent ≥10 s. Previously a hard-coded activity allowlist; now a
+  semantic judgment the model makes from its own motion_cues reasoning.
 - **Concurrent response mutex** (D55) — `start_response()` cancels any
   in-flight task before starting a new one, preventing orphaned tasks.
 - **Safe WebSocket sends** (D56) — all 11 `ws.send_json()` calls in
@@ -402,6 +460,33 @@ These are documented in full with alternatives and trade-offs in
 - **Temporal activity context** (D19) — last 5 scene descriptions with
   relative timestamps ("2 min ago: sitting", "just now: standing up")
   give Claude awareness of what the user has been doing over time.
+- **Priority-hierarchy system prompt** (Phase D) — Claude's prompt is
+  structured as explicit priorities: listen → respond → use vision only
+  if relevant → be proactive only in silence. Natural conversational
+  gestures (touching face, moving head while talking) are explicitly
+  listed as "never comment on", so Abide stays a present friend rather
+  than a narrator.
+- **Correction-response shape rule** (Phase G) — when the user corrects
+  Abide, the prompt enforces a one-sentence reply with no enumeration,
+  no future-action promises, and no "thanks for your patience" coda.
+  Shape-based rather than a phrase blocklist, so it generalizes across
+  wordings Claude Sonnet 4 might invent.
+- **Vision chain-of-thought via `motion_cues`** (Phase F) — the vision
+  model writes a short grounded observation ("Hips sway; arms up;
+  feet shift") before classifying the activity. Scope-matching rules
+  (WHOLE-BODY / LIMB / HAND-OBJECT / STATIC) plus 14 diverse few-shot
+  examples generalize to activities we didn't enumerate. Based on
+  CoT-VLA (CVPR 2025) and OpenAI vision-prompt guidance.
+- **Auto-populated TTS cache** (Phase I) — replaces a hand-curated
+  phrase list. Every sentence Claude completes is recorded to
+  `tts_cache/phrase_counts.json`; phrases heard ≥2 times are merged
+  with a 16-phrase seed at next prewarm.
+- **Time-of-day awareness** (D75, easter egg) — frontend sends
+  `getTimezoneOffset()` in the `config` WS message; server buckets the
+  local hour (morning / afternoon / evening / night), picks a matching
+  cached welcome, and injects a one-line time-of-day hint into every
+  Claude system prompt so greetings and check-ins reference the hour
+  naturally. Falls back silently if the offset is absent.
 
 ---
 
@@ -483,15 +568,18 @@ silent no-op. The voice loop never depends on telemetry.
 |----------|------|---------|---------|
 | `POST_TTS_COOLDOWN_MS` | `main.py` | 300 | Echo suppression cooldown (ms) |
 | `SUSTAINED_SPEECH_MS` | `main.py` | 400 | Barge-in speech threshold (ms) |
-| `BARGE_IN_MIN_RMS` | `main.py` | 0.015 | Barge-in loudness threshold |
+| `BARGE_IN_MIN_LOUD_WINDOWS` | `main.py` | 6 | Barge-in loud-window count (≈190 ms of cumulative above-threshold audio). Replaces peak-RMS gate (Phase B). |
 | `MIN_SPEECH_SAMPLES` | `audio.py` | 8000 | Min segment length (0.5s at 16kHz) |
-| `MIN_SPEECH_RMS` | `audio.py` | 0.015 | Min segment loudness |
+| `MIN_SPEECH_RMS` | `audio.py` | 0.015 | Per-VAD-window loudness threshold; used by both the barge-in loud-window counter and the post-hoc segment filter |
 | `MAX_HISTORY` | `conversation.py` | 20 | Conversation window (messages) |
 | `CHECK_IN_INTERVAL_S` | `main.py` | 30 | Proactive check-in silence threshold (s) |
 | `_VISION_REACT_COOLDOWN_S` | `session.py` | 15.0 | Min seconds between vision-reactive responses |
-| `TTS_CACHE_PHRASES` | `main.py` | 5 phrases | Stock phrases pre-generated at session start (greetings, check-ins) |
+| `_VISION_REACT_MIN_SILENCE_S` | `session.py` | 10.0 | Min seconds of user silence before vision-react may fire. Matches the "10 seconds" rule in Claude's system prompt. |
+| `TTS_CACHE_SEED_PHRASES` | `main.py` | 16 phrases | First-run seed for the auto-populated TTS cache (4 time-of-day welcome variants + generic fallback + check-ins + short acknowledgements) |
+| `_PREWARM_TOTAL_CAP` | `main.py` | 30 | Cap on combined seed + learned phrases prewarmed per session |
+| `_MIN_COUNT_TO_PREWARM` | `tts_cache_store.py` | 2 | A learned phrase must be heard at least this many times before it's prewarmed |
+| `_MAX_STORED` | `tts_cache_store.py` | 200 | Top-N learned phrases retained on disk |
 | `STABLE_REMIND_S` | `vision.py` | 30.0 | Seconds of stable activity before re-injecting vision context (D63) |
-| `SESSION_STORAGE_KEY` | `index.html` | `abide_last_session` | localStorage key for resume-across-refresh (D65) |
 | `CAPTURE_INTERVAL_MS` | `index.html` | 1200 | Vision frame capture interval |
 | `SEND_EVERY_N` | `index.html` | 3 | Frames before sending to vision |
 

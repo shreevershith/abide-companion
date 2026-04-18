@@ -127,10 +127,17 @@ class AudioProcessor:
         self._remainder = np.array([], dtype=np.float32)
         self.last_speech_end_ts: float | None = None  # monotonic timestamp of last speech_end
         # Running max RMS over the current in-progress speech segment.
-        # Reset on each speech_start; consulted during barge-in decisions
-        # so that quiet TTS echo leaking through the mic never causes a
-        # false interrupt (echo RMS ~0.005, real speech ~0.03+).
+        # Kept for diagnostic logging; the barge-in gate uses the
+        # loud-window counter below instead (see note).
         self._current_max_rms: float = 0.0
+        # Count of VAD windows in the current segment whose RMS clears
+        # MIN_SPEECH_RMS. Used as the barge-in gate so a single loud
+        # spike (keypress, cough) cannot trigger a false interrupt —
+        # matches the semantics of the post-hoc aggregate-RMS filter.
+        # See D25b; previously the gate used peak-RMS, which let
+        # momentary spikes through even when the full segment averaged
+        # below the post-hoc threshold and got discarded anyway.
+        self._loud_window_count: int = 0
 
     @property
     def is_speech(self) -> bool:
@@ -140,9 +147,17 @@ class AudioProcessor:
     def current_max_rms(self) -> float:
         """Max RMS observed in the current speech-in-progress segment.
 
-        Zero when not collecting. Used by the barge-in gate in main.py.
+        Zero when not collecting. Retained for diagnostic logging.
         """
         return self._current_max_rms
+
+    @property
+    def current_loud_window_count(self) -> int:
+        """Number of windows in the current segment whose RMS cleared
+        MIN_SPEECH_RMS. Zero when not collecting. Used by the barge-in
+        gate in main.py to require SUSTAINED above-threshold audio.
+        """
+        return self._loud_window_count
 
     def feed(self, pcm_float32: np.ndarray, source_rate: int) -> bytes | None:
         """Feed raw PCM. Returns WAV bytes when a speech segment ends, else None."""
@@ -176,8 +191,10 @@ class AudioProcessor:
                 if "start" in event:
                     self._collecting = True
                     self._speech_buf = [window]
-                    # Seed the running max RMS with this first window.
-                    self._current_max_rms = _window_rms(window)
+                    # Seed the running stats with this first window.
+                    first_rms = _window_rms(window)
+                    self._current_max_rms = first_rms
+                    self._loud_window_count = 1 if first_rms >= MIN_SPEECH_RMS else 0
                 elif "end" in event:
                     if self._collecting:
                         self._speech_buf.append(window)
@@ -185,6 +202,7 @@ class AudioProcessor:
                         self._speech_buf = []
                         self._collecting = False
                         self._current_max_rms = 0.0
+                        self._loud_window_count = 0
                         self.last_speech_end_ts = time.monotonic()
                         self.vad.reset_states()
 
@@ -210,10 +228,13 @@ class AudioProcessor:
                             result = _pcm_to_wav(audio)
             elif self._collecting:
                 self._speech_buf.append(window)
-                # Update the running max RMS while we're mid-segment.
+                # Update the running max RMS and loud-window counter
+                # while we're mid-segment.
                 w_rms = _window_rms(window)
                 if w_rms > self._current_max_rms:
                     self._current_max_rms = w_rms
+                if w_rms >= MIN_SPEECH_RMS:
+                    self._loud_window_count += 1
 
         self._remainder = pcm_16k[pos:]
         return result
@@ -223,6 +244,7 @@ class AudioProcessor:
         self._speech_buf = []
         self._remainder = np.array([], dtype=np.float32)
         self._current_max_rms = 0.0
+        self._loud_window_count = 0
         self.vad.reset_states()
 
 
