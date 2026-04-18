@@ -202,28 +202,35 @@ main {
     box-shadow: var(--shadow-lg);
     margin-bottom: 12px;
 }
+.hero {
+    /* --voice-level and --glow-breathe are written every animation frame
+       by updateVoiceGlow() in the JS (Phase J). --voice-level: 0 = silence,
+       1 = loud speech. --glow-breathe: slow sine wave (0 → 0.08 over ~4s)
+       so the idle state still breathes subtly. Both drive the ::before
+       opacity/blur in real time, replacing what used to be a fixed CSS
+       keyframe. Declared as sine-wave + amplitude from JS rather than CSS
+       @property-registered custom properties so we don't need the
+       browser to interpolate custom-property keyframes. */
+    --voice-level: 0;
+    --glow-breathe: 0;
+}
 .hero::before {
-    /* animated glow that follows the rectangle shape */
+    /* Audio-reactive amber glow ring (Phase J). The opacity baseline of
+       0.30 means the glow is ALWAYS visible (ambient presence cue) —
+       even before anything has played. During TTS playback, --voice-level
+       climbs toward 1.0 and drives opacity toward 1.0 + a matching blur
+       bloom from 22px to 40px. */
     content: "";
     position: absolute;
     inset: -8px;
     border-radius: calc(var(--radius-lg) + 4px);
     background: linear-gradient(135deg, var(--accent), var(--accent-secondary), var(--accent));
     z-index: 0;
-    filter: blur(22px);
-    opacity: 0.35;
+    opacity: calc(0.30 + var(--voice-level, 0) * 0.70 + var(--glow-breathe, 0));
+    filter: blur(calc(22px + var(--voice-level, 0) * 18px));
     pointer-events: none;
-    transition: opacity 0.4s ease, filter 0.4s ease;
-    animation: glow-pulse 4s ease-in-out infinite;
-}
-.hero.speaking::before { opacity: 0.8; filter: blur(30px); animation: glow-pulse-active 2s ease-in-out infinite; }
-@keyframes glow-pulse {
-    0%, 100% { opacity: 0.3; filter: blur(22px); }
-    50%      { opacity: 0.5; filter: blur(28px); }
-}
-@keyframes glow-pulse-active {
-    0%, 100% { opacity: 0.7; filter: blur(28px); }
-    50%      { opacity: 1; filter: blur(36px); }
+    /* Smooth the per-frame updates so the glow flows rather than steps. */
+    transition: opacity 60ms linear, filter 60ms linear;
 }
 
 #videoPreview {
@@ -823,6 +830,17 @@ let isProcessing = false;
 let playbackEpoch = 0;      // bumped on barge-in so in-flight decodes drop their result
 let currentSource = null;   // active AudioBufferSourceNode
 
+// Audio-reactive hero glow (Phase J). outputAnalyser sits between every
+// TTS AudioBufferSourceNode and audioCtx.destination so we can read the
+// real-time amplitude of Abide's voice. A rAF loop reads the analyser,
+// applies an envelope follower, and writes to --voice-level on .hero.
+// The .hero::before CSS interpolates opacity + blur from that variable
+// so the ambient amber glow pulses in sync with speech instead of on a
+// fixed 2s CSS keyframe.
+let outputAnalyser = null;
+let outputLevelBuf = null;
+let smoothedVoice = 0;
+
 // Tracks whether we've told the server we're currently playing audio.
 // Sent to the server as playback_start / playback_end JSON messages on
 // state transitions. The server uses this to gate barge-in correctly
@@ -1122,7 +1140,17 @@ async function processNextAudio() {
     }
     const source = audioCtx.createBufferSource();
     source.buffer = decoded;
-    source.connect(audioCtx.destination);
+    // Route through the output analyser so the hero glow can sync with
+    // Abide's voice amplitude (Phase J). Falls back to a direct
+    // connection on the unlikely path where the analyser wasn't created
+    // yet (would only happen if processNextAudio ran before the Start
+    // handler finished initialising audioCtx — current code paths can't).
+    if (outputAnalyser) {
+        source.connect(outputAnalyser);
+        outputAnalyser.connect(audioCtx.destination);
+    } else {
+        source.connect(audioCtx.destination);
+    }
     currentSource = source;
     source.onended = () => {
         if (currentSource === source) currentSource = null;
@@ -1439,6 +1467,44 @@ $startBtn.onclick = async () => {
             requestAnimationFrame(updateLevel);
         }
         updateLevel();
+
+        // Output analyser for Phase J — audio-reactive hero glow. Sits in
+        // the TTS playback chain (see processNextAudio) so we can sample
+        // the amplitude of Abide's actual voice. Sampling uses time-domain
+        // data (not FFT bins) — we want loudness, not spectrum.
+        outputAnalyser = audioCtx.createAnalyser();
+        outputAnalyser.fftSize = 256;
+        outputAnalyser.smoothingTimeConstant = 0.5;
+        outputLevelBuf = new Uint8Array(outputAnalyser.fftSize);
+        smoothedVoice = 0;
+        function updateVoiceGlow() {
+            if (!audioCtx) return;
+            outputAnalyser.getByteTimeDomainData(outputLevelBuf);
+            // Mean absolute deviation from the centre (128 = silence in
+            // unsigned 8-bit PCM), normalised to [0, 1]. At typical TTS
+            // volumes this peaks around 0.3-0.5, so we scale up a bit so
+            // the glow visibly reaches "bright" on real speech.
+            let sum = 0;
+            for (let i = 0; i < outputLevelBuf.length; i++) {
+                sum += Math.abs(outputLevelBuf[i] - 128);
+            }
+            const amp = Math.min(1, (sum / outputLevelBuf.length) / 40);
+            // Envelope follower: attack is instant (new loud sample wins),
+            // decay is exponential over ~0.5s at 60fps (0.88^30 ≈ 0.02).
+            // Prevents flicker during between-syllable silences while
+            // still letting the glow dip clearly between phrases.
+            smoothedVoice = Math.max(amp, smoothedVoice * 0.88);
+            // Subtle idle breathing so the ambient glow isn't flat when
+            // Abide is silent. Sine wave oscillates 0 → 0.08 over ~4s.
+            // Adds on top of the amplitude baseline; barely noticeable
+            // during loud speech (amp already dominates), but keeps the
+            // idle state feeling alive.
+            const breathe = (Math.sin(performance.now() / 2000) + 1) * 0.04;
+            $hero.style.setProperty('--voice-level', smoothedVoice.toFixed(3));
+            $hero.style.setProperty('--glow-breathe', breathe.toFixed(3));
+            requestAnimationFrame(updateVoiceGlow);
+        }
+        updateVoiceGlow();
 
         // WebSocket
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
