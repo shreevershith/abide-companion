@@ -76,6 +76,14 @@ It runs on one machine with Docker Desktop. You double-click `start.bat`
   welcome ("Good morning! / Good afternoon! / Good evening! / Hello, I'm
   Abide. How are you tonight?") and injects a one-line context into every
   Claude turn so greetings and check-ins reference the hour naturally.
+- **Cross-session memory (minimal)** — a per-browser `resident_id` UUID
+  keys a small on-disk `UserContext` file. Name, topics discussed,
+  preferences, and current mood survive across Start→Stop cycles, so a
+  returning user hears Abide greet them by name and reference past
+  topics. Conversation turns are **not** persisted (deliberately — keeps
+  Claude's context fresh and latency flat over long deployments). A
+  "What Abide remembers" panel in the gear drawer plus a "Forget me"
+  button (with confirm dialog) give the user visibility + control.
 - **Vision-emitted "noteworthy" flag** — the vision model itself decides
   whether a scene is engagement-worthy (waving, standing up, dancing,
   falling) or background (sitting, talking with natural gestures). No
@@ -213,6 +221,8 @@ abide-companion/
 |                          - Light/dark theme toggle (Abide Robotics brand)
 |-- app/tts_cache_store.py  Persistent phrase-frequency counter that
 |                            auto-populates the TTS prewarm list (Phase I)
+|-- app/memory.py         Per-resident UserContext persistence — cross-session
+|                          name / topics / preferences storage (Phase E, D78)
 |-- Dockerfile            Python 3.12-slim + CPU torch + torchaudio + silero-vad
 |-- docker-compose.yml    Single service, .env mounted as env_file
 |-- start.bat             Windows launcher: docker compose up + open browser
@@ -487,6 +497,15 @@ These are documented in full with alternatives and trade-offs in
   cached welcome, and injects a one-line time-of-day hint into every
   Claude system prompt so greetings and check-ins reference the hour
   naturally. Falls back silently if the offset is absent.
+- **Cross-session memory** (D78, Phase E) — persist `UserContext` only,
+  not conversation turns. A browser-local `resident_id` UUID keys
+  `./memory/<id>.json`. Loaded on connect, saved off-loop after every
+  fact extraction. Strict `^[a-f0-9\-]{10,64}$` validation +
+  `Path.resolve()` escape check prevent path traversal. Conversation
+  history is deliberately ephemeral to keep Claude's input flat over
+  long deployments and avoid stale-reference drift. "Forget me"
+  button wipes the server file, resets in-memory state, and
+  regenerates the local UUID.
 
 ---
 

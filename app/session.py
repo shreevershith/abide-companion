@@ -19,6 +19,7 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketState
 
 from app.conversation import ConversationEngine, MODEL as CLAUDE_MODEL
+from app.memory import save_user_context
 from app.tts import synthesize
 from app.tts_cache_store import record_phrase
 from app.vision import VisionBuffer, analyze_frames
@@ -123,6 +124,71 @@ class UserContext:
             return ""
         return "What I know about you:\n" + "\n".join(lines)
 
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-safe dict for on-disk persistence
+        (Phase E). The format is flat and stable so we can evolve the
+        class without breaking existing memory files."""
+        return {
+            "name": self.name,
+            "mentioned_topics": list(self.mentioned_topics),
+            "preferences": list(self.preferences),
+            "mood_signals": list(self.mood_signals),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "UserContext":
+        """Hydrate from a dict previously produced by ``to_dict``.
+        Defensively coerces types and caps list lengths so a corrupt or
+        maliciously-edited memory file can't blow up the session or
+        balloon into Claude's prompt. Unknown keys are ignored.
+
+        Re-applies the _NAME_BLOCKLIST as defence-in-depth: if a prior
+        run mis-extracted "Abide" as the user's name and persisted it
+        to disk, we drop it on load rather than injecting it back into
+        every Claude turn."""
+        if not isinstance(data, dict):
+            return cls()
+        raw_name = data.get("name")
+        if isinstance(raw_name, str) and raw_name.strip() and raw_name.strip().lower() not in _NAME_BLOCKLIST:
+            name = raw_name.strip()[:80]
+        else:
+            name = None
+
+        def _clean_str_list(raw, cap: int) -> list[str]:
+            if not isinstance(raw, list):
+                return []
+            out = []
+            seen = set()
+            for item in raw:
+                if not isinstance(item, str):
+                    continue
+                s = item.strip()
+                if not s or s in seen:
+                    continue
+                seen.add(s)
+                out.append(s[:120])
+                if len(out) >= cap:
+                    break
+            return out
+
+        return cls(
+            name=name,
+            mentioned_topics=_clean_str_list(data.get("mentioned_topics"), 15),
+            preferences=_clean_str_list(data.get("preferences"), 10),
+            mood_signals=_clean_str_list(data.get("mood_signals"), 5),
+        )
+
+    def snapshot(self) -> dict:
+        """Flat dict for the UI's "What Abide remembers" panel.
+        Fields here are the ones the panel renders — keep it minimal
+        and deterministic so the client doesn't have to interpret."""
+        return {
+            "name": self.name,
+            "topics": list(self.mentioned_topics),
+            "preferences": list(self.preferences),
+            "mood": self.mood_signals[-1] if self.mood_signals else None,
+        }
+
 class Session:
     """Manages response pipeline as a concurrent task for barge-in support."""
 
@@ -148,8 +214,19 @@ class Session:
         self._client_playing: bool = False
         self._client_playing_since: float | None = None
 
-        # User context — accumulates facts about the user across the session
+        # User context — accumulates facts about the user across the session.
+        # On connect, main.py hydrates this from ./memory/<resident_id>.json
+        # if a file exists (Phase E cross-session memory), so returning
+        # users have their name / topics / preferences / mood-signals
+        # restored. First-time visitors start with an empty UserContext.
         self.user_context: UserContext = UserContext()
+
+        # Browser-generated per-device identifier for the memory file.
+        # Set by main.py's config handler after validation against
+        # app.memory._ID_RE. None until config arrives, and wiped on
+        # Forget-me so subsequent fact-extraction saves don't resurrect
+        # the deleted record.
+        self.resident_id: str | None = None
 
         # Browser-reported timezone offset in minutes (JS
         # `getTimezoneOffset()`: UTC = local + offset, so offset=360 means
@@ -616,13 +693,43 @@ class Session:
         except Exception as e:
             log.error("Queued vision-react failed: %s", e)
 
-    async def _extract_user_facts(self, engine: ConversationEngine):
-        """Fire-and-forget task: extract user facts from the last exchange."""
+    async def _extract_user_facts(self, engine: ConversationEngine, ws=None):
+        """Fire-and-forget task: extract user facts from the last exchange.
+
+        On successful extraction, also (a) persists the updated
+        UserContext to disk off-loop via the executor (Phase E), and
+        (b) pushes a ``remember_snapshot`` WS message so the UI's
+        "What Abide remembers" panel live-updates.
+        """
         try:
             facts = await engine.extract_user_facts()
-            if facts:
-                self.user_context.update(facts)
-                log.info("[CONTEXT] User context updated: %s", self.user_context.as_prompt()[:120])
+            if not facts:
+                return
+            self.user_context.update(facts)
+            log.info("[CONTEXT] User context updated: %s", self.user_context.as_prompt()[:120])
+            # Persist to ./memory/<resident_id>.json in the executor so
+            # we don't block the event loop. Idempotent (full snapshot
+            # every call); last-writer-wins on concurrent updates is
+            # fine given the monotonic accumulation semantics.
+            if self.resident_id:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.run_in_executor(
+                        None,
+                        save_user_context,
+                        self.resident_id,
+                        self.user_context.to_dict(),
+                    )
+                except RuntimeError:
+                    # No running loop (shouldn't happen on this path) —
+                    # fall back to sync write so we don't drop data.
+                    save_user_context(self.resident_id, self.user_context.to_dict())
+            # Push the updated snapshot to the UI memory panel.
+            if ws is not None:
+                await self._safe_send_json(
+                    ws,
+                    {"type": "remember_snapshot", "context": self.user_context.snapshot()},
+                )
         except Exception as e:
             log.debug("User fact extraction skipped: %s", e)
 
@@ -889,10 +996,12 @@ class Session:
             if not self._cancelled:
                 await self._safe_send_json(ws, {"type": "status", "state": "listening"})
 
-            # Fire-and-forget: extract user facts from the last exchange
-            # and update the persistent UserContext. Non-blocking — the
-            # voice loop is already back to "listening" above.
-            asyncio.create_task(self._extract_user_facts(engine))
+            # Fire-and-forget: extract user facts from the last exchange,
+            # update the persistent UserContext, persist to disk if a
+            # resident_id is known, and push the snapshot to the UI
+            # memory panel. Non-blocking — the voice loop is already
+            # back to "listening" above.
+            asyncio.create_task(self._extract_user_facts(engine, ws))
 
             # Consume any queued vision-reactive activity that was detected
             # while Abide was busy talking. Fire as a separate task with a

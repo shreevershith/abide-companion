@@ -129,6 +129,7 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 16. ✅ Diary export button (D64)
 17. ✅ Auto-populated TTS cache — runtime-learned phrase frequencies replace the hand-curated seed list (Phase I)
 18. ✅ Time-of-day awareness — browser-reported timezone drives 4-variant welcome + system-prompt injection in every Claude turn (D75, easter egg)
+19. ✅ Cross-session UserContext persistence — per-device `resident_id` UUID keys `./memory/<id>.json`; name/topics/preferences/mood hydrated on connect, saved after each fact-extraction. Conversation history stays ephemeral. "Forget me" button in the gear drawer wipes (Phase E, D78)
 
 ## Never Do
 - Use React, Vue, or any frontend framework
@@ -175,6 +176,7 @@ abide-companion/
 │   ├── conversation.py  # Claude API streaming (direct httpx, no SDK)
 │   ├── tts.py           # OpenAI TTS streaming (opus, parallel)
 │   ├── tts_cache_store.py # Runtime-learned phrase frequency store (auto-prewarm list)
+│   ├── memory.py        # Cross-session UserContext persistence (Phase E)
 │   └── telemetry.py     # Langfuse tracing (graceful no-op if missing)
 ├── frontend/
 │   └── index.html       # Single-file UI
@@ -204,7 +206,7 @@ python-dotenv>=1.0
 - Vision bbox coordinates approximate, not surgical
 - Fall detection is best-effort, no emergency dispatch
 - Conversation history caps at 20 messages
-- No persistent session storage across sessions (in-memory only)
+- Cross-session persistence is limited to `UserContext` facts (Phase E). Conversation turn history is deliberately ephemeral per-session; Claude starts with a clean slate each reconnect. Calendar/schedule integration (per Abide Robotics demo) is out of scope.
 - English-only (language="en" passed to Whisper)
 - Direct httpx everywhere due to Windows SDK issues
 - Logitech MeetUp pan/tilt integration not built (hardware-specific, out of scope)
@@ -220,6 +222,7 @@ python-dotenv>=1.0
 - No audio stored anywhere
 - Video frames analyzed and immediately discarded
 - Conversation history in-memory only, cleared on session end
+- `UserContext` (name, topics, preferences, mood signals) persists on-device across sessions at `./memory/<resident_id>.json`, keyed by a browser-generated UUID. Plaintext, gitignored, local only — no cloud sync. User wipes via "Forget me" button in the gear drawer (Phase E)
 - Privacy notice displayed in UI
 
 ## Living Documents

@@ -65,3 +65,8 @@ node_modules/
 
 # ── Runtime-learned TTS cache frequencies (auto-populated) ──
 tts_cache/
+
+# ── Per-resident UserContext memory files (Phase E) ──
+# Keyed by browser-generated resident_id UUIDs; contain name, topics,
+# preferences, mood signals only. No conversation transcripts or audio.
+memory/

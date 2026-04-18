@@ -525,6 +525,46 @@ main {
 }
 .key-field .saved.show { opacity: 1; }
 
+/* ── "What Abide remembers" panel (Phase E) ── */
+.memory-section {
+    margin-top: 18px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+}
+.memory-section h3 { margin-bottom: 8px; }
+.memory-row {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin-bottom: 4px;
+    word-break: break-word;
+}
+.memory-row strong {
+    color: var(--text);
+    font-weight: 500;
+}
+.memory-empty {
+    font-size: 12px;
+    color: var(--text-dim);
+    font-style: italic;
+    line-height: 1.5;
+}
+.forget-me-btn {
+    margin-top: 10px;
+    padding: 7px 12px;
+    font-size: 12px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease;
+}
+.forget-me-btn:hover {
+    border-color: rgba(255, 100, 120, 0.5);
+    color: rgba(255, 100, 120, 0.9);
+}
+
 /* ── Responsive tweaks ── */
 @media (max-width: 680px) {
     .topbar { padding: 14px 18px; }
@@ -749,6 +789,19 @@ button:focus-visible, input:focus-visible, .gear:focus-visible {
             <label>OpenAI <span class="saved" id="openaiSaved">Saved</span></label>
             <input type="password" id="openaiKey" placeholder="sk-...">
         </div>
+
+        <!-- "What Abide remembers" panel (Phase E cross-session memory) -->
+        <div class="memory-section">
+            <h3>What Abide remembers</h3>
+            <div id="memoryContent">
+                <div class="memory-empty" id="memoryEmpty">Nothing yet — say hi and Abide will start to learn about you.</div>
+                <div class="memory-row" id="memoryName" style="display:none"><strong>Name:</strong> <span></span></div>
+                <div class="memory-row" id="memoryTopics" style="display:none"><strong>We've talked about:</strong> <span></span></div>
+                <div class="memory-row" id="memoryPrefs" style="display:none"><strong>You like:</strong> <span></span></div>
+                <div class="memory-row" id="memoryMood" style="display:none"><strong>Mood:</strong> <span></span></div>
+            </div>
+            <button type="button" class="forget-me-btn" id="forgetMeBtn">Forget me</button>
+        </div>
     </div>
 </div>
 
@@ -902,6 +955,73 @@ $themeToggle.addEventListener("click", () => {
 $groqKey.value = localStorage.getItem("groq_api_key") || "";
 $anthropicKey.value = localStorage.getItem("anthropic_api_key") || "";
 $openaiKey.value = localStorage.getItem("openai_api_key") || "";
+
+// ── Resident ID (Phase E: cross-session memory) ──
+// Generated once per browser profile and sent in the config WS message.
+// The server uses it to load/save ./memory/<resident_id>.json so Abide
+// remembers the user's name / topics / preferences across Start → Stop
+// cycles. "Forget me" wipes the server file + the localStorage entry +
+// regenerates a fresh UUID for the next session.
+const RESIDENT_ID_KEY = "abide_resident_id";
+function getResidentId() {
+    let id = localStorage.getItem(RESIDENT_ID_KEY);
+    if (!id) {
+        // crypto.randomUUID() is available in all modern browsers.
+        // Fallback for ancient ones — not strictly necessary but keeps
+        // the feature resilient.
+        id = (crypto && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : "r-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+        localStorage.setItem(RESIDENT_ID_KEY, id);
+    }
+    return id;
+}
+let residentId = getResidentId();
+
+// Memory panel DOM refs + render helper. Called on `remember_snapshot`
+// WS messages (both on connect after server-side hydrate, and after
+// every fact-extraction update).
+const $memoryEmpty = document.getElementById("memoryEmpty");
+const $memoryName = document.getElementById("memoryName");
+const $memoryTopics = document.getElementById("memoryTopics");
+const $memoryPrefs = document.getElementById("memoryPrefs");
+const $memoryMood = document.getElementById("memoryMood");
+const $forgetMeBtn = document.getElementById("forgetMeBtn");
+
+function renderMemorySnapshot(ctx) {
+    const showIf = (el, val) => {
+        if (val) {
+            el.querySelector("span").textContent = val;
+            el.style.display = "";
+        } else {
+            el.style.display = "none";
+        }
+    };
+    const any = !!(ctx && (ctx.name || (ctx.topics && ctx.topics.length) ||
+                           (ctx.preferences && ctx.preferences.length) || ctx.mood));
+    showIf($memoryName, ctx && ctx.name);
+    showIf($memoryTopics, ctx && ctx.topics && ctx.topics.length ? ctx.topics.join(", ") : "");
+    showIf($memoryPrefs, ctx && ctx.preferences && ctx.preferences.length ? ctx.preferences.join(", ") : "");
+    showIf($memoryMood, ctx && ctx.mood);
+    $memoryEmpty.style.display = any ? "none" : "";
+}
+
+// Forget-me flow: confirm, send WS message, on ack regenerate UUID and
+// reset the panel to empty state.
+$forgetMeBtn.addEventListener("click", () => {
+    if (!confirm("Wipe everything Abide remembers about you on this device? This can't be undone.")) {
+        return;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "forget_me" }));
+    } else {
+        // Not connected — just wipe the local state. The server has
+        // nothing to delete anyway.
+        localStorage.removeItem(RESIDENT_ID_KEY);
+        residentId = getResidentId();
+        renderMemorySnapshot(null);
+    }
+});
 
 function bindKeyInput(input, storageKey, indicator) {
     input.addEventListener("input", () => {
@@ -1523,6 +1643,12 @@ $startBtn.onclick = async () => {
                 // afternoon / evening / night) and reference time-of-day
                 // naturally in greetings and check-ins.
                 timezone_offset_minutes: new Date().getTimezoneOffset(),
+                // Per-device UUID for cross-session memory (Phase E).
+                // Server loads ./memory/<resident_id>.json so Abide
+                // remembers the user's name/topics/preferences across
+                // Start→Stop cycles. A browser-local ID; never sent
+                // over the network to anyone but this server.
+                resident_id: residentId,
             }));
 
             $stopBtn.disabled = false;
@@ -1582,6 +1708,18 @@ $startBtn.onclick = async () => {
                 addDiaryEntry(msg.level === "fall" ? "fall" : "alert", msg.text);
             } else if (msg.type === "error") {
                 $error.textContent = msg.message;
+            } else if (msg.type === "remember_snapshot") {
+                // Server pushed a fresh view of what Abide knows about
+                // the user. Sent on connect after hydrate, and again
+                // after every fact-extraction update.
+                renderMemorySnapshot(msg.context || null);
+            } else if (msg.type === "forget_me_ok") {
+                // Server confirmed the memory file was deleted. Wipe
+                // the local resident_id + regenerate a fresh one, and
+                // reset the panel to the empty state.
+                localStorage.removeItem(RESIDENT_ID_KEY);
+                residentId = getResidentId();
+                renderMemorySnapshot(null);
             }
         };
 

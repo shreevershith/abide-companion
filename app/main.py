@@ -38,7 +38,13 @@ else:
 
 from app.audio import AudioProcessor, transcribe
 from app.conversation import ConversationEngine
-from app.session import Session
+from app.memory import (
+    _ID_RE as _MEMORY_ID_RE,
+    delete_user_context,
+    load_user_context,
+    save_user_context,
+)
+from app.session import Session, UserContext
 from app.tts import prewarm as tts_prewarm, prewarm_cache as tts_prewarm_cache
 from app.tts_cache_store import learned_phrases, stats as tts_store_stats
 from app.vision import prewarm as vision_prewarm
@@ -459,6 +465,31 @@ async def websocket_endpoint(ws: WebSocket):
                     except (TypeError, ValueError):
                         pass
 
+                    # Cross-session memory (Phase E): if the browser sent a
+                    # resident_id that passes the strict format check, hydrate
+                    # UserContext from disk. The path-traversal guard lives in
+                    # app.memory._safe_path; we re-check the format here so we
+                    # don't log-spam on a garbage id and so session.resident_id
+                    # only gets set when the id is usable for later saves.
+                    rid = data.get("resident_id")
+                    if isinstance(rid, str) and _MEMORY_ID_RE.match(rid):
+                        session.resident_id = rid
+                        persisted = await asyncio.to_thread(load_user_context, rid)
+                        if persisted:
+                            session.user_context = UserContext.from_dict(persisted)
+                            log.info(
+                                "[MEMORY] Hydrated UserContext for %s: %s",
+                                rid,
+                                session.user_context.as_prompt()[:120],
+                            )
+                    # Push the current snapshot (hydrated or empty) so the
+                    # UI "What Abide remembers" panel renders immediately on
+                    # connect instead of waiting for the first fact update.
+                    await Session._safe_send_json(
+                        ws,
+                        {"type": "remember_snapshot", "context": session.user_context.snapshot()},
+                    )
+
                     if anthropic_key:
                         engine = ConversationEngine(api_key=anthropic_key)
 
@@ -593,6 +624,26 @@ async def websocket_endpoint(ws: WebSocket):
                     # Browser has drained its audio queue OR has stopped
                     # playback in response to a barge-in. Idempotent.
                     session.client_playing = False
+
+                elif msg_type == "forget_me":
+                    # Cross-session memory wipe (Phase E). Delete the
+                    # on-disk memory file, reset the in-memory UserContext,
+                    # and clear resident_id so subsequent fact extractions
+                    # don't resurrect the record. Client is responsible
+                    # for regenerating a fresh UUID after acknowledgement.
+                    rid = session.resident_id
+                    if rid:
+                        deleted = await asyncio.to_thread(delete_user_context, rid)
+                        log.info("[MEMORY] Forget-me: resident_id=%s deleted=%s", rid, deleted)
+                    session.user_context = UserContext()
+                    session.resident_id = None
+                    await Session._safe_send_json(ws, {"type": "forget_me_ok"})
+                    # Push the now-empty snapshot so the UI panel reverts
+                    # to the empty state without needing a round-trip.
+                    await Session._safe_send_json(
+                        ws,
+                        {"type": "remember_snapshot", "context": session.user_context.snapshot()},
+                    )
 
             # Binary frames = raw PCM float32 audio
             elif "bytes" in message:
@@ -809,6 +860,17 @@ async def websocket_endpoint(ws: WebSocket):
         # Cancel proactive check-in loop
         if checkin_task is not None and not checkin_task.done():
             checkin_task.cancel()
+
+        # Belt-and-suspenders final save of UserContext (Phase E). The
+        # in-session save hook in Session._extract_user_facts writes after
+        # each fact update, but if the client disconnected mid-extraction
+        # the latest update might not have landed yet. Runs synchronously
+        # on the way out since there's no event loop left to off-load to.
+        if session.resident_id and session.user_context:
+            try:
+                save_user_context(session.resident_id, session.user_context.to_dict())
+            except Exception as e:
+                log.debug("[MEMORY] Final flush failed: %s", type(e).__name__)
 
         if engine is not None:
             try:
