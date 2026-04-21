@@ -1,6 +1,91 @@
 # Troubleshooting Log
 
-A running record of bugs, root causes, and fixes encountered while building Abide Companion. Newest entries at the top.
+A running record of bugs encountered while building Abide Companion — **when** we hit them, **why** they happened, and **how** we fixed them. Newest entries at the top. Entries 1–10 are pre-launch phase bugs; 11 onwards are post-launch / live-testing discoveries.
+
+---
+
+## 21. Prompt cache was structurally correct but never activating (Phase R)
+
+**When**: After Phase O shipped, every Claude response log line carried `cache_read=0 cache_create=0` despite sending the `anthropic-beta: prompt-caching-2024-07-31` header and marking `SYSTEM_PROMPT` with `cache_control: ephemeral`. Over a 26-turn live session: not a single cache hit.
+
+**Why**: Two interacting causes.
+1. Our `system` field was an array of two blocks: a static `SYSTEM_PROMPT` block with `cache_control` (~484 tokens), and a dynamic block holding the per-turn context (time of day, user facts, vision observations). Anthropic's minimum cacheable prefix on Sonnet is 1024 tokens; `SYSTEM_PROMPT` alone is below threshold so the cache never wrote.
+2. Even if we had added a second cache breakpoint deeper into the prefix (on the conversation history, say), it would still never hit — the dynamic system block changed every turn, invalidating every prefix position that came *after* it. Anything past the dynamic block had a fresh key on every turn.
+
+**How we fixed it**: Moved dynamic context out of the `system` array entirely and into the head of the newest user message, wrapped in `<turn_context>…</turn_context>` delimiters so Claude can tell ambient context from user speech. The `system` array is now one static block. Added a second cache breakpoint on `messages[-2]` (the previous completed turn's assistant reply) by converting its string content to a one-element content-block list with `cache_control: ephemeral`. The cached prefix is now `[SYSTEM_PROMPT + all turns up through the previous assistant reply]` — stable turn-over-turn. Once that crosses 1024 tokens (turn ~3–5), every subsequent turn reads the bulk of the prefix from cache. Verifiable via `cache_read_tokens > 0` in the `[TIMING] Claude response complete` log.
+
+**Files touched**: `app/conversation.py`. Documented inline; cross-referenced in [DESIGN-NOTES.md](DESIGN-NOTES.md) *Latency engineering* section.
+
+---
+
+## 20. duvc-ctl 2.x API differed from what our wrapper expected (Phase R)
+
+**When**: After fixing the wrong-Python-interpreter issue (entry #19) and getting `duvc-ctl` actually imported, sessions still logged "PTZ unavailable" with no diagnostic lines. The wrapper was silently concluding every DirectShow camera was PTZ-less.
+
+**Why**: `app/ptz.py` had been written speculatively before PyPI was checked. It called:
+- `device.get_camera_property_range(prop)` — a method on the device object
+- `CamProp.PAN`, `CamProp.TILT`, `CamProp.ZOOM` — uppercase enum members
+
+duvc-ctl 2.x actually exposes:
+- `duvc.get_camera_property_range(device, prop) -> (ok: bool, PropRange)` — a module-level function returning a tuple
+- `CamProp.Pan`, `CamProp.Tilt`, `CamProp.Zoom` — PascalCase members
+
+Every probe call raised `AttributeError` which the wrapper's `try/except` swallowed and returned `None`. Every device looked PTZ-less. No logs because every failure was caught silently.
+
+**How we fixed it**: Rewrote `app/ptz.py` against the real 2.x surface — module-level probe functions, tuple unpacking, `PropSetting(value, mode)` for writes via `set_camera_property(device, prop, setting)`. Added verbose per-axis diagnostic logs at init: `[PTZ] duvc-ctl version: 2.0.0`, `[PTZ] list_devices returned 2 entries`, per-device probe results `pan=- tilt=- zoom=[100,500 step=1]`. Verified end-to-end by zooming the real MeetUp lens 100→200→300→200→100 from a standalone Python script before restarting the app.
+
+**Files touched**: `app/ptz.py` (full rewrite). Pin in `requirements.txt` bumped from `>=0.1,<1.0` (non-existent on PyPI — see entry below) to `>=1.0,<3.0`.
+
+---
+
+## 19. Wrong Python interpreter silently disabled PTZ (Phase R)
+
+**When**: During live testing the user ran `python -m uvicorn app.main:app --reload` from PowerShell instead of double-clicking `start.bat`. Zoom commands were recognised by Claude (the inline marker fired) but nothing physically moved the camera. The only evidence anything was wrong was one log line near the top of each session: `[PTZ] duvc-ctl unavailable at import (ModuleNotFoundError: No module named 'duvc_ctl') — PTZ disabled`.
+
+**Why**: `duvc-ctl` is installed in the project's `.venv`, not in system Python. Launching with the system `python` executable bypassed the venv, so the `import duvc_ctl` at module load raised `ModuleNotFoundError`, the try/except set `_DUVC_AVAILABLE = False`, and `_init()`'s early return did nothing visible — there was no log on the bailout path originally.
+
+**How we fixed it**: Two layers.
+1. Added `log.info("[PTZ] duvc-ctl unavailable at import (%s) — PTZ disabled", _DUVC_IMPORT_ERROR)` on the `_DUVC_AVAILABLE=False` branch of `_init()` so the silent-disable is now loud. Also stashed the full import error string at module load time so it surfaces on the first session regardless of when uvicorn's logger attaches.
+2. Documentation: made the manual-launch command explicit in README (`python -m venv .venv && .venv\Scripts\python -m uvicorn app.main:app --reload`) and left `start.bat` as the single recommended path for non-developer runs.
+
+**Files touched**: `app/ptz.py`, `README.md`.
+
+---
+
+## 18. MeetUp firmware does not expose pan/tilt over UVC (Phase R, correcting earlier belief)
+
+**When**: After wiring `PTZController.nudge_to_bbox` into the vision loop under the assumption that the Phase N duvc-ctl path would deliver subject-follow on MeetUp. Live testing showed the camera was tilting — but only sometimes, and only when RightSight was enabled in Logi Tune. No `[PTZ] nudge:` log lines ever fired. The tilt we were seeing wasn't ours.
+
+**Why**: We probed MeetUp firmware 1.0.272 directly via duvc-ctl 2.x:
+```
+Pan  → get_camera_property_range() = (ok=False, min=-488735792 max=630 step=-487872656 default=?)
+Tilt → get_camera_property_range() = (ok=False, min=-488735792 max=630 step=-487872656 default=?)
+Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=100)
+```
+`ok=False` with garbage values means the axis is not exposed over UVC. Firmware 1.0.244 probed the same way. Logitech routes MeetUp pan/tilt through their proprietary Sync/Tune SDK, not UVC — confirmed independently by running Google's MediaCapture-PTZ reference demo, which also shows zoom-only for MeetUp (this earlier result is what became D79). The apparent motion testers had observed was Logitech RightSight digital re-framing — an on-device AI crop inside the 120° fixed lens, not mechanical pan/tilt.
+
+**How we fixed it**: Pivoted from continuous subject-follow to **on-request optical zoom** (Phase R, D84). When the user says "zoom in / out / reset", Claude emits a `[[CAM:zoom_in]]` marker at the start of its reply; `app/conversation.py` strips the marker from the stream before the transcript sees it and records the action on `last_camera_action`; `app/session.py`'s producer dispatches `PTZController.zoom(direction)` off-loop so the lens motion overlaps with Claude's verbal acknowledgement. Zoom goes 100 → 200 → 300 per "in", each step a quarter of the range. System prompt explicitly tells Claude to decline pan/tilt requests honestly so the user gets "I can zoom but not pan/tilt" rather than another hallucinated "Zooming in now" with nothing happening. `nudge_to_bbox` is preserved in the wrapper for genuinely PTZ-capable cameras (Rally Bar Mini etc.) where `pan_range` and `tilt_range` come back populated — untested on that hardware but structurally ready.
+
+**Files touched**: `app/ptz.py` (added `zoom(direction)` method, relaxed `_init` to accept any single PTZ axis, per-axis probe logs), `app/conversation.py` (camera-action marker regex + stream-head buffering + `last_camera_action` side-channel + `CAMERA CONTROL` section in `SYSTEM_PROMPT`), `app/session.py` (`_dispatch_camera_action` method, producer-side dispatch once per turn). Documented in [DESIGN-NOTES.md](DESIGN-NOTES.md) *The PTZ saga, honestly* section and D84.
+
+---
+
+## 17. Dropped Docker in favour of native Python to reach Windows DirectShow (Phase N)
+
+**When**: Phase N, after the browser-MediaCapture-PTZ investigation (D79) established we couldn't reach MeetUp's camera controls through the browser. DirectShow was the next-best path — and the same path Zoom and Teams use. We needed a Python process to speak to DirectShow directly, and our Docker-based deployment couldn't.
+
+**Why**: Docker Desktop on Windows runs containers inside a WSL2 Linux VM that doesn't see host DirectShow devices. Reaching them would require either (a) `usbipd-win` USB/IP passthrough — admin PowerShell, per-reboot USB re-attach, 5 terminal commands the end user would have to run — or (b) a separate Windows-host PTZ agent that the Docker backend calls over localhost HTTP, i.e. an entire second deployment unit. Both violated the brief's double-click first-run rule.
+
+**How we fixed it**: Deleted `Dockerfile` and `docker-compose.yml`. Rewrote `start.bat` / `start.sh` to (1) verify Python 3.12+ on PATH, (2) create a local `.venv`, (3) `pip install -r requirements.txt`, (4) launch uvicorn, (5) open the browser. Single double-click, same UX as the Docker launcher. First run takes 3–5 minutes for pip install (torch + silero-vad are heavy); subsequent runs start in seconds.
+
+**Correction (2026-04-20)**: At the time we wrote Phase N's rationale we expected DirectShow access to unlock *motorised subject-follow* on the MeetUp. It didn't — see entry #18. What we actually ship on MeetUp is optical zoom on spoken request (Phase R, D84). The native-Python deployment rationale still stands (DirectShow is now reachable, deployment is still single-click, zoom works), but "PTZ subject-follow" was aspirational and never shipped on this hardware.
+
+**Trade-offs accepted**:
+- Python install reliability on Windows varies (PATH issues, multiple Python versions). Mitigated by a clear error message + python.org link at the top of `start.bat` when `python` isn't found.
+- Docker gave reproducible builds; native Python relies on the user's pip resolver. Mitigated by upper-bound pinning in `requirements.txt` (from D76 audit cleanup).
+- Mac/Linux users miss zoom (DirectShow is Windows-only). The `duvc-ctl` dep is marker-skipped via `; sys_platform == "win32"` so install doesn't fail. `PTZController.available` returns False on non-Windows; every other feature works identically.
+
+**Files touched**: deleted `Dockerfile`, `docker-compose.yml`. Rewrote `start.bat`, `start.sh`. Added `duvc-ctl>=1.0,<3.0 ; sys_platform == "win32"` to `requirements.txt` (the original pin was `>=0.1,<1.0`, which didn't exist on PyPI — see #20). New module `app/ptz.py`. `Session.__init__` instantiates `PTZController`, `_run_vision` calls `nudge_to_bbox` via `asyncio.to_thread` (no-op on MeetUp, effective on PTZ-capable cameras), `main.py` disconnect handler calls `session._ptz.center()`. Docs: CLAUDE.md, README.md, DESIGN-NOTES.md (D82 + 2026-04-20 follow-up note), README-SETUP.txt all rewritten for the native-Python model.
 
 ---
 

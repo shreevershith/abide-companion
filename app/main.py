@@ -89,10 +89,10 @@ async def _on_startup() -> None:
     if lf is not None:
         # Fire-and-forget credential check. verify_langfuse_async logs
         # the final status; we just need to kick it off without awaiting.
+        # The done-callback surfaces any unhandled exception — previously
+        # this was a no-op lambda that silently discarded failures.
         t = asyncio.create_task(telemetry.verify_langfuse_async(timeout=3.0))
-        t.add_done_callback(
-            lambda task: task.exception() if not task.cancelled() else None
-        )
+        t.add_done_callback(_log_prewarm_exception("Langfuse verify"))
 
 
 @app.on_event("shutdown")
@@ -195,17 +195,31 @@ async def analyze_session(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Analysis failed"}, status_code=500)
 
 
-# Echo suppression tunables
+# Echo suppression tunables.
+#
+# Phase L: these values are tuned for the Logitech MeetUp (and any
+# conference device with hardware Acoustic Echo Cancellation). MeetUp
+# does AEC in firmware — the mic signal it sends to the PC is already
+# stripped of whatever the MeetUp's speaker is playing, so residual
+# echo on a barge-in candidate is near-zero and we can gate
+# aggressively without phantom interrupts.
+#
+# On a LAPTOP (built-in mic + speakers, no hardware AEC) these values
+# will likely cause false barge-ins from TTS bleeding through the
+# microphone. Revert to the pre-Phase-L defaults if deploying there:
+#     SUSTAINED_SPEECH_MS = 400
+#     BARGE_IN_MIN_LOUD_WINDOWS = 6
+# See DESIGN-NOTES.md D80 for the full trade-off history.
 POST_TTS_COOLDOWN_MS = 300   # ignore VAD this long after last TTS chunk sent
-SUSTAINED_SPEECH_MS = 400    # require this much continuous speech before firing barge-in
+SUSTAINED_SPEECH_MS = 150    # MeetUp-tuned; was 400 pre-Phase-L
 # Require SUSTAINED above-threshold audio, not just a peak. Each VAD
-# window is ~32ms at 16kHz (VAD_CHUNK=512). 6 windows ≈ 192ms of
+# window is ~32ms at 16kHz (VAD_CHUNK=512). 4 windows ≈ 128ms of
 # cumulative audio whose per-window RMS cleared MIN_SPEECH_RMS (0.015).
-# This matches the post-hoc aggregate-RMS filter in audio.py: a single
-# loud keypress/cough/click no longer qualifies, only real speech does.
-# Previously the gate used peak-RMS, which let spikes through even when
-# the full segment averaged below threshold and got discarded anyway.
-BARGE_IN_MIN_LOUD_WINDOWS = 6
+# Pre-Phase-L this was 6 (≈192ms); MeetUp's hardware AEC lets us drop
+# it to 4 because there's essentially no TTS-echo leakage for the
+# counter to trip on. A single loud keypress/cough/click still fails
+# to reach 4 loud windows, so false-positive protection is intact.
+BARGE_IN_MIN_LOUD_WINDOWS = 4  # MeetUp-tuned; was 6 pre-Phase-L
 
 # Defensive limits on client-supplied payloads
 MAX_FRAME_B64_CHARS = 500_000  # ~350 KB decoded — well above our 512x384 JPEGs (~15-40 KB)
@@ -286,9 +300,21 @@ def _select_welcome_greeting(session: "Session") -> str:
     local hour. Falls back to the generic greeting when the timezone hasn't
     been reported yet (shouldn't happen in practice — the config message
     arrives before the 1.2s welcome delay — but defensive).
-    All returned strings are in TTS_CACHE_SEED_PHRASES so they'll hit the
-    cache instead of paying the ~1000ms OpenAI TTS roundtrip."""
+
+    Phase K: if the hydrated UserContext has a name (returning resident),
+    splice it in. The exact string is not in the seed list — it gets
+    prewarmed asynchronously in the config handler so it's cached by the
+    time the welcome delay elapses. On cache miss, synthesize() falls
+    back to an API call (~1 s) — still correct, just not instant."""
     bucket = session.time_of_day_bucket()
+    name = (session.user_context.name or "").strip()
+    if name:
+        return {
+            "morning":   f"Good morning, {name}! I'm Abide. How are you today?",
+            "afternoon": f"Good afternoon, {name}! I'm Abide. How are you today?",
+            "evening":   f"Good evening, {name}! I'm Abide. How are you today?",
+            "night":     f"Hello, {name}. I'm Abide. How are you tonight?",
+        }.get(bucket, f"Hello, {name}. I'm Abide. How are you today?")
     return {
         "morning": "Good morning! I'm Abide. How are you today?",
         "afternoon": "Good afternoon! I'm Abide. How are you today?",
@@ -301,12 +327,66 @@ def _select_welcome_greeting(session: "Session") -> str:
 # OpenAI TTS requests. 30 is generous and well under `_TTS_CACHE_MAX_ENTRIES`.
 _PREWARM_TOTAL_CAP = 30
 
+# All time-of-day welcome variants (including the generic fallback).
+# _relevant_welcome_phrases() picks the subset that matches the server's
+# current clock-hour bucket; the others are filtered out of the prewarm
+# list so we don't pay ~4 × 2 s of OpenAI TTS per startup warming greetings
+# the session will never play. Generic "today" fallback stays in every
+# bucket as insurance for the window where the browser tz hasn't arrived.
+_ALL_WELCOME_PHRASES = frozenset({
+    "Good morning! I'm Abide. How are you today?",
+    "Good afternoon! I'm Abide. How are you today?",
+    "Good evening! I'm Abide. How are you today?",
+    "Hello, I'm Abide. How are you tonight?",
+    "Hello, I'm Abide. How are you today?",
+})
+_GENERIC_WELCOME = "Hello, I'm Abide. How are you today?"
+
+
+def _server_hour_bucket() -> str:
+    """Server-local time-of-day bucket, using same thresholds as
+    Session.time_of_day_bucket(). Used at prewarm time when the browser's
+    tz offset hasn't arrived yet; server clock is a close enough proxy
+    for local-only deployments."""
+    from datetime import datetime
+    h = datetime.now().hour
+    if 5 <= h < 12:
+        return "morning"
+    if 12 <= h < 17:
+        return "afternoon"
+    if 17 <= h < 21:
+        return "evening"
+    return "night"
+
+
+def _relevant_welcome_phrases() -> set[str]:
+    bucket = _server_hour_bucket()
+    matching = {
+        "morning": "Good morning! I'm Abide. How are you today?",
+        "afternoon": "Good afternoon! I'm Abide. How are you today?",
+        "evening": "Good evening! I'm Abide. How are you today?",
+        "night": "Hello, I'm Abide. How are you tonight?",
+    }[bucket]
+    return {matching, _GENERIC_WELCOME}
+
 
 def _prewarm_phrase_list() -> list[str]:
     """Baseline seed + phrases learned from prior sessions, deduped and
-    bounded. Dedup preserves first-seen order so the seed wins ties."""
-    learned = learned_phrases(limit=_PREWARM_TOTAL_CAP)
-    merged = list(dict.fromkeys(TTS_CACHE_SEED_PHRASES + learned))
+    bounded. Dedup preserves first-seen order so the seed wins ties.
+
+    Drops time-of-day welcome variants that don't match the server's
+    current hour — saves ~3 × ~2 s of OpenAI TTS on startup since
+    previously all four buckets were prewarmed unconditionally. The
+    matching variant + generic fallback are always kept. Learned phrases
+    get the same filter so variants that accumulated in `phrase_counts.json`
+    from prior sessions at other times of day don't sneak back in."""
+    relevant = _relevant_welcome_phrases()
+    to_drop = _ALL_WELCOME_PHRASES - relevant
+    # Pull extra learned phrases so after filtering we still have enough.
+    learned = learned_phrases(limit=_PREWARM_TOTAL_CAP * 2)
+    seed_filtered = [p for p in TTS_CACHE_SEED_PHRASES if p not in to_drop]
+    learned_filtered = [p for p in learned if p not in to_drop]
+    merged = list(dict.fromkeys(seed_filtered + learned_filtered))
     return merged[:_PREWARM_TOTAL_CAP]
 
 
@@ -532,6 +612,30 @@ async def websocket_endpoint(ws: WebSocket):
                             tts_prewarm_cache(prewarm_list, openai_key)
                         )
                         t_cache.add_done_callback(_log_prewarm_exception("TTS cache"))
+
+                        # Personalized welcome: if UserContext hydrated a
+                        # name AND we know the time-of-day bucket, prewarm
+                        # the one matching name-aware greeting variant so
+                        # the welcome handler (1.2 s later) finds it in
+                        # the cache and serves at 0 ms. The string itself
+                        # isn't in the seed list because it's per-user.
+                        # Fire-and-forget; on cache miss, say_canned
+                        # falls through to an API call — still correct.
+                        if (
+                            session.user_context.name
+                            and session.tz_offset_minutes is not None
+                        ):
+                            personalized = _select_welcome_greeting(session)
+                            log.info(
+                                "[TTS-CACHE] Prewarming personalized greeting: %r",
+                                personalized,
+                            )
+                            t_name_cache = asyncio.create_task(
+                                tts_prewarm_cache([personalized], openai_key)
+                            )
+                            t_name_cache.add_done_callback(
+                                _log_prewarm_exception("Personalized greeting")
+                            )
 
                     # Launch the proactive check-in background loop.
                     # Every CHECK_IN_INTERVAL_S seconds of user silence, Abide
@@ -836,9 +940,24 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         # Telemetry: log the session summary + flush the Langfuse client.
         try:
+            import statistics as _stats  # stdlib only — deferred import keeps startup slim
             duration_s = time.monotonic() - session_start_ts
             latencies = session.stats.get("turn_latencies_ms", [])
             avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else 0
+            # Phase Q — percentiles alongside avg/min/max. P95 is more
+            # evaluator-friendly than max (max is dominated by outliers).
+            # `quantiles(n=20)[-1]` gives the 95th percentile — needs ≥20
+            # samples to be meaningful, otherwise fall back to max to
+            # avoid a bogus "P95" on a 3-turn session.
+            if latencies:
+                p50 = round(_stats.median(latencies), 1)
+                if len(latencies) >= 20:
+                    p95 = round(_stats.quantiles(latencies, n=20)[-1], 1)
+                else:
+                    p95 = round(max(latencies), 1)
+            else:
+                p50 = 0
+                p95 = 0
             summary = {
                 "session_id": session_id,
                 "duration_seconds": round(duration_s, 1),
@@ -848,6 +967,8 @@ async def websocket_endpoint(ws: WebSocket):
                 "fall_count": session.stats["fall_count"],
                 "vision_calls": session.stats["vision_calls"],
                 "avg_turn_latency_ms": avg_latency,
+                "p50_turn_latency_ms": p50,
+                "p95_turn_latency_ms": p95,
                 "max_turn_latency_ms": max(latencies) if latencies else 0,
                 "min_turn_latency_ms": min(latencies) if latencies else 0,
             }
@@ -871,6 +992,13 @@ async def websocket_endpoint(ws: WebSocket):
                 save_user_context(session.resident_id, session.user_context.to_dict())
             except Exception as e:
                 log.debug("[MEMORY] Final flush failed: %s", type(e).__name__)
+
+        # Phase N — return the PTZ camera to a neutral pose so the next
+        # session starts centred. Silent no-op when PTZ isn't available.
+        try:
+            session._ptz.center()
+        except Exception as e:
+            log.debug("[PTZ] center failed on cleanup (%s)", type(e).__name__)
 
         if engine is not None:
             try:

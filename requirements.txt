@@ -10,3 +10,8 @@ h2>=4.1,<5.0
 anthropic>=0.40,<1.0
 langfuse>=2.60,<3.0
 python-dotenv>=1.0,<2.0
+# Windows-only: DirectShow wrapper for Logitech MeetUp pan/tilt/zoom
+# control (Phase N). Gracefully no-ops on non-Windows and on cameras
+# that don't advertise PTZ through DirectShow. Ignore install errors
+# on Mac/Linux — the app imports it via a try/except in app/ptz.py.
+duvc-ctl>=1.0,<3.0 ; sys_platform == "win32"

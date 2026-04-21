@@ -1,627 +1,355 @@
 # Abide Companion
 
-A real-time multimodal AI companion for elderly care. Abide listens, watches,
-and talks back — a voice conversation loop with always-on vision that can
-describe the person's current activity, draw a bounding box around them in
-the live video, detect falls, and gently check in when something looks wrong.
+A real-time multimodal AI companion for elderly care. Abide listens, watches, and talks back — a voice conversation loop with always-on vision that describes the user's current activity, draws a bounding box around them in the live video, detects falls, and gently checks in when something looks wrong.
 
-It runs on one machine with Docker Desktop. You double-click `start.bat`
-(or `start.sh`), the browser opens, you click Start, and you can talk to it.
+It runs on one machine as a native Python app. Double-click `start.bat` (or `start.sh`), the browser opens, enter three API keys, click **Start**, and talk. On Windows with a Logitech MeetUp, saying *"zoom in / out / reset"* moves the camera's optical zoom; MeetUp firmware does not expose mechanical pan/tilt — see [DESIGN-NOTES.md](DESIGN-NOTES.md) *The PTZ saga* for the story.
 
 ---
 
 ## Table of Contents
 
-- [What It Does](#what-it-does)
+- [What it does](#what-it-does)
 - [Architecture](#architecture)
 - [Stack](#stack)
-- [Quick Start](#quick-start)
-- [Project Layout](#project-layout)
-- [How the Voice Loop Works](#how-the-voice-loop-works)
-- [Vision Pipeline](#vision-pipeline)
-- [Session Summary and Diary](#session-summary-and-diary)
-- [Barge-In (Interruption Handling)](#barge-in-interruption-handling)
-- [Whisper Hallucination Defenses](#whisper-hallucination-defenses)
-- [Key Design Decisions](#key-design-decisions)
-- [Known Limitations](#known-limitations)
-- [Data Privacy](#data-privacy)
-- [Observability (Langfuse)](#observability-langfuse)
-- [Configuration Reference](#configuration-reference)
-- [Further Reading](#further-reading)
+- [Quick start](#quick-start)
+- [Project layout](#project-layout)
+- [How the voice loop works](#how-the-voice-loop-works)
+- [Vision pipeline](#vision-pipeline)
+- [Session summary and diary](#session-summary-and-diary)
+- [Barge-in](#barge-in)
+- [Whisper hallucination defences](#whisper-hallucination-defences)
+- [Known limitations](#known-limitations)
+- [Data privacy](#data-privacy)
+- [Observability](#observability)
+- [Configuration reference](#configuration-reference)
+- [Further reading](#further-reading)
 
 ---
 
-## What It Does
+## What it does
 
-- **Voice conversation** — continuous microphone capture, voice-activity
-  detection (local CPU), speech-to-text, a conversational LLM, text-to-speech,
-  and barge-in (interrupt Abide mid-sentence and it stops within ~420 ms).
-- **Live scene understanding** — webcam feed sampled every ~3.6 seconds
-  in 3-frame bursts so the model can see motion. Abide can distinguish
-  sitting from standing, walking from dancing, folding clothes from
-  putting on a shirt. The current activity is displayed as a glass chip
-  overlaid on the video, with a bounding box drawn around the person.
-- **Fall detection + welfare check-in** — if the vision model sees
-  someone going down or lying on the floor, a red alert banner appears
-  and Abide's next reply opens with a gentle welfare question instead
-  of continuing its previous train of thought.
-- **Session summary** — when the user clicks Stop, a full-screen overlay
-  shows: session duration, complete timestamped transcript, activity log,
-  and a Claude-generated analysis of what Abide got right vs. wrong.
-- **Live diary** — a tab in the transcript panel showing all events
-  (speech, replies, vision observations, alerts) in chronological order
-  with timestamps, live-updating during the session.
-- **Proactive check-ins** — if the user is silent for 30 seconds, Abide
-  initiates conversation based on what it sees on camera. It's a companion
-  in the room, not a chatbot waiting for input.
-- **Welcome greeting** — on WebSocket connect, Abide plays a cached
-  time-of-day-appropriate greeting instantly (no API call): "Good
-  morning!", "Good afternoon!", "Good evening!", or "Hello, I'm Abide.
-  How are you tonight?" depending on the browser's local hour. User
-  hears a voice the moment the session starts.
-- **Diary export** — one-click download of the full session (transcript
-  + vision observations + alerts) as a timestamped plain-text file.
-- **User memory within session** — Abide extracts and remembers the user's
-  name, topics discussed, preferences, and mood signals. These are injected
-  into every Claude turn so responses feel personal ("John, I noticed you're
-  back in your chair — how was your walk?"). Defence-in-depth name filter
-  rejects the assistant's own name or generic role labels if the extractor
-  ever mistags them.
-- **Auto-populated TTS cache** — every sentence Claude completes is
-  recorded to a small on-disk frequency counter; phrases heard repeatedly
-  across sessions are prewarmed at next startup so the cache naturally
-  tracks Abide's actual voice instead of a hand-curated list.
-- **Time-of-day awareness** — the browser reports its timezone offset on
-  connect; the server buckets the local hour and picks a matching cached
-  welcome ("Good morning! / Good afternoon! / Good evening! / Hello, I'm
-  Abide. How are you tonight?") and injects a one-line context into every
-  Claude turn so greetings and check-ins reference the hour naturally.
-- **Cross-session memory (minimal)** — a per-browser `resident_id` UUID
-  keys a small on-disk `UserContext` file. Name, topics discussed,
-  preferences, and current mood survive across Start→Stop cycles, so a
-  returning user hears Abide greet them by name and reference past
-  topics. Conversation turns are **not** persisted (deliberately — keeps
-  Claude's context fresh and latency flat over long deployments). A
-  "What Abide remembers" panel in the gear drawer plus a "Forget me"
-  button (with confirm dialog) give the user visibility + control.
-- **Vision-emitted "noteworthy" flag** — the vision model itself decides
-  whether a scene is engagement-worthy (waving, standing up, dancing,
-  falling) or background (sitting, talking with natural gestures). No
-  hard-coded activity allowlist — proactive reactions generalize to
-  activities we didn't enumerate.
-- **Low latency** — target is under 1.5 seconds from end-of-speech to
-  first audio response. Achieved via persistent HTTP/2 clients, streaming
-  LLM to streaming TTS on sentence boundaries, and parallel TTS
-  synthesis while the LLM is still generating.
-- **Observability** — optional Langfuse integration with per-turn
-  traces, standalone vision traces, and a session-summary trace on
-  disconnect.
+- **Voice conversation** with barge-in — interrupt Abide mid-sentence and it stops within ~150 ms on MeetUp (~420 ms on a laptop).
+- **Always-on vision** — 3-frame bursts every 3.6 s through GPT-4o-mini, with motion-aware prompting that distinguishes *dancing* from *waving*, *standing up* from *standing still*, *falling* from *lying down*.
+- **Fall detection** — a `FALL:` prefix from the vision model raises a red alert banner and makes Abide's next reply open with a welfare check.
+- **Out-of-frame welfare check** — after ~11 s of sustained absence, Abide gently asks *"I can't see you right now — are you still there?"*.
+- **Proactive check-ins** — after 30 s of silence, Abide initiates conversation based on what it sees.
+- **Vision-reactive responses** — the vision model itself emits a `noteworthy: bool` flag; proactive replies fire when it's true and the activity changed.
+- **Personalised welcome greeting** — cached time-of-day variant, name-aware if cross-session memory has hydrated a name.
+- **Cross-session memory** — per-browser `resident_id` UUID keys `./memory/<id>.json`. Name / topics / preferences / mood survive across Start→Stop. Conversation turns are deliberately not persisted. "Forget me" button wipes it.
+- **On-request optical zoom** (Windows + MeetUp) — user says "zoom in / out / reset", Claude emits an inline `[[CAM:...]]` marker, server dispatches to DirectShow off-loop.
+- **Session summary** — on Stop, a full-screen overlay shows duration, full transcript, activity log, and a Claude-powered analysis of what Abide got right vs wrong.
+- **Live diary** — chronological event log with color-coded type badges, exportable to plain text.
+- **Observability** — optional Langfuse v2 traces (per-turn + vision + session summary).
 
 ---
 
 ## Architecture
 
 ```
-                          +-----------+
-                          |  Browser  |
-                          |  (Single  |
-                          |   HTML    |
-                          |   file)   |
-                          +-----+-----+
+                     +---------------------+
+                     |       Browser       |
+                     |  frontend/index.html|
+                     +----------+----------+
                                 |
-                         WebSocket (binary PCM up,
-                         opus audio down, JSON both ways,
-                         base64 JPEG frames up)
-                                |
-                   +------------+------------+
-                   |    FastAPI Server       |
-                   |    (single process)     |
-                   |                         |
-           +-------+-------+       +--------+--------+
-           | Voice Loop    |       | Vision Pipeline  |
-           |               |       | (fire-and-forget)|
-           | 1. silero-vad |       |                  |
-           |    (local CPU)|       | 3-frame burst    |
-           | 2. Groq       |       |    every 3.6s    |
-           |    Whisper STT|       |       |          |
-           | 3. Claude     |       |  GPT-4o-mini     |
-           |    (streaming)|       |  (JSON bbox)     |
-           | 4. OpenAI TTS |       +--------+---------+
-           |    (parallel, |                |
-           |    per-sentence|        Scene description
-           +-------+-------+        injected into Claude's
-                   |                 system prompt per turn
-            Audio bytes back
-            to browser via WS
+                                |  WebSocket
+                                |     up:   PCM audio, JPEG frames (b64),
+                                |           config / control (JSON)
+                                |     down: opus audio, events + transcript
+                                v
+                     +----------+----------+
+                     |   FastAPI server    |
+                     |  (single process,   |
+                     |   one WebSocket)    |
+                     +----+-----------+----+
+                          |           |
+              +-----------+--+     +--+------------------+
+              |  Voice loop  |     |  Vision pipeline    |
+              |              |     |  (fire-and-forget)  |
+              |  silero-vad  |     |                     |
+              |  (local CPU) |     |  3-frame burst      |
+              |              |     |  every 3.6 s        |
+              |  Groq        |     |                     |
+              |  Whisper STT |     |  GPT-4o-mini        |
+              |              | <---+  activity / bbox /  |
+              |  Anthropic   |     |  noteworthy flag    |
+              |  Claude      |     +----------+----------+
+              |  (streaming) |                |
+              |              |                |  scene
+              |  OpenAI TTS  |                |  description
+              |  (parallel,  |                |  injected into
+              |  per-        |                |  Claude's
+              |  sentence)   |                |  system prompt
+              +------+-------+                |
+                     |                        v
+                     |                 (Claude's next turn)
+                     |
+                     |  [[CAM:zoom_in]] marker in reply
+                     v
+              +----------------+
+              | PTZController  |   Windows + MeetUp only
+              | duvc-ctl  -->  |   optical zoom (no pan/tilt
+              | DirectShow     |   on MeetUp firmware)
+              +----------------+
 ```
 
-All API calls use a single persistent `httpx.AsyncClient` with HTTP/2
-per module. Connection prewarm fires on WebSocket open so the user
-never pays a TLS handshake on their first turn.
+All API calls (Claude, OpenAI, Groq) use persistent `httpx.AsyncClient`s with HTTP/2 multiplexing. Connection prewarm fires on WebSocket open so the user never pays a TLS handshake on their first turn.
 
 ---
 
 ## Stack
 
-| Layer             | Choice                                              |
-|-------------------|-----------------------------------------------------|
-| Backend           | FastAPI + single WebSocket endpoint                 |
-| Frontend          | Single `frontend/index.html` — no React, no build tools |
-| VAD               | silero-vad (local CPU inference via PyTorch)         |
-| STT               | Groq Whisper API (`whisper-large-v3`, `verbose_json`) |
-| Conversation LLM  | Anthropic Claude (`claude-sonnet-4-20250514`), streaming |
-| TTS               | OpenAI `tts-1` / `nova` voice, opus format          |
-| Vision            | OpenAI `gpt-4o-mini`, JSON-mode, multi-frame        |
-| Session Analysis  | Anthropic Claude (one-shot call at session end)      |
-| Telemetry         | Langfuse v2 (optional, graceful no-op if missing)    |
-| Packaging         | Docker + docker-compose + `start.bat` / `start.sh`  |
+| Layer | Choice |
+|---|---|
+| Backend | FastAPI + single WebSocket endpoint |
+| Frontend | Single `frontend/index.html` — no React, no build tools |
+| VAD | silero-vad (local CPU, PyTorch) |
+| STT | Groq Whisper (`whisper-large-v3`, `verbose_json`) |
+| Conversation LLM | Anthropic Claude (`claude-sonnet-4-6`), streaming |
+| TTS | OpenAI `tts-1` / `nova` voice, opus format |
+| Vision | OpenAI `gpt-4o-mini`, JSON mode, multi-frame |
+| Session analysis | Anthropic Claude (one-shot call at session end) |
+| Telemetry | Langfuse v2 (optional, graceful no-op if missing) |
+| Camera control | `duvc-ctl` (Windows DirectShow) — optical zoom on MeetUp |
+| Packaging | Native Python 3.12+ in `.venv`, launched via `start.bat` / `start.sh` |
 
 ---
 
-## Quick Start
+## Quick start
 
-### For first-time users
+### End user
 
-Follow `README-SETUP.txt`. In short:
+Follow [`README-SETUP.txt`](README-SETUP.txt). In short:
 
-1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-2. Double-click `start.bat` (Windows) or `start.sh` (Mac/Linux)
-3. Browser opens at `http://localhost:8000`
-4. Click the gear icon, paste your 3 API keys (Groq, Anthropic, OpenAI)
-5. Click **Start** — allow mic + camera access when prompted
+1. Install [Python 3.12+](https://www.python.org/downloads/) (check *"Add python.exe to PATH"* on Windows)
+2. Double-click `start.bat` (Windows) or `start.sh` (Mac / Linux)
+3. First run creates `.venv` and pip-installs dependencies (~3–5 min). Later runs start in seconds.
+4. Browser opens at `http://localhost:8000`
+5. Click the gear icon, paste your three API keys, click **Start**
 
-### For a developer who wants to iterate without Docker
+### Developer / manual
 
 ```bash
-# Python 3.12+ recommended
 python -m venv .venv
-.venv\Scripts\activate              # Windows
-# source .venv/bin/activate         # Mac/Linux
+.venv\Scripts\activate            # Windows
+# source .venv/bin/activate       # Mac / Linux
 
 pip install -r requirements.txt
 python -m uvicorn app.main:app --reload
 ```
 
-Then open `http://localhost:8000` and click the gear icon to enter
-your API keys.
+Always run via the venv's Python — launching uvicorn with system Python will silently disable `duvc-ctl` and zoom will do nothing. See [TROUBLESHOOTING.md #19](TROUBLESHOOTING.md) for the trap we hit.
 
-### API keys needed
+### API keys
 
-| Key | Provider | Purpose | Get it at |
-|-----|----------|---------|-----------|
-| Groq | Groq | Speech-to-text (Whisper) | https://console.groq.com |
-| Anthropic | Anthropic | Conversation (Claude) + session analysis | https://console.anthropic.com |
-| OpenAI | OpenAI | TTS (text-to-speech) + Vision (GPT-4o-mini) | https://platform.openai.com |
+All three are entered in the browser UI and stored in `localStorage`. Nothing touches the server filesystem.
 
-All three are entered in the browser UI and stored in `localStorage`.
-They never touch the server's filesystem. The only server-side keys
-are the optional Langfuse ones in `.env`.
+| Key | Provider | Used for |
+|---|---|---|
+| Groq | [console.groq.com](https://console.groq.com) | Whisper STT |
+| Anthropic | [console.anthropic.com](https://console.anthropic.com) | Claude conversation + session analysis |
+| OpenAI | [platform.openai.com](https://platform.openai.com) | TTS + vision |
+
+Optional Langfuse keys go in a server-side `.env`; see [`.env.example`](.env.example).
 
 ---
 
-## Project Layout
+## Project layout
 
 ```
 abide-companion/
-|-- app/
-|   |-- main.py           FastAPI app, WebSocket, hot loop, /api/analyze endpoint
-|   |-- audio.py          silero-vad + Groq Whisper STT + hallucination filters
-|   |-- session.py        Per-connection state, barge-in coordinator, response task
-|   |-- conversation.py   Claude streaming via direct httpx (not SDK)
-|   |-- tts.py            OpenAI TTS streaming via direct httpx
-|   |-- vision.py         GPT-4o-mini multi-frame vision with JSON bbox output
-|   `-- telemetry.py      Langfuse wrapper with graceful no-op
-|-- frontend/
-|   |-- index.html        Entire UI in one file: HTML + CSS + JS
-|                          - Conversation tab (real-time transcript)
-|                          - Diary tab (chronological event log) + Export button
-|                          - Session summary overlay (on Stop)
-|                          - Video overlay with bounding box + confidence badge
-|                          - Fall alert banner
-|                          - Light/dark theme toggle (Abide Robotics brand)
-|-- app/tts_cache_store.py  Persistent phrase-frequency counter that
-|                            auto-populates the TTS prewarm list (Phase I)
-|-- app/memory.py         Per-resident UserContext persistence — cross-session
-|                          name / topics / preferences storage (Phase E, D78)
-|-- Dockerfile            Python 3.12-slim + CPU torch + torchaudio + silero-vad
-|-- docker-compose.yml    Single service, .env mounted as env_file
-|-- start.bat             Windows launcher: docker compose up + open browser
-|-- start.sh              Mac / Linux equivalent
-|-- .env.example          Template for Langfuse env vars (developer only)
-|-- requirements.txt      Python dependencies
-|-- README.md             This file
-|-- README-SETUP.txt      Plain-English setup guide for end users
-|-- DESIGN-NOTES.md       65 architectural decisions with context and trade-offs
-|-- CLAUDE.md             Developer guidance for Claude Code sessions
-`-- TROUBLESHOOTING.md    10 bugs, root causes, and fixes
+├── app/
+│   ├── main.py             FastAPI, WebSocket, hot loop, /api/analyze
+│   ├── session.py          Per-connection state, barge-in coordinator
+│   ├── audio.py            silero-vad + Groq Whisper STT + hallucination filters
+│   ├── conversation.py     Claude streaming via direct httpx (not SDK)
+│   ├── tts.py              OpenAI TTS streaming via direct httpx
+│   ├── vision.py           GPT-4o-mini multi-frame vision (JSON bbox output)
+│   ├── ptz.py              DirectShow camera control via duvc-ctl (Windows)
+│   ├── memory.py           Per-resident UserContext persistence (cross-session)
+│   ├── tts_cache_store.py  Persistent phrase-frequency counter (auto-prewarm)
+│   └── telemetry.py        Langfuse wrapper with graceful no-op
+├── frontend/
+│   └── index.html          Entire UI: conversation + diary + summary + overlay
+├── start.bat               Windows launcher: .venv + pip + uvicorn + open browser
+├── start.sh                Mac / Linux equivalent
+├── requirements.txt
+├── .env.example            Template for optional Langfuse env vars
+├── README.md               This file
+├── README-SETUP.txt        Plain-English setup guide for end users
+├── DESIGN-NOTES.md         Development journal — what we built / tried / broke / fixed
+├── TROUBLESHOOTING.md      Bug log with root causes and fixes
+└── CLAUDE.md               Working notes for Claude Code sessions on this repo
 ```
 
 ---
 
-## How the Voice Loop Works
+## How the voice loop works
 
 ```
-browser mic (AudioWorklet, 48 kHz, 2048-sample chunks)
-    --- binary WebSocket frames --->
-server: downsample to 16 kHz, silero-vad (512-sample windows)
-    --- speech segment as WAV (on speech_end) --->
+browser mic  (AudioWorklet, 48 kHz, 2048-sample chunks)
+     |
+     |   binary WebSocket frames
+     v
+server       downsample to 16 kHz, silero-vad (512-sample windows)
+     |
+     |   speech segment as WAV on speech_end
+     v
 Groq Whisper (STT, verbose_json, temperature=0, language=en)
-    --- confidence filter + hallucination blocklist --->
-    --- user transcript text --->
-Anthropic Claude (streamed, with vision context in system prompt)
-    --- sentence-boundary detection --->
-OpenAI TTS (one request per sentence, launched in parallel)
-    --- opus audio bytes --->
-    --- binary WebSocket frames --->
-browser: decode + sequential FIFO playback via Web Audio API
+     |
+     |   confidence filter + hallucination blocklist
+     v
+user transcript
+     |
+     v
+Anthropic Claude  (streamed, with vision + time + user context)
+     |
+     |   sentence-boundary detection
+     v
+OpenAI TTS   (one request per sentence, launched in parallel)
+     |
+     |   opus audio bytes, binary WebSocket frames
+     v
+browser      Web Audio API, sequential FIFO playback
 ```
 
-**Key latency optimizations:**
-- TTS fires on first sentence boundary, not after full Claude response
-- Parallel TTS requests via HTTP/2 multiplexing over one connection
+**Key latency wins:**
+- TTS fires on first sentence boundary, not after the full Claude response
+- Parallel TTS via HTTP/2 multiplexing over one connection
 - Connection prewarm on WebSocket open (HEAD to each API)
 - silero-vad runs locally — no API call on the critical path
+- Anthropic prompt caching (Phase O + R) — cached prefix `[system + prior turns]` kicks in from turn ~3–5
 
 ---
 
-## Vision Pipeline
+## Vision pipeline
 
-The vision system runs independently from the voice loop as a
-fire-and-forget background task:
+Independent from the voice loop, fire-and-forget:
 
-1. Browser captures one JPEG frame every 1.2 seconds
-2. Ring buffer holds last 3 frames (~3.6 seconds of motion)
-3. Every 3rd capture, the full 3-frame batch is sent to the server
-4. Server sends the batch to GPT-4o-mini with a structured prompt
-5. Response includes: `motion_cues` (chain-of-thought grounding),
-   `activity` description (max 10 words), `noteworthy` flag,
-   and bounding box
-6. Result displayed on the frontend: scene chip + canvas overlay
-7. Last 5 scene descriptions with relative timestamps injected into Claude's system prompt
+1. Browser captures one JPEG every 1.2 s; ring buffer holds last 3 frames.
+2. Every 3rd capture, the 3-frame batch is sent to the server.
+3. Server sends to GPT-4o-mini with a structured JSON prompt.
+4. Response: `motion_cues` (chain-of-thought grounding), `activity` (≤10 words), `noteworthy` flag, bounding box.
+5. Scene chip + canvas overlay render on the frontend.
+6. Last 5 scene descriptions (with relative timestamps) get injected into Claude's system prompt.
 
-**Motion-cues chain-of-thought.** The model writes a short grounded
-observation (e.g. *"Hips sway side to side; both arms up; feet shift"*)
-before it classifies the activity. This forces it to commit to observed
-evidence before picking a label — prevents defaulting to a narrow
-single-pose label (*"Waving"*) when the whole body is moving
-(*"Dancing"*). Cues are logged server-side for diagnostics, not sent to
-Claude.
+The prompt teaches four motion scopes (WHOLE-BODY / LIMB / HAND-OBJECT / STATIC) and instructs the model to match the label's granularity to the scope of motion observed. When motion spans scopes, pick the largest visible. The `noteworthy` flag replaces an earlier hard-coded activity allowlist — the model decides whether a scene is the kind of event a friend would stop and react to.
 
-**Scope-matching label rule.** The prompt teaches four motion scopes
-(WHOLE-BODY / LIMB / HAND-OBJECT / STATIC) and instructs the model to
-match the label's granularity to the scope of the motion observed.
-When motion spans scopes, pick the largest one visible. This
-generalizes across activities we didn't enumerate.
-
-**Activities the system handles:** dancing, walking, running, jumping,
-standing up, sitting down, bending over, turning, exercising, lifting
-a leg, waving, reaching, pointing, stretching, holding a cup, eating,
-drinking, typing, folding, putting on a shirt, brushing teeth,
-sitting still, standing still, lying down, falling, slipping,
-stumbling. The list isn't hard-coded — the prompt's scope rule and
-diverse few-shot examples cover the elderly-care activity spectrum.
-
-**Fall detection:** Vision prompt enforces a `FALL:` prefix when a fall
-or near-fall (slip, stumble, catching oneself on furniture) is
-observed — erring on the side of flagging. The frontend shows a red
-pulsing alert banner that auto-hides after 20 seconds. Claude's next
-reply opens with a welfare check-in question.
-
-**`noteworthy` flag.** Alongside the activity text, the model emits a
-`noteworthy: bool` judgment — "would a friend in the room stop and
-react to this?". True for waving, standing up, dancing, starting to
-eat. False for sitting still, talking with natural gestures,
-continuing an ongoing activity. The server fires a proactive Claude
-turn only when `noteworthy=true` AND the activity changed since the
-last observation AND the user has been silent ≥10 s. Replaced an
-earlier hard-coded activity allowlist in `session.py`.
+**Fall detection.** A `FALL:` prefix on the activity text triggers a red pulsing alert banner that auto-hides after 20 s. Claude's next reply opens with a welfare question. Biased toward false positives.
 
 ---
 
-## Session Summary and Diary
+## Session summary and diary
 
-### Diary Tab (live, during session)
+**Diary tab** (live during session): chronological event log with type badges — *You* (indigo) / *Abide* (teal) / *Vision* (amber) / *Alert* (rose). Live-updating. Exportable to plain text.
 
-A tab alongside "Conversation" in the transcript panel. Shows ALL events
-in chronological order:
-
-- **You** (indigo) — user speech transcripts
-- **Abide** (teal) — assistant responses
-- **Vision** (amber) — camera observations
-- **Alert/Fall** (rose) — fall alerts and warnings
-
-Each entry has a timestamp (HH:MM:SS) and a color-coded type badge.
-Live-updating — entries appear as they happen.
-
-### Session Summary (on Stop)
-
-When the user clicks Stop, a full-screen overlay displays:
-
-1. **Duration** — start time, end time, total length
-2. **Conversation Transcript** — all user + assistant messages with timestamps
-3. **Activity Log** — all vision observations + fall alerts with timestamps
-4. **What Abide Got Right / Wrong** — a Claude-powered analysis that reviews
-   the conversation for: correct interpretations (user confirmed or didn't
-   correct), incorrect interpretations (user said "no", "that's wrong",
-   etc.), and ambiguous cases
-
-The analysis is generated by a one-shot Claude API call via
-`POST /api/analyze`. The rest of the summary renders immediately;
-the analysis shows a spinner while loading.
+**Session summary** (on Stop): full-screen overlay with session duration, complete timestamped transcript, activity log, and a Claude-generated analysis of what Abide got right vs wrong (separate one-shot `POST /api/analyze` call).
 
 ---
 
-## Barge-In (Interruption Handling)
+## Barge-in
 
-Abide can be interrupted mid-sentence. The system uses a multi-layer gate:
+Abide can be interrupted mid-sentence. Multi-layer gate:
 
-1. **POST_TTS_COOLDOWN_MS (300 ms)** — ignore VAD after each TTS chunk
-   to suppress echo blips
-2. **SUSTAINED_SPEECH_MS (400 ms)** — require continuous speech before
-   firing, not a single spike
-3. **BARGE_IN_MIN_LOUD_WINDOWS (6)** — require ≥6 VAD windows (≈190 ms
-   of cumulative audio) to clear `MIN_SPEECH_RMS` in the same segment.
-   Previously a peak-RMS threshold, which let single loud spikes through
-   (keypresses, coughs, mic thumps) even when the full segment averaged
-   below the post-hoc filter. The loud-window count matches the
-   post-hoc filter's aggregate semantics so the two gates agree.
-4. **Cooperative cancellation** — on barge-in, the server sets a flag
-   checked between sentence boundaries; partial response is saved to
-   history so Claude doesn't repeat itself
-5. **Client-side epoch counter** — drops any in-flight `decodeAudioData`
-   callbacks from the cancelled response
+1. **300 ms post-TTS cooldown** — ignore VAD after each TTS chunk to kill trailing-echo blips.
+2. **Sustained-speech gate** (150 ms on MeetUp / 400 ms on laptop) — single spikes don't qualify, real speech sustains.
+3. **Loud-window count** (≥4 on MeetUp / ≥6 on laptop) — ≈128 ms of cumulative above-threshold audio in the same segment.
+4. **Cooperative cancellation** — on barge-in, a flag checked between sentence boundaries stops the Claude stream; partial response is saved to history so Claude doesn't repeat itself.
+5. **Client-side epoch counter** — drops any in-flight `decodeAudioData` callbacks from the cancelled response.
 
-Total barge-in latency: ~420 ms from user speech onset to Abide going
-silent. The tradeoff is documented in D14 / D25b — lowering it further
-requires acoustic echo cancellation (AEC) hardware or DSP, not just
-timing gates.
+MeetUp's firmware-level Acoustic Echo Cancellation is what lets the gate be aggressive without false positives. Laptop deployments should revert to the 400 / 6 defaults.
 
 ---
 
-## Whisper Hallucination Defenses
+## Whisper hallucination defences
 
-Groq Whisper (whisper-large-v3) hallucinates on short/quiet/ambiguous
-audio — it emits phrases from its YouTube training data. The system
-has four layers of defense (see D41, D48, Troubleshooting #8, #10):
+Groq Whisper (whisper-large-v3) hallucinates on short / quiet / ambiguous audio — it emits phrases from its YouTube training data. Four layers of defence:
 
-1. **RMS + length pre-filter** — reject segments < 0.5s or < 0.015 RMS
-   before they ever reach Whisper
-2. **Minimal STT prompt** — only disambiguates the rare name "Abide",
-   never lists common phrases (which bias the decoder toward them)
-3. **`verbose_json` confidence filter** — drop segments where
-   `no_speech_prob > 0.6 AND avg_logprob < -1.0` (OpenAI's reference
-   thresholds)
-4. **Regex + standalone blocklist** — catch known hallucination patterns
-   ("Subtitles by Amara.org") and bare phrases ("thank you", "hmm")
+1. **RMS + length pre-filter** — reject segments <0.5 s or <0.015 RMS before they ever reach Whisper.
+2. **Minimal STT prompt** — only disambiguates the assistant's name "Abide". No "hello" / "thank you" / "goodbye" (those would bias the decoder toward them — see [TROUBLESHOOTING.md #10](TROUBLESHOOTING.md)).
+3. **`verbose_json` confidence filter** — drop segments where `no_speech_prob > 0.6` AND `avg_logprob < -1.0` (OpenAI's reference thresholds).
+4. **Standalone blocklist** — drop transcripts that are exactly a known hallucination ("thank you", "bye", "Subtitles by Amara.org").
 
 ---
 
-## Key Design Decisions
+## Known limitations
 
-These are documented in full with alternatives and trade-offs in
-`DESIGN-NOTES.md` (65 entries across 8+ phases). Highlights:
-
-- **Single-file frontend, no framework** (D1) — build tools are a cold-start
-  liability for a zero-config first-run experience.
-- **Direct httpx instead of SDKs** (D5) — bypasses Windows SSL flakiness;
-  HTTP/2 client reuse cuts ~500 ms off first-token latency.
-- **silero-vad on local CPU** (D3) — no API round-trip on the critical path.
-- **Sentence-boundary streaming TTS** (D8) — first audio starts playing
-  while Claude is still generating sentence 2.
-- **Web Audio API, not `<audio>`** (D11) — `.stop()` is synchronous,
-  which matters for barge-in.
-- **Cooperative cancellation flag** (D12) — clean partial-response
-  preservation on barge-in so Claude doesn't repeat itself.
-- **Multi-frame vision** (D23) — 3 consecutive frames gives the model
-  motion signal (walking vs standing, falling vs lying down).
-- **`FALL:` prefix convention** (D24) — prompt-enforced, not a separate
-  classifier; biased toward false positives over false negatives.
-- **Whisper confidence filter** (D48) — `verbose_json` + `no_speech_prob`
-  thresholds suppress hallucinations at the model confidence level.
-- **Session summary with Claude analysis** (D50) — one-shot Claude call
-  at session end reviews conversation accuracy.
-- **Live diary tab** (D49) — chronological event log mixing speech,
-  replies, and vision observations with color-coded type badges.
-- **Proactive vision engagement** (D51) — Claude is instructed to always
-  comment on what it sees, not wait to be asked. Activity changes between
-  turns are noticed and remarked on naturally.
-- **Proactive check-in** (D52) — 30-second silence trigger fires a
-  system-initiated Claude turn based on vision context. Abide doesn't
-  wait for the user to speak first.
-- **UserContext persistence** (D53) — lightweight extraction call after each
-  response extracts user facts (name, topics, preferences, mood) and
-  injects them into every subsequent Claude turn.
-- **TTS cache for stock phrases** (D59, extended by Phase I + D75) — a
-  16-phrase seed (4 time-of-day welcome variants, generic fallback,
-  check-ins, short acknowledgements) is pre-generated at session start so
-  they serve in 0 ms. On top of that, every sentence Claude completes is
-  recorded to a persistent on-disk frequency counter
-  (`app/tts_cache_store.py`); phrases heard ≥2 times across prior sessions
-  are merged into the prewarm list. Cache naturally converges on Abide's
-  real voice instead of a hand-curated list.
-- **Dynamic Whisper prompt biasing** (D60) — once the user's name is
-  extracted, it's appended to the STT prompt so Whisper recognizes it
-  correctly on subsequent utterances.
-- **Welcome greeting on connect** (D61, extended by D75) — on WebSocket
-  open, Abide plays a time-of-day-appropriate greeting ("Good morning!",
-  "Good afternoon!", "Good evening!", or a night-time variant) from the
-  TTS cache — no user speech required, no Claude call, instant first
-  impression. Variant chosen from the browser-reported timezone offset.
-- **Vision confidence indicator** (D62) — scene chip appends a colored
-  badge: red `⚠ alert` for falls, amber `low confidence` for tiny bboxes,
-  green `confident` otherwise. Pure frontend heuristic.
-- **Activity stability filter** (D63) — `VisionBuffer` tracks consecutive
-  identical observations and suppresses redundant vision context when the
-  same activity has been stable for < 30s. Stops Claude from repeating
-  "still sitting" every turn.
-- **Diary export** (D64) — one-click download of the full session as a
-  plain-text `abide-session-YYYY-MM-DD.txt` file. No backend needed.
-- **Vision-reactive triggers** (D54, restructured by Phase H) — the
-  vision model itself emits a `noteworthy: bool` flag per scene. The
-  server fires a proactive Claude turn when that flag is true AND the
-  activity text changed since the last observation AND the user has
-  been silent ≥10 s. Previously a hard-coded activity allowlist; now a
-  semantic judgment the model makes from its own motion_cues reasoning.
-- **Concurrent response mutex** (D55) — `start_response()` cancels any
-  in-flight task before starting a new one, preventing orphaned tasks.
-- **Safe WebSocket sends** (D56) — all 11 `ws.send_json()` calls in
-  `main.py` replaced with `Session._safe_send_json()` to prevent crashes
-  on WebSocket close race conditions.
-- **Temporal activity context** (D19) — last 5 scene descriptions with
-  relative timestamps ("2 min ago: sitting", "just now: standing up")
-  give Claude awareness of what the user has been doing over time.
-- **Priority-hierarchy system prompt** (Phase D) — Claude's prompt is
-  structured as explicit priorities: listen → respond → use vision only
-  if relevant → be proactive only in silence. Natural conversational
-  gestures (touching face, moving head while talking) are explicitly
-  listed as "never comment on", so Abide stays a present friend rather
-  than a narrator.
-- **Correction-response shape rule** (Phase G) — when the user corrects
-  Abide, the prompt enforces a one-sentence reply with no enumeration,
-  no future-action promises, and no "thanks for your patience" coda.
-  Shape-based rather than a phrase blocklist, so it generalizes across
-  wordings Claude Sonnet 4 might invent.
-- **Vision chain-of-thought via `motion_cues`** (Phase F) — the vision
-  model writes a short grounded observation ("Hips sway; arms up;
-  feet shift") before classifying the activity. Scope-matching rules
-  (WHOLE-BODY / LIMB / HAND-OBJECT / STATIC) plus 14 diverse few-shot
-  examples generalize to activities we didn't enumerate. Based on
-  CoT-VLA (CVPR 2025) and OpenAI vision-prompt guidance.
-- **Auto-populated TTS cache** (Phase I) — replaces a hand-curated
-  phrase list. Every sentence Claude completes is recorded to
-  `tts_cache/phrase_counts.json`; phrases heard ≥2 times are merged
-  with a 16-phrase seed at next prewarm.
-- **Time-of-day awareness** (D75, easter egg) — frontend sends
-  `getTimezoneOffset()` in the `config` WS message; server buckets the
-  local hour (morning / afternoon / evening / night), picks a matching
-  cached welcome, and injects a one-line time-of-day hint into every
-  Claude system prompt so greetings and check-ins reference the hour
-  naturally. Falls back silently if the offset is absent.
-- **Cross-session memory** (D78, Phase E) — persist `UserContext` only,
-  not conversation turns. A browser-local `resident_id` UUID keys
-  `./memory/<id>.json`. Loaded on connect, saved off-loop after every
-  fact extraction. Strict `^[a-f0-9\-]{10,64}$` validation +
-  `Path.resolve()` escape check prevent path traversal. Conversation
-  history is deliberately ephemeral to keep Claude's input flat over
-  long deployments and avoid stale-reference drift. "Forget me"
-  button wipes the server file, resets in-memory state, and
-  regenerates the local UUID.
-
----
-
-## Known Limitations
-
-Full list in `DESIGN-NOTES.md`. Highlights:
-
-- **Barge-in latency ~420 ms** — the RMS + sustained-speech gate prevents
-  TTS echo from triggering phantom interrupts. Lowering it needs proper AEC.
-- **Vision bounding boxes are approximate** — GPT-4o-mini spatial grounding
-  is "close" not "precise."
-- **Fall detection is prototype-grade** — no emergency dispatch, no SLA,
-  best-effort. Abide offers to call someone; it does not dial anyone.
-- **Conversation history caps at 20 messages** — intentional forgetting
-  so the token budget stays flat over long sessions.
-- **No persistence** — closing the tab ends the session. This matches
-  the project's data-privacy posture.
-- **English-only** — `language="en"` is passed to Whisper; other languages
-  were not tested.
+- **Mechanical pan/tilt on MeetUp is not reachable.** Firmware 1.0.244 / 1.0.272 both probe as `Pan: ok=False / Tilt: ok=False` over UVC. Only optical zoom is exposed. Any on-device framing motion is Logitech RightSight digital cropping. See [DESIGN-NOTES.md](DESIGN-NOTES.md) *The PTZ saga*.
+- **Barge-in is ~150 ms on MeetUp / ~420 ms on laptop** — the MeetUp number depends on its hardware AEC.
+- **Vision bounding boxes are approximate** — GPT-4o-mini spatial grounding is "close" not "precise".
+- **Fall detection is prototype-grade** — no emergency dispatch. Abide offers to call someone; it does not dial anyone.
+- **Conversation history caps at 20 messages** — intentional, keeps token budget flat over long sessions.
+- **English-only** — `language="en"` is passed to Whisper.
 - **Single-session, localhost only** — no auth, no rate limiting, no TLS.
+- **`p95_turn_latency_ms` is whole-turn, not TTFA** — real TTFA is sub-1 s on cache-warm paths. See DESIGN-NOTES *Observability and latency percentiles*.
 
 ---
 
-## Data Privacy
+## Data privacy
 
 - Audio is processed in-memory only and immediately discarded.
-- Video frames are sent to the vision API and not stored anywhere.
-- Conversation history lives only in the server process's memory for
-  the duration of the WebSocket connection.
-- API keys live in the browser's `localStorage` and the server's
-  `.env` (Langfuse only). They are not written anywhere else.
-- If the browser tab closes, the entire conversation and all derived
-  data is gone.
-- The privacy notice is displayed in the UI.
+- Video frames are sent to the vision API and not stored.
+- Conversation history lives only in the server process for the WebSocket's lifetime.
+- API keys live in the browser's `localStorage` and (optionally) the server's `.env` for Langfuse. Nothing else is persisted.
+- Closing the tab ends the session; all derived data is gone.
+- `UserContext` facts (name, topics, preferences, mood) persist to `./memory/<resident_id>.json`, gitignored, local-only. Wipe via the "Forget me" button.
 
 ---
 
-## Observability (Langfuse)
+## Observability
 
-Langfuse is supported but optional. Set `LANGFUSE_PUBLIC_KEY` and
-`LANGFUSE_SECRET_KEY` in `.env` to enable. The server emits:
+Langfuse v2 is optional. Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in `.env` to enable. The server emits:
 
-- One **turn trace** per user utterance with child spans for STT, the
-  Claude generation (with token usage), and one TTS span per sentence
-- One **vision trace** per vision API call, tagged `vision` (and `fall`
-  if a fall was detected)
-- One **session-summary trace** at WebSocket disconnect with counters
-  (turns, barge-ins, falls, vision calls, latency stats, duration)
-- One **connectivity-probe trace** on WebSocket connect for end-to-end
-  verification
+- One **turn trace** per user utterance with child spans for STT, Claude (with token usage + cache telemetry), and per-sentence TTS
+- One **vision trace** per vision API call, tagged `vision` (and `fall` when applicable)
+- One **session-summary trace** on disconnect with counters (turns, barge-ins, falls, vision calls, latency P50/P95, duration)
+- One **connectivity-probe trace** on WebSocket connect
 
-If keys are missing or Langfuse is unreachable, the server logs
-`Langfuse: disabled (no keys)` and every telemetry call becomes a
-silent no-op. The voice loop never depends on telemetry.
+If keys are missing or Langfuse is unreachable, every telemetry call becomes a silent no-op. The voice loop never depends on telemetry.
 
 ---
 
-## Configuration Reference
+## Configuration reference
 
-### Browser-side (gear icon in UI)
+### Browser (gear icon)
 
 | Setting | Required | Notes |
-|---------|----------|-------|
-| Groq API Key | Yes | For Whisper STT |
-| Anthropic API Key | Yes | For Claude conversation + session analysis |
-| OpenAI API Key | Yes | For TTS + vision |
+|---|---|---|
+| Groq API key | Yes | Whisper STT |
+| Anthropic API key | Yes | Claude conversation + session analysis |
+| OpenAI API key | Yes | TTS + vision |
 
-### Server-side (.env file, developer only)
+### Server (`.env`, developer only)
 
-| Variable | Required | Notes |
-|----------|----------|-------|
-| `LANGFUSE_PUBLIC_KEY` | No | Enables telemetry traces |
-| `LANGFUSE_SECRET_KEY` | No | Enables telemetry traces |
-| `LANGFUSE_HOST` | No | Defaults to `https://cloud.langfuse.com` |
+| Variable | Notes |
+|---|---|
+| `LANGFUSE_PUBLIC_KEY` | Enables telemetry |
+| `LANGFUSE_SECRET_KEY` | Enables telemetry |
+| `LANGFUSE_HOST` | Defaults to `https://cloud.langfuse.com` |
 
-### Tunables (constants in source code)
+### Key tunables (source-code constants)
 
 | Constant | File | Default | Purpose |
-|----------|------|---------|---------|
-| `POST_TTS_COOLDOWN_MS` | `main.py` | 300 | Echo suppression cooldown (ms) |
-| `SUSTAINED_SPEECH_MS` | `main.py` | 400 | Barge-in speech threshold (ms) |
-| `BARGE_IN_MIN_LOUD_WINDOWS` | `main.py` | 6 | Barge-in loud-window count (≈190 ms of cumulative above-threshold audio). Replaces peak-RMS gate (Phase B). |
-| `MIN_SPEECH_SAMPLES` | `audio.py` | 8000 | Min segment length (0.5s at 16kHz) |
-| `MIN_SPEECH_RMS` | `audio.py` | 0.015 | Per-VAD-window loudness threshold; used by both the barge-in loud-window counter and the post-hoc segment filter |
-| `MAX_HISTORY` | `conversation.py` | 20 | Conversation window (messages) |
-| `CHECK_IN_INTERVAL_S` | `main.py` | 30 | Proactive check-in silence threshold (s) |
-| `_VISION_REACT_COOLDOWN_S` | `session.py` | 15.0 | Min seconds between vision-reactive responses |
-| `_VISION_REACT_MIN_SILENCE_S` | `session.py` | 10.0 | Min seconds of user silence before vision-react may fire. Matches the "10 seconds" rule in Claude's system prompt. |
-| `TTS_CACHE_SEED_PHRASES` | `main.py` | 16 phrases | First-run seed for the auto-populated TTS cache (4 time-of-day welcome variants + generic fallback + check-ins + short acknowledgements) |
-| `_PREWARM_TOTAL_CAP` | `main.py` | 30 | Cap on combined seed + learned phrases prewarmed per session |
-| `_MIN_COUNT_TO_PREWARM` | `tts_cache_store.py` | 2 | A learned phrase must be heard at least this many times before it's prewarmed |
-| `_MAX_STORED` | `tts_cache_store.py` | 200 | Top-N learned phrases retained on disk |
-| `STABLE_REMIND_S` | `vision.py` | 30.0 | Seconds of stable activity before re-injecting vision context (D63) |
-| `CAPTURE_INTERVAL_MS` | `index.html` | 1200 | Vision frame capture interval |
-| `SEND_EVERY_N` | `index.html` | 3 | Frames before sending to vision |
+|---|---|---|---|
+| `SUSTAINED_SPEECH_MS` | `main.py` | 150 (MeetUp) / 400 (laptop) | Barge-in speech threshold |
+| `BARGE_IN_MIN_LOUD_WINDOWS` | `main.py` | 4 (MeetUp) / 6 (laptop) | Barge-in loud-window count |
+| `POST_TTS_COOLDOWN_MS` | `main.py` | 300 | Echo-suppression cooldown |
+| `CHECK_IN_INTERVAL_S` | `main.py` | 30 | Proactive check-in silence threshold |
+| `MAX_HISTORY` | `conversation.py` | 20 | Conversation window |
+| `_OUT_OF_FRAME_CHECKIN_THRESHOLD` | `session.py` | 3 | Consecutive out-of-frame cycles before welfare check (~11 s) |
+
+Full list in the source. Revert the barge-in constants to laptop defaults on deployments without hardware AEC.
 
 ---
 
-## Stopping
+## Further reading
 
-Click Stop in the browser to end the session and see the summary.
-To shut down the server: close the browser tab, then quit Docker
-Desktop, or run `docker compose down` in this folder.
+- [`DESIGN-NOTES.md`](DESIGN-NOTES.md) — development journal: what we set out to build, what we tried, what broke, what we didn't ship and why
+- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — bug log with symptoms, root causes, and fixes
+- [`README-SETUP.txt`](README-SETUP.txt) — end-user setup guide in plain English
+- [`CLAUDE.md`](CLAUDE.md) — working notes for Claude Code sessions on this repo
 
 ---
 
 ## License
 
 Proprietary. All rights reserved.
-
----
-
-## Further Reading
-
-- `README-SETUP.txt` — one-page setup guide for the end user
-- `DESIGN-NOTES.md` — 65 architectural decisions with context and
-  trade-offs across 8+ development phases
-- `TROUBLESHOOTING.md` — 10 bugs, root causes, and fixes
-- `CLAUDE.md` — developer instructions for Claude Code sessions

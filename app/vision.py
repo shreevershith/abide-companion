@@ -213,9 +213,14 @@ class VisionBuffer:
             return
         now = time.monotonic()
         prev_activity = self.entries[-1].result.activity if self.entries else None
+        # Trim BEFORE append so the list never briefly exceeds BUFFER_SIZE +
+        # 1, even for one statement. Previously we appended then re-sliced,
+        # which allocated a new list each time past the cap and held the
+        # over-sized entry for the gap between append and reassign. Cheap
+        # polish; matters more if BUFFER_SIZE ever grows.
+        if len(self.entries) >= BUFFER_SIZE:
+            del self.entries[0:len(self.entries) - BUFFER_SIZE + 1]
         self.entries.append(SceneEntry(ts=now, result=result))
-        if len(self.entries) > BUFFER_SIZE:
-            self.entries = self.entries[-BUFFER_SIZE:]
 
         # Stability accounting
         if prev_activity is not None and result.activity == prev_activity:

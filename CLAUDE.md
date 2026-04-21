@@ -20,7 +20,7 @@ Mission: *to care for those who can't care for themselves.*
 
 ## Project Context
 Real-time multimodal AI companion for elderly care (Abide Robotics).
-Primary target: non-technical end users on Windows (with Docker Desktop).
+Primary target: non-technical end users on Windows (native Python 3.12+).
 Must work without developer involvement during first-run and daily use.
 
 ## Stack (non-negotiable)
@@ -31,12 +31,12 @@ Must work without developer involvement during first-run and daily use.
 - Conversation: Claude API (claude-sonnet-4-20250514)
 - TTS: OpenAI TTS (tts-1, nova voice, opus format)
 - VAD: silero-vad (runs locally — deliberate latency optimization, no API call)
-- Packaging: Docker + docker-compose + start.bat
+- Packaging: native Python 3.12+ in a local `.venv`, launched via `start.bat` / `start.sh` (one double-click, first-run creates venv + pip installs). Docker was dropped in Phase N (D82) because its WSL2 backend on Windows can't reach DirectShow, which blocks MeetUp pan/tilt control.
 
 ## First-Run Experience (CRITICAL)
 End users install and run with zero technical knowledge.
 Acceptable steps:
-1. Install Docker Desktop (one link, one installer)
+1. Install Python 3.12+ (one link, one installer)
 2. Double-click start.bat
 3. Browser opens automatically
 4. Enter API keys in browser UI
@@ -53,7 +53,7 @@ NOT acceptable:
 - End user supplies exactly 3 keys: Groq, Anthropic, OpenAI
 
 ## Hard Requirements
-- Barge-in: fires at ~420ms (gated on 400ms sustained speech + ≥6 loud VAD windows, ≈190ms cumulative above-threshold audio — matches post-hoc segment filter)
+- Barge-in: fires at ~150ms on Logitech MeetUp (gated on 150ms sustained speech + ≥4 loud VAD windows, ≈128ms cumulative above-threshold audio). Tuned for MeetUp's hardware AEC which strips echo at the device level. On a laptop mic+speaker (no hardware AEC), revert to 400ms / 6 windows — see DESIGN-NOTES.md D80
 - Use Web Audio API for playback (NOT <audio> element)
 - TTS starts on first sentence boundary, not after full Claude response
 - Latency target: <1.5s to first audio after user finishes speaking
@@ -117,7 +117,7 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 4. ✅ TTS pipeline (OpenAI, sentence-boundary, parallel producer/consumer)
 5. ✅ Barge-in (cooperative cancellation, loud-window-count gated, client_playing flag)
 6. ✅ Vision pipeline (multi-frame, bbox, fall detection)
-7. ✅ Docker packaging
+7. ✅ Native Python packaging (was Docker until Phase N — see D82)
 8. ✅ Langfuse observability
 9. ✅ Session summary screen
 10. ✅ Diary view
@@ -130,13 +130,22 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 17. ✅ Auto-populated TTS cache — runtime-learned phrase frequencies replace the hand-curated seed list (Phase I)
 18. ✅ Time-of-day awareness — browser-reported timezone drives 4-variant welcome + system-prompt injection in every Claude turn (D75, easter egg)
 19. ✅ Cross-session UserContext persistence — per-device `resident_id` UUID keys `./memory/<id>.json`; name/topics/preferences/mood hydrated on connect, saved after each fact-extraction. Conversation history stays ephemeral. "Forget me" button in the gear drawer wipes (Phase E, D78)
+20. ✅ Out-of-frame welfare check — Abide verbally checks in after ~11s of sustained absence. Works on every browser / every camera. PTZ subject-follow was attempted via W3C MediaCapture-PTZ but removed after empirical confirmation that Logitech doesn't expose pan/tilt over UVC on any MeetUp firmware (verified against Google's reference demo — MeetUp reports zoom but not pan/tilt). Motion tracking on MeetUp is only possible via Logitech's proprietary Sync/Tune SDK, inaccessible from a browser (Phase K, D79)
+21. ✅ MeetUp-tuned barge-in — hardware AEC on the MeetUp allows dropping the sustained-speech gate from 400ms→150ms and loud-window requirement from 6→4. Barge-in feels ~2.5× more responsive (~200ms in live testing). Revert to laptop values (400/6) for deployments without hardware AEC (Phase L, D80)
+22. ✅ Personalized welcome greeting — when UserContext has hydrated a name on connect, the welcome picks a name-aware variant ("Good morning, Shree! I'm Abide. How are you today?"). The specific greeting is prewarmed in parallel with the other seed phrases so it still serves at ~0ms. First-time users (no name) hear the generic greeting unchanged (Phase M, D81)
+23. ✅ Native Python deployment — dropped Docker in favour of `.venv` + `pip install` + `uvicorn`, all triggered by one double-click on `start.bat`. Enables Phase N.2 below. See D82 for rationale (Phase N.1, D82)
+24. ⚠ PTZ via `duvc-ctl` — native-Python DirectShow access to camera controls. Empirically, MeetUp firmware 1.0.272 exposes only `Zoom` ([100, 500]); `Pan` and `Tilt` probe as `ok=False` on all MeetUp firmwares we've tested. The "subject-follow" ambition of Phase N.2 did not ship on this hardware — see D82 2026-04-20 follow-up. The working deliverable on MeetUp is on-request zoom (Phase R, item 28 below). `nudge_to_bbox` pan/tilt code path is preserved for cameras that do expose those axes (Rally Bar etc.) but is untested here. (Phase N.2, D82 + correction)
+25. ✅ Anthropic prompt caching — `system` field is now an array of content blocks with `cache_control: ephemeral` on the static SYSTEM_PROMPT. Cache kicks in once the prefix crosses Anthropic's 1024-token threshold (usually turn 3-5). Verifiable via `cache_read_tokens` / `cache_creation_tokens` in the `[TIMING] Claude response complete` log line. (Phase O)
+26. ✅ Claude Sonnet 4.6 — upgraded from `claude-sonnet-4-20250514` to `claude-sonnet-4-6`. One-line model-ID change for ~10-20% TTFT improvement. (Phase P, D83)
+27. ✅ Latency percentiles in session summary — P50 and P95 (with max-fallback when <20 samples) now logged and pushed to Langfuse alongside avg/min/max. More evaluator-useful than avg alone. (Phase Q)
+28. ✅ On-request optical zoom — user says "zoom in / out / reset"; Claude emits an inline `[[CAM:zoom_in]]` marker at the head of its reply; the server strips it from the transcript and dispatches `PTZController.zoom()` off-loop so the lens motion overlaps with the verbal ack. `PTZController` init relaxed to accept any single PTZ axis and logs per-axis probe results at INFO for diagnostics. (Phase R, D84)
 
 ## Never Do
 - Use React, Vue, or any frontend framework
 - Use <audio> element for TTS playback
 - Wait for full Claude response before starting TTS
 - Require terminal commands from the end user
-- Add unnecessary dependencies outside Docker
+- Add unnecessary dependencies outside the requirements.txt (every added dep is a failure mode on first-run pip install)
 - Create httpx/Groq/Anthropic clients per-request
 - Put user speech examples in Whisper prompt (causes hallucinations)
 - Send raw exception messages to the client (security risk)
@@ -160,11 +169,9 @@ abide-companion/
 ├── CLAUDE.md
 ├── DESIGN-NOTES.md
 ├── TROUBLESHOOTING.md
-├── docker-compose.yml
-├── Dockerfile
-├── start.bat
-├── start.sh
-├── requirements.txt
+├── start.bat            # Windows launcher — creates .venv, pip install, uvicorn, opens browser
+├── start.sh             # Mac/Linux equivalent
+├── requirements.txt     # Python deps incl. duvc-ctl on Windows for PTZ
 ├── README-SETUP.txt
 ├── .env                 # Langfuse keys only (developer-only)
 ├── .env.example         # Template with security warning header
@@ -177,6 +184,7 @@ abide-companion/
 │   ├── tts.py           # OpenAI TTS streaming (opus, parallel)
 │   ├── tts_cache_store.py # Runtime-learned phrase frequency store (auto-prewarm list)
 │   ├── memory.py        # Cross-session UserContext persistence (Phase E)
+│   ├── ptz.py           # DirectShow PTZ subject-follow via duvc-ctl (Phase N, Windows-only)
 │   └── telemetry.py     # Langfuse tracing (graceful no-op if missing)
 ├── frontend/
 │   └── index.html       # Single-file UI
@@ -209,7 +217,7 @@ python-dotenv>=1.0
 - Cross-session persistence is limited to `UserContext` facts (Phase E). Conversation turn history is deliberately ephemeral per-session; Claude starts with a clean slate each reconnect. Calendar/schedule integration (per Abide Robotics demo) is out of scope.
 - English-only (language="en" passed to Whisper)
 - Direct httpx everywhere due to Windows SDK issues
-- Logitech MeetUp pan/tilt integration not built (hardware-specific, out of scope)
+- Logitech MeetUp motorized pan/tilt control: **architecturally inaccessible from a web app**. Logitech exposes zoom via UVC but gates pan/tilt behind their proprietary Sync/Tune SDK on all MeetUp firmware (confirmed via Google's official MediaCapture-PTZ reference demo against MeetUp firmware 1.0.244 — zoom slider active, pan/tilt reported unsupported). The MediaCapture-PTZ frontend code was shipped and then removed after empirical confirmation; the out-of-frame welfare check (backend, camera-agnostic) remains as the effective Phase K feature on MeetUp. A native desktop app using Logi SDK is the only path for motion tracking on this hardware
 
 ## Observability
 - Langfuse v2 (pinned <3.0)

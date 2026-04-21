@@ -16,6 +16,14 @@ TTS_URL = "https://api.openai.com/v1/audio/speech"
 # Module-level persistent client. Created on first use so module import stays cheap.
 _client: httpx.AsyncClient | None = None
 
+# Hard cap on a single TTS response's audio size. Sentences Claude emits
+# are 2-3 short sentences, ~5-50 KB of opus each. A response an order of
+# magnitude larger means the stream misbehaved (malformed Accept header,
+# MITM, bogus OpenAI response) — drop it rather than OOM the process
+# trying to concat it. 4 MB allows ~3-4 min of opus with generous
+# headroom.
+_MAX_TTS_BYTES = 4 * 1024 * 1024
+
 # TTS cache: pre-generated opus audio for frequently-used stock phrases.
 # Populated by prewarm_cache() at session start. synthesize() checks this
 # first and serves the cached bytes instantly (0ms), bypassing the OpenAI
@@ -118,12 +126,24 @@ async def synthesize(text: str, api_key: str, sentence_detected_ts: float | None
             log.error("TTS error %d: %s", resp.status_code, body[:200])
             raise Exception(f"TTS API returned {resp.status_code}: {body[:200]!r}")
 
+        total_bytes = 0
+        aborted = False
         async for chunk in resp.aiter_bytes():
             if first_byte_ts is None and chunk:
                 first_byte_ts = time.monotonic()
+            total_bytes += len(chunk)
+            if total_bytes > _MAX_TTS_BYTES:
+                log.warning(
+                    "TTS response exceeded %d bytes (%d) — aborting stream",
+                    _MAX_TTS_BYTES, total_bytes,
+                )
+                aborted = True
+                break
             chunks.append(chunk)
 
     t_done = time.monotonic()
+    if aborted:
+        raise Exception(f"TTS response exceeded size cap ({_MAX_TTS_BYTES} bytes)")
     audio = b"".join(chunks)
 
     call_to_first_ms = (first_byte_ts - t_call) * 1000 if first_byte_ts else -1

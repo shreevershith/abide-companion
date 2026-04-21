@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Abide Companion — Mac / Linux launcher
+#  Abide Companion — Mac / Linux launcher (native Python)
 #  Run with:  bash start.sh   (or chmod +x start.sh && ./start.sh)
+# ============================================================
+#  Why not Docker: motorized pan/tilt on Logitech MeetUp needs
+#  Windows DirectShow access, which Docker on Windows can't
+#  reach without admin-only USB/IP setup (usbipd-win). To keep
+#  the launcher a true double-click across platforms, we run
+#  the backend natively. See DESIGN-NOTES.md D82 for full
+#  rationale. Note: PTZ only activates on Windows + MeetUp;
+#  on Mac/Linux the rest of the system works identically.
 # ============================================================
 set -e
 
@@ -13,53 +21,57 @@ echo
 # --- 1. Move to this script's folder so relative paths work ---
 cd "$(dirname "$0")"
 
-# --- 2. Verify Docker is running ---
-if ! docker info >/dev/null 2>&1; then
-    echo " ERROR: Docker does not appear to be running."
+# --- 2. Verify Python 3.12+ ---
+if ! command -v python3 >/dev/null 2>&1; then
+    echo " ERROR: python3 is not on PATH."
     echo
-    echo " Please:"
-    echo "   1. Open Docker Desktop (Mac) or start the docker daemon (Linux)"
-    echo "   2. Wait until it is fully ready"
-    echo "   3. Run this script again"
+    echo " Please install Python 3.12 or newer:"
+    echo "   - macOS:  brew install python@3.12   (or https://www.python.org/downloads/)"
+    echo "   - Linux:  sudo apt install python3.12 python3.12-venv   (Debian/Ubuntu)"
     echo
     exit 1
 fi
 
-echo " [1/3] Docker is running."
+PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+echo " [1/4] Python $PY_VER detected."
 
-# --- 3. Build (first run) and start the container ---
-echo " [2/3] Starting Abide Companion container..."
-echo "       First run may take 3-5 minutes while the image builds."
-echo
+# --- 3. Create / reuse a local virtualenv so we never touch system Python ---
+if [ ! -x ".venv/bin/python" ]; then
+    echo " [2/4] Creating virtual environment in .venv/ ..."
+    python3 -m venv .venv
+else
+    echo " [2/4] Using existing virtual environment."
+fi
 
-docker compose up -d --build
+# --- 4. Install dependencies (quiet on repeat runs) ---
+echo " [3/4] Installing / verifying dependencies (first run may take a few minutes)..."
+.venv/bin/python -m pip install --upgrade pip --quiet
+.venv/bin/python -m pip install -r requirements.txt --quiet
 
-# --- 4. Wait a few seconds for uvicorn to bind the port ---
-echo " [3/3] Waiting for the server to come up..."
-sleep 5
+# --- 5. Launch uvicorn in the background so we can also open the browser ---
+echo " [4/4] Starting Abide Companion on http://localhost:8000 ..."
+.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+UVICORN_PID=$!
 
-# --- 5. Open the browser ---
+# --- 6. Wait for port to bind, open browser ---
+sleep 3
 URL="http://localhost:8000"
-echo
-echo " Opening $URL in your browser..."
-
 if command -v open >/dev/null 2>&1; then
-    # macOS
-    open "$URL"
+    open "$URL"            # macOS
 elif command -v xdg-open >/dev/null 2>&1; then
-    # Linux (most distros)
-    xdg-open "$URL" >/dev/null 2>&1 &
+    xdg-open "$URL" >/dev/null 2>&1 &   # Linux
 else
     echo " (Could not auto-open — please visit $URL manually)"
 fi
 
 echo
 echo " ============================================================"
-echo "  Abide Companion is running."
+echo "  Abide Companion is running (pid $UVICORN_PID)."
 echo
-echo "  To STOP the system later, run in this folder:"
-echo "      docker compose down"
-echo
-echo "  Or simply quit Docker Desktop."
+echo "  To STOP: press Ctrl+C in this terminal, or run:"
+echo "      kill $UVICORN_PID"
 echo " ============================================================"
 echo
+
+# Keep the script attached to the uvicorn process so Ctrl+C here stops it cleanly.
+wait "$UVICORN_PID"

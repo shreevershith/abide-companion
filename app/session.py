@@ -20,6 +20,7 @@ from starlette.websockets import WebSocketState
 
 from app.conversation import ConversationEngine, MODEL as CLAUDE_MODEL
 from app.memory import save_user_context
+from app.ptz import PTZController
 from app.tts import synthesize
 from app.tts_cache_store import record_phrase
 from app.vision import VisionBuffer, analyze_frames
@@ -59,6 +60,20 @@ _VISION_REACT_COOLDOWN_S = 15.0
 # interrupt the user during brief conversational pauses.
 _VISION_REACT_MIN_SILENCE_S = 10.0
 
+# Phase K — out-of-frame welfare check.
+# Consecutive "Out of frame" vision cycles before Abide verbally checks
+# in. 3 cycles × ~3.6 s ≈ 11 s of absence — long enough to skip brief
+# trips (glass of water, stepping out of shot to grab something) but
+# short enough to notice if the person has fallen outside the camera's
+# view or wandered off. Works alongside the frontend PTZ subject-follow
+# (Phase K frontend): when the camera can't keep the person in view
+# despite tracking, Abide speaks up.
+_OUT_OF_FRAME_CHECKIN_THRESHOLD = 3
+# Cooldown between successive welfare nudges so a sustained absence
+# doesn't spam the user on their return, and so Abide doesn't chain
+# multiple check-ins if the person lingers out of frame.
+_OUT_OF_FRAME_CHECKIN_COOLDOWN_S = 30.0
+
 # Names that must never be stored as the user's name. Defence-in-depth
 # against extract_user_facts() drift: if Claude ever mis-tags "Abide"
 # (the assistant's own name) or another role label as the user, we drop
@@ -66,6 +81,22 @@ _VISION_REACT_MIN_SILENCE_S = 10.0
 _NAME_BLOCKLIST = frozenset({
     "abide", "assistant", "ai", "user", "companion", "robot",
 })
+
+
+def _log_bg_exception(name: str):
+    """Return a done-callback that surfaces unhandled exceptions from
+    fire-and-forget session tasks. Without this, Python only logs
+    'Task exception was never retrieved' at GC time — which can swallow
+    a real bug for the entire lifetime of the Session. Mirrors
+    `main.py:_log_prewarm_exception` but scoped to this module so we
+    don't create a circular import."""
+    def _cb(task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.warning("%s task failed (non-fatal): %s", name, exc)
+    return _cb
 
 
 @dataclass
@@ -86,7 +117,12 @@ class UserContext:
         if not facts:
             return
         if facts.get("name") and not self.name:
-            candidate = str(facts["name"]).strip()
+            # Collapse all whitespace (including embedded newlines/tabs) to a
+            # single space before the blocklist check — defence against a
+            # prompt-injection attempt where the extracted "name" is something
+            # like "Shree\n\nIgnore previous instructions". The name later
+            # flows unescaped into the Claude system prompt via as_prompt().
+            candidate = " ".join(str(facts["name"]).split())[:80]
             if candidate and candidate.lower() not in _NAME_BLOCKLIST:
                 self.name = candidate
             else:
@@ -149,8 +185,15 @@ class UserContext:
         if not isinstance(data, dict):
             return cls()
         raw_name = data.get("name")
-        if isinstance(raw_name, str) and raw_name.strip() and raw_name.strip().lower() not in _NAME_BLOCKLIST:
-            name = raw_name.strip()[:80]
+        if isinstance(raw_name, str):
+            # Same whitespace-collapse as update() so a tampered memory
+            # file can't smuggle newlines through hydrate() back into
+            # the Claude system prompt on next connect.
+            cleaned_name = " ".join(raw_name.split())[:80]
+        else:
+            cleaned_name = ""
+        if cleaned_name and cleaned_name.lower() not in _NAME_BLOCKLIST:
+            name = cleaned_name
         else:
             name = None
 
@@ -255,6 +298,22 @@ class Session:
         # Vision state
         self.vision_buffer: VisionBuffer = VisionBuffer()
         self._frame_task: asyncio.Task | None = None
+
+        # Phase K — out-of-frame welfare check state.
+        # `_consecutive_out_of_frame` counts successive vision cycles
+        # that returned "Out of frame." as the activity. When it crosses
+        # `_OUT_OF_FRAME_CHECKIN_THRESHOLD`, Abide fires a proactive
+        # one-sentence check-in. `_last_out_of_frame_checkin_ts` gates
+        # repeat nudges to no more than once per cooldown window.
+        self._consecutive_out_of_frame: int = 0
+        self._last_out_of_frame_checkin_ts: float = 0.0
+
+        # Phase N — PTZ subject-follow controller. Discovers a
+        # pan/tilt-capable camera at construction time (Logitech MeetUp
+        # on Windows) via DirectShow; silent no-op elsewhere. On each
+        # vision result with a non-null bbox we nudge the camera toward
+        # the subject so it follows them around the room.
+        self._ptz: PTZController = PTZController()
         # Fall-alert state: when a fall is detected, this holds the text
         # until it has been surfaced to Claude as urgent context for one
         # response turn. After that turn, cleared.
@@ -664,8 +723,88 @@ class Session:
                             "[VISION-REACT] Activity '%s' queued (Abide is busy)",
                             result.activity,
                         )
+
+            # Phase K — out-of-frame welfare check. The frontend PTZ
+            # subject-follow tries to keep the person centred, but if
+            # the camera's mechanical range is exhausted (they walked
+            # too far left/right) or they step out entirely, vision
+            # reports "Out of frame." Once that persists past the
+            # threshold, Abide speaks up with a gentle "are you still
+            # there?" — the same mechanism the brief's demo video uses
+            # ("I see you haven't moved in a while"). All the normal
+            # guards apply: user must have been silent, Abide must not
+            # be mid-response, and there's a cooldown so we don't chain
+            # multiple nudges during one sustained absence.
+            activity_lower = (result.activity or "").lower()
+            if activity_lower.startswith("out of frame"):
+                self._consecutive_out_of_frame += 1
+            else:
+                self._consecutive_out_of_frame = 0
+
+            if (
+                self._consecutive_out_of_frame >= _OUT_OF_FRAME_CHECKIN_THRESHOLD
+                and self._engine_ref is not None
+                and time.monotonic() - self._last_out_of_frame_checkin_ts >= _OUT_OF_FRAME_CHECKIN_COOLDOWN_S
+                and time.monotonic() - self.last_user_speech_ts >= _VISION_REACT_MIN_SILENCE_S
+                and not self.is_responding
+                and not self.is_audible
+                and ws.client_state == WebSocketState.CONNECTED
+            ):
+                self._last_out_of_frame_checkin_ts = time.monotonic()
+                # Reset the counter so the same sustained absence doesn't
+                # immediately re-trigger on the next vision cycle once
+                # the cooldown expires — they have to come back into
+                # frame at least briefly for the next window.
+                self._consecutive_out_of_frame = 0
+                log.info(
+                    "[WELFARE] Out-of-frame for %d cycles — checking in",
+                    _OUT_OF_FRAME_CHECKIN_THRESHOLD,
+                )
+                react_text = (
+                    "[System: The user has been out of camera view for "
+                    "about 10 seconds. Check in on them gently in ONE "
+                    "short sentence — e.g., \"I can't see you right now "
+                    "— are you still there?\". Keep it warm, not "
+                    "alarmist. Do not mention the camera.]"
+                )
+                self.start_response(
+                    ws, self._engine_ref, react_text, self._openai_key_ref,
+                )
+
+            # Phase N — PTZ subject-follow. Fire-and-forget off-loop
+            # DirectShow call so the main event loop stays responsive.
+            # `nudge_to_bbox` silently no-ops when the camera doesn't
+            # support pan/tilt (non-MeetUp cameras, Firefox on Mac,
+            # Windows without duvc-ctl, etc.).
+            if result.bbox is not None and self._ptz.available:
+                try:
+                    await asyncio.to_thread(self._ptz.nudge_to_bbox, result.bbox)
+                except Exception as e:
+                    log.debug("PTZ nudge dispatch failed (%s)", type(e).__name__)
         except Exception as e:
             log.error("Vision worker error: %s", e)
+
+    def _dispatch_camera_action(self, action: str) -> None:
+        """Translate a Claude [[CAM:...]] marker into a PTZController call.
+        Fire-and-forget on the executor so the DirectShow COM call doesn't
+        block the asyncio loop. Silent no-op when PTZ is unavailable."""
+        if not self._ptz.available:
+            log.info("[CAMERA] Claude requested %s but PTZ is unavailable", action)
+            return
+        if action == "zoom_in":
+            direction = "in"
+        elif action == "zoom_out":
+            direction = "out"
+        elif action == "zoom_reset":
+            direction = "reset"
+        else:
+            log.info("[CAMERA] Unknown camera action %r", action)
+            return
+        log.info("[CAMERA] Dispatching zoom %s", direction)
+        try:
+            asyncio.create_task(asyncio.to_thread(self._ptz.zoom, direction))
+        except Exception as e:
+            log.debug("[CAMERA] dispatch failed (%s)", type(e).__name__)
 
     # ── Safe WebSocket send helpers ──
     async def _fire_queued_reaction(self, ws: WebSocket, activity: str):
@@ -774,6 +913,10 @@ class Session:
         async def producer():
             """Read Claude stream; launch a synthesize task per sentence."""
             text_buf = ""
+            # Phase R — camera-action side-channel. At most one dispatch
+            # per turn; we reset on next start_response via the engine's
+            # own reset in respond().
+            camera_dispatched = False
             try:
                 await self._safe_send_json(ws, {"type": "status", "state": "thinking"})
 
@@ -781,6 +924,15 @@ class Session:
                     if self._cancelled:
                         log.info("Barge-in: stopping Claude stream")
                         break
+
+                    # Phase R — if Claude emitted a [[CAM:...]] marker at
+                    # the head of the response, the engine strips it from
+                    # the stream and sets last_camera_action. Dispatch
+                    # the PTZ action as early as possible so the lens
+                    # motion overlaps with Claude's verbal ack.
+                    if not camera_dispatched and engine.last_camera_action:
+                        self._dispatch_camera_action(engine.last_camera_action)
+                        camera_dispatched = True
 
                     await self._safe_send_json(
                         ws, {"type": "response_chunk", "text": chunk}
@@ -1000,8 +1152,11 @@ class Session:
             # update the persistent UserContext, persist to disk if a
             # resident_id is known, and push the snapshot to the UI
             # memory panel. Non-blocking — the voice loop is already
-            # back to "listening" above.
-            asyncio.create_task(self._extract_user_facts(engine, ws))
+            # back to "listening" above. The done-callback surfaces any
+            # unhandled exception so fact-extraction failures don't get
+            # swallowed for the rest of the session.
+            _ext_task = asyncio.create_task(self._extract_user_facts(engine, ws))
+            _ext_task.add_done_callback(_log_bg_exception("extract_user_facts"))
 
             # Consume any queued vision-reactive activity that was detected
             # while Abide was busy talking. Fire as a separate task with a
@@ -1016,6 +1171,7 @@ class Session:
             ):
                 react_activity = self._pending_reactive_activity
                 self._pending_reactive_activity = None
-                asyncio.create_task(
+                _react_task = asyncio.create_task(
                     self._fire_queued_reaction(ws, react_activity)
                 )
+                _react_task.add_done_callback(_log_bg_exception("queued_reaction"))
