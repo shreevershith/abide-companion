@@ -10,6 +10,7 @@ import logging
 import re
 import time
 import httpx
+from app.conversation import APIKeyError
 
 log = logging.getLogger("abide.tts")
 
@@ -184,6 +185,10 @@ async def synthesize(text: str, api_key: str, sentence_detected_ts: float | None
             if resp.status_code != 200:
                 body = await resp.aread()
                 log.error("TTS error %d: %s", resp.status_code, body[:200])
+                if resp.status_code == 401:
+                    raise APIKeyError(
+                        "Please check your OpenAI API key in the settings panel (gear icon)."
+                    )
                 raise Exception(f"TTS API returned {resp.status_code}: {body[:200]!r}")
 
             total_bytes = 0

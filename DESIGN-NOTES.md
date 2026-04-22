@@ -651,6 +651,14 @@ Format for each entry:
 - Alternatives considered: winget (unreliable on pre-1809 Windows 10), PyInstaller single-exe (1-1.5 GB + SmartScreen trips on unsigned builds), embeddable Python zip (strips ensurepip, breaks torch/silero-vad), detect-and-instruct (status quo ante, violates brief).
 - Trade-offs: Requires internet on first run; adds ~30-60 s of cold-start on Windows when Python is missing; macOS install is GUI not silent since Apple provides no sudo-free system-install path; clean "install manually" fallback message on every download/install failure.
 
+### D102. PTZ tilt wide dead-zone to prevent standing-user runaway
+
+- Decision: Added a separate `_TILT_DEAD_ZONE = 0.35` for the y-axis in `app/ptz.py`, leaving `_DEAD_ZONE = 0.15` for pan only.
+- Context: Live session log analysis showed that when the user stands up, MediaPipe places the face+shoulders centroid at y approx 0.13-0.22 (top of frame), giving oy approx -0.35. With the shared 0.15 dead zone, tilt fired every nudge and maxed out at +15 within ~1 s, then stayed pinned. The camera appeared to "keep moving" throughout the standing portion of the session.
+- Root cause: `nudge_to_bbox()` used the same `_DEAD_ZONE` for both axes. The standing-user centroid offset of ~-0.35 greatly exceeds 0.15, so tilt drove to its rail immediately.
+- Fix: `if abs(oy) >= _TILT_DEAD_ZONE` in `nudge_to_bbox()`. At 0.35, tilt only fires when the subject is truly at the extreme edge of frame, not just standing normally. Pan still uses 0.15 for responsive left/right tracking.
+- Trade-offs: Tilt tracking is now essentially dormant for most seated and standing positions. That is intentional for this narrow-range hardware (MeetUp tilt range is only +-15 total). Wider-range PTZ cameras could use a smaller _TILT_DEAD_ZONE.
+
 ### D101. macOS start.command launcher plus Gatekeeper documentation
 - Decision: Ship start.command alongside start.sh as a Finder-double-clickable macOS sibling with identical contents; add .gitattributes forcing LF endings on shell scripts so Windows-committed scripts still run on Mac/Linux; document the one-time Gatekeeper right-click-Open bypass rather than Apple-sign the binaries.
 - Context: macOS Finder opens .sh files in TextEdit on double-click, and every downloaded file gets Gatekeeper-quarantined regardless of format (.app/.command/.pkg/.dmg all blocked) unless Apple-Developer-signed and notarized.

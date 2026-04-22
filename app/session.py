@@ -733,7 +733,9 @@ class Session:
 
             # Fall-alert path: stash for next turn + push a WS alert now.
             if result.is_fall:
-                self._pending_fall_alert = result.activity
+                self._pending_fall_alert = (
+                    result.activity.replace("<", "&lt;").replace(">", "&gt;").replace("\n", " ").strip()
+                )
                 self.stats["fall_count"] += 1
                 log.warning("FALL detected from vision: %s", result.activity)
                 await self._safe_send_json(
@@ -907,7 +909,7 @@ class Session:
         # the text came from. Keep it human-readable (HTML-entity form)
         # so a legit pose-heuristic message still reads naturally when
         # it reaches Claude.
-        safe_text = text.replace("<", "&lt;").replace(">", "&gt;")
+        safe_text = text.replace("<", "&lt;").replace(">", "&gt;").replace("\n", " ").strip()
 
         self._pending_fall_alert = safe_text
         self.stats["fall_count"] += 1
@@ -1013,7 +1015,7 @@ class Session:
                     {"type": "remember_snapshot", "context": self.user_context.snapshot()},
                 )
         except Exception as e:
-            log.debug("User fact extraction skipped: %s", e)
+            log.info("User fact extraction skipped (%s: %s)", type(e).__name__, e)
 
     # The response pipeline can outlive the WebSocket (TTS in flight when the
     # client disconnects). Without these guards, late sends raise
@@ -1025,8 +1027,8 @@ class Session:
             return
         try:
             await ws.send_json(data)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("WS send_json failed (%s)", type(e).__name__)
 
     @staticmethod
     async def _safe_send_bytes(ws: WebSocket, data: bytes):
@@ -1034,8 +1036,8 @@ class Session:
             return
         try:
             await ws.send_bytes(data)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("WS send_bytes failed (%s)", type(e).__name__)
 
     async def _run_response(
         self,
@@ -1331,18 +1333,23 @@ class Session:
             # so raw details never leak to the client. This lets the
             # Claude first-token-timeout path surface the friendly
             # "Give me a moment…" wording the engine defined.
-            from app.conversation import ConversationError
-            if isinstance(e, ConversationError):
+            from app.conversation import ConversationError, APIKeyError
+            if isinstance(e, APIKeyError):
                 user_message = str(e)
+                await self._safe_send_json(
+                    ws,
+                    {
+                        "type": "error",
+                        "message": user_message,
+                        "open_settings": True,
+                    },
+                )
+            elif isinstance(e, ConversationError):
+                user_message = str(e)
+                await self._safe_send_json(ws, {"type": "error", "message": user_message})
             else:
                 user_message = "Something went wrong while I was responding. Let's try again."
-            await self._safe_send_json(
-                ws,
-                {
-                    "type": "error",
-                    "message": user_message,
-                },
-            )
+                await self._safe_send_json(ws, {"type": "error", "message": user_message})
         finally:
             # Drain any TTS tasks still sitting in the queue. On the happy
             # path the consumer already processed everything up to the

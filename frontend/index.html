@@ -1967,6 +1967,10 @@ $startBtn.onclick = async () => {
                 addDiaryEntry(msg.level === "fall" ? "fall" : "alert", msg.text);
             } else if (msg.type === "error") {
                 $error.textContent = msg.message;
+                if (msg.open_settings) {
+                    $keyDrawer.classList.add("open");
+                    stop();
+                }
             } else if (msg.type === "remember_snapshot") {
                 // Server pushed a fresh view of what Abide knows about
                 // the user. Sent on connect after hydrate, and again

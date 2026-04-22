@@ -92,6 +92,13 @@ class ConversationError(Exception):
     """Raised when Claude cannot produce a response. The `message` attribute
     is safe to show to the end user — implementation details are in logs."""
 
+
+class APIKeyError(ConversationError):
+    """Raised when an API call is rejected due to an invalid or missing key.
+    Subclasses ConversationError so session.py's error path handles it, but
+    the frontend distinguishes it by the `open_settings: true` flag to open
+    the key drawer automatically."""
+
 MODEL = "claude-sonnet-4-6"  # Phase P — was "claude-sonnet-4-20250514"; upgraded for ~10-20% faster TTFT + better quality. Revert if eval session shows regression.
 # Phase U.3 follow-up: bumped 20 → 60 so the prompt-cache prefix stays
 # stable across a typical 20-30 min session. With MAX_HISTORY = 20 the
@@ -517,6 +524,10 @@ class ConversationEngine:
                         resp.status_code,
                         body.decode(errors="replace")[:500],
                     )
+                    if resp.status_code == 401:
+                        raise APIKeyError(
+                            "Please check your Anthropic API key in the settings panel (gear icon)."
+                        )
                     raise ConversationError(
                         "I'm having trouble reaching my services. Please try again in a moment."
                     )

@@ -86,7 +86,16 @@ except Exception as e:
 # 0.12 to 0.15 since the S.1 retune made the camera chase small jitter
 # ("we keep moving with the camera" — user quote). For wider-range PTZ
 # cameras (Rally Bar etc.) these values still compute sensible nudges.
-_DEAD_ZONE = 0.15
+#
+# Demo-session fix: when the user stands up, MediaPipe places the
+# face+shoulders centroid at y≈0.13-0.22 (top of frame), giving
+# oy ≈ -0.35. With _DEAD_ZONE=0.15 tilt fires every nudge and
+# immediately maxes at +15, then stays pinned ("camera keeps moving"
+# complaint in live session). Tilt gets its own wider dead zone (0.35)
+# so it only fires when the subject is really at the extreme edge of
+# frame. Pan keeps the tighter 0.15 zone for responsive left/right.
+_DEAD_ZONE = 0.15      # pan x-axis dead zone (fraction of frame width)
+_TILT_DEAD_ZONE = 0.35 # tilt y-axis dead zone — wider to prevent standing-user runaway
 _DELTA_FRACTION = 0.70
 _DAMPING = 0.50
 
@@ -270,14 +279,15 @@ class PTZController:
         pan_span = self._pan_range.max - self._pan_range.min
         tilt_span = self._tilt_range.max - self._tilt_range.min
 
-        # Axis-independent dead-zone: pan and tilt each skip their own
-        # nudge when their own offset is inside the zone. Prevents tilt
-        # from drifting to the rail when pan is doing all the work.
+        # Axis-independent dead-zones: pan uses _DEAD_ZONE (0.15), tilt
+        # uses the wider _TILT_DEAD_ZONE (0.35) so a standing user whose
+        # face+shoulder centroid sits at y≈0.13-0.22 doesn't immediately
+        # pin tilt to its +15 rail.
         if abs(ox) >= _DEAD_ZONE:
             pan_delta = int(round(ox * pan_span * _DELTA_FRACTION * _DAMPING))
         else:
             pan_delta = 0
-        if abs(oy) >= _DEAD_ZONE:
+        if abs(oy) >= _TILT_DEAD_ZONE:
             tilt_delta = int(round(-oy * tilt_span * _DELTA_FRACTION * _DAMPING))
         else:
             tilt_delta = 0

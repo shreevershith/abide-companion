@@ -38,7 +38,7 @@ else:
 
 from app import audio_events
 from app.audio import AudioProcessor, transcribe
-from app.conversation import ConversationEngine, MODEL as CLAUDE_MODEL
+from app.conversation import ConversationEngine, MODEL as CLAUDE_MODEL, APIKeyError
 from app.memory import (
     _ID_RE as _MEMORY_ID_RE,
     delete_user_context,
@@ -125,16 +125,16 @@ async def _on_shutdown() -> None:
     """Flush Langfuse traces and close persistent HTTP clients."""
     try:
         telemetry.flush(telemetry.init_langfuse())
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("Langfuse flush on shutdown failed (%s)", type(e).__name__)
     # Close all module-level persistent httpx clients
     from app.tts import aclose as tts_close
     from app.vision import aclose as vision_close
     for name, closer in [("analyze", _analyze_client.aclose), ("tts", tts_close), ("vision", vision_close)]:
         try:
             await closer()
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Shutdown: closing %s client failed (%s)", name, type(e).__name__)
 
 
 # ── Session analysis endpoint ──
@@ -475,8 +475,20 @@ async def _proactive_checkin_loop(
             log.error("Proactive check-in failed: %s", e)
 
 
+_ALLOWED_ORIGINS = {"http://localhost:8000", "http://127.0.0.1:8000"}
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # Reject cross-origin browser connections. Browsers always send an
+    # Origin header for WebSocket upgrades; curl/wscat/dev scripts don't.
+    # Allowing missing-Origin lets developer tooling through while blocking
+    # a malicious page at http://evil.com from opening ws://localhost:8000/ws
+    # and driving the session (or receiving API keys from the config message).
+    origin = ws.headers.get("origin")
+    if origin and origin not in _ALLOWED_ORIGINS:
+        log.warning("[WS] Rejected connection from disallowed origin: %s", origin)
+        await ws.close(code=1008)  # 1008 = Policy Violation
+        return
     await ws.accept()
     processor = AudioProcessor()
     session = Session()
@@ -1148,16 +1160,42 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         if not session.is_audible:
                             await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
-                    except Exception as e:
-                        # Log the real error server-side but send a safe,
-                        # non-leaky message to the client.
-                        log.error("Transcription failed: %s", e)
+                    except APIKeyError as e:
+                        log.error("Transcription auth error: %s", e)
                         if audio_events_task is not None and not audio_events_task.done():
                             audio_events_task.cancel()
-                        await Session._safe_send_json(ws,{
+                        await Session._safe_send_json(ws, {
                             "type": "error",
-                            "message": "I'm having trouble hearing you right now. Please try again.",
+                            "message": str(e),
+                            "open_settings": True,
                         })
+                    except Exception as e:
+                        # Check for Groq authentication errors (groq SDK raises
+                        # groq.AuthenticationError on 401, which is an httpx-
+                        # based exception whose class name we check here to avoid
+                        # a hard import of the groq package at module level).
+                        type_name = type(e).__name__
+                        if type_name == "AuthenticationError" or (
+                            hasattr(e, "status_code") and getattr(e, "status_code", None) == 401
+                        ):
+                            log.error("Groq authentication error: %s", e)
+                            if audio_events_task is not None and not audio_events_task.done():
+                                audio_events_task.cancel()
+                            await Session._safe_send_json(ws, {
+                                "type": "error",
+                                "message": "Please check your Groq API key in the settings panel (gear icon).",
+                                "open_settings": True,
+                            })
+                        else:
+                            # Log the real error server-side but send a safe,
+                            # non-leaky message to the client.
+                            log.error("Transcription failed: %s", e)
+                            if audio_events_task is not None and not audio_events_task.done():
+                                audio_events_task.cancel()
+                            await Session._safe_send_json(ws,{
+                                "type": "error",
+                                "message": "I'm having trouble hearing you right now. Please try again.",
+                            })
                         if not session.is_audible:
                             await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
 
