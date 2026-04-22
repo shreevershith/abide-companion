@@ -1,0 +1,14 @@
+# Force LF line endings on shell scripts so they run correctly on
+# macOS / Linux even when committed from Windows. Without this, bash
+# on Mac/Linux sees "#!/usr/bin/env bash\r" and reports "bad interpreter"
+# or "command not found" errors that are hard for a non-dev to diagnose.
+start.sh     text eol=lf
+start.command text eol=lf
+*.sh         text eol=lf
+
+# Batch files get CRLF (native Windows convention)
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+
+# Keep Python / web source files in whatever line endings they have;
+# Python is agnostic, browsers handle either.

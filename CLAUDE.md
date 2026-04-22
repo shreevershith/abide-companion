@@ -31,19 +31,52 @@ Must work without developer involvement during first-run and daily use.
 - Conversation: Claude API (claude-sonnet-4-20250514)
 - TTS: OpenAI TTS (tts-1, nova voice, opus format)
 - VAD: silero-vad (runs locally — deliberate latency optimization, no API call)
-- Packaging: native Python 3.12+ in a local `.venv`, launched via `start.bat` / `start.sh` (one double-click, first-run creates venv + pip installs). Docker was dropped in Phase N (D82) because its WSL2 backend on Windows can't reach DirectShow, which blocks MeetUp pan/tilt control.
+- Packaging: native Python 3.12+ in a local `.venv`, launched via `start.bat` (Windows) / `start.command` (macOS, Finder double-click) / `start.sh` (Linux). One double-click per OS; first-run creates venv + pip installs. Docker was dropped in Phase N (D82) because its WSL2 backend on Windows can't reach DirectShow, which blocks MeetUp pan/tilt control.
 
 ## First-Run Experience (CRITICAL)
 End users install and run with zero technical knowledge.
 Acceptable steps:
-1. Install Python 3.12+ (one link, one installer)
-2. Double-click start.bat
-3. Browser opens automatically
-4. Enter API keys in browser UI
-5. Click Start
+1. Double-click the launcher for the OS:
+   - Windows: `start.bat`
+   - macOS:   `start.command`  *(NOT `start.sh` — Finder treats
+              `.sh` as text and opens it in TextEdit)*
+   - Linux:   `start.sh` (or `bash start.sh` from a terminal)
+2. Browser opens automatically
+3. Enter API keys in browser UI
+4. Click Start
+
+If Python 3.12+ is missing, the launcher auto-installs it (D100):
+- Windows: per-user silent install via the official python.org
+  installer (`InstallAllUsers=0 PrependPath=0`, no admin, no UAC,
+  no PATH checkbox the user has to tick). Launcher references
+  the resulting `%LocalAppData%\Programs\Python\Python312\python.exe`
+  by absolute path.
+- macOS: downloads the official `.pkg` and opens the Apple
+  Installer GUI — user clicks Continue and enters admin password
+  once. Launcher resumes automatically after the installer closes.
+- Linux: no generic silent path across distros (`apt`/`dnf`/`pacman`
+  all need sudo), so the launcher prints the one-line command for
+  the user's distro and exits. Python 3.12 is already present on
+  most modern desktop Linux installs.
+
+macOS Gatekeeper (documented, not bypassed):
+- First double-click of `start.command` after download shows
+  *"cannot be opened because it is from an unidentified developer."*
+  This is Apple policy for any unsigned third-party app.
+- User bypass is one-time: right-click `start.command` in Finder
+  → Open → confirm "Open". Every subsequent launch is silent.
+- Eliminating the prompt entirely requires a paid Apple Developer
+  account ($99/year) + `codesign` + notarization. Chose not to
+  pay it for this build; one-time right-click is the documented
+  first-run cost. Same applies to any unsigned PyInstaller `.app`
+  or `.dmg` we might ship — file format doesn't matter, the
+  quarantine attribute + signature check is what matters.
+- `.gitattributes` forces LF line endings on `start.sh`/`start.command`
+  so bash scripts committed from Windows still run on macOS/Linux.
 
 NOT acceptable:
 - Any terminal commands after initial setup
+- Settings changes (PATH, environment variables, registry, etc.)
 - Installing dependencies manually
 - Multiple steps beyond the above
 
@@ -152,6 +185,7 @@ Implementation: `diaryEntries[]` array + `renderDiaryEntry()` + `switchTab()` in
 39. ✅ Stall-resilience bundle after live session `abide-63d2e9245567` saw three Anthropic-side stalls (4 s / 12 s / 17 s with `in=None out=None`, never received `message_start`) that read as "Abide is dead" to the user: (a) **Claude first-token deadline** — `asyncio.timeout(15.0)` around the stream setup + first-token wait in `conversation.py`; once first text_delta arrives `timeout_cm.reschedule(None)` disables the deadline so the rest of the response runs unrestricted. On timeout: WARNING log + `ConversationError` with user-safe message "Give me a moment — trouble reaching my services, try again." (b) **TTS first-byte deadline** — same pattern, 10 s cap in `tts.py`; timeout returns empty bytes so the consumer skips the sentence cleanly. (c) **Stall detector** — any Claude response ending with `out_tokens=None` and `total_ms > 5000` is now logged at WARNING with `[STALL]` prefix so these cases are greppable across sessions. (d) **`ConversationError` message now passes through to the UI** — previously Session's except clause hardcoded a generic "Something went wrong" string, hiding the specific friendly message. (e) **YAMNet windows capped at 3** (was 5) — classifier now scans only the first 1.5 s of audio per utterance instead of up to 3.5 s; trims 1-2 s of TTFA drag on longer utterances since the `speech_end → _run_response started` anchor (shipped in D96) showed YAMNet processing time was overflowing STT on long inputs. Cough/sneeze/gasp events reliably live in the first window anyway (coughs interrupt, they don't happen mid-sentence). (f) **Frontend "Still thinking…" escalation** — after 3 s in the thinking/processing state with no audio, the status pill label softens so silence doesn't read as "dead". Cleared on any state transition. (Phase U.3 follow-up #4, D97)
 40. ✅ **YAMNet pre-load on connect** — `audio_events.prewarm()` new public coroutine wraps `_load_once()` in `asyncio.to_thread`; fired from main.py's connect-time prewarm fan-out alongside Claude / TTS / Vision prewarms. Prior behaviour: tflite interpreter lazy-loaded inside the first `classify_segment()` call, paying ~600-900 ms of model+tensor init inside the TTFA window of turn 1. Live session `abide-a1265a3e45be` first-turn `speech_end → _run_response started = 2532 ms` confirmed the hypothesis; subsequent turns were 1100-1900 ms. Eager load in the connect-to-first-utterance window moves the cost out of the user-visible critical path. No API key required (model is local). Unconditionally runs even when `openai_key` is missing. Conscious decision to NOT ship streaming TTS-chunks-to-WS: frontend uses `decodeAudioData` which requires complete Ogg-opus containers, so streaming chunks to the client doesn't enable progressive playback — the ~100-200 ms savings would require switching `response_format` to `pcm` + AudioWorklet progressive playback, which is a major architecture change incompatible with the "small polish" framing for the demo milestone. Documented in write-up as a considered tradeoff. (Phase U.3 follow-up #5, D98)
 41. ✅ **Pre-demo security + robustness sweep** — eight findings from a parallel security / performance / error-handling review, all shipped: (a) `<>` escape symmetry on the vision path — `SceneResult.activity` and `.motion_cues` now pass through the same `&lt;`/`&gt;` replacement that `handle_client_fall` has always used, closing the `</camera_observations>` injection gap if the vision model ever emitted a closing-tag lookalike. (b) `start.bat` / `start.sh` bind uvicorn to `127.0.0.1` (was `0.0.0.0`) so the WebSocket + `/api/analyze` endpoints aren't exposed to the LAN — Abide runs on the user's own machine, loopback is all we need. (c) The `ERROR:abide.session:Response pipeline error:` empty-string log at session shutdown now logs `"%s: %r", type(e).__name__, e` so the type is visible even when `str(e) == ""` (e.g. `anyio.ClosedResourceError`). (d)–(g) `add_done_callback` on four background tasks that previously had none: `checkin_task`, `audio_events_task`, `_frame_task`, and the executor future for `save_user_context`. Surfaces disk-full / permission / schedule-side exceptions that would otherwise disappear at GC time with Python's generic "Task exception was never retrieved" message. (h) Replaced the discard-only lambda on the Langfuse connectivity-probe task with `_log_prewarm_exception("Langfuse probe")` for consistency with the rest of the prewarm fan-out. None of these change the happy path; all make failure modes visible. (Phase U.3 follow-up #6, D99)
+42. ✅ **Zero-config Python auto-install** — the launcher previously detected missing Python and told the user to install it from python.org with the *"Add python.exe to PATH"* checkbox ticked. That's configuration disguised as instructions, and Ruben's brief rules it out (no Settings changes, no checkboxes, no terminal). `start.bat` now downloads the official python.org installer via `curl` and runs it with `/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0` — per-user, no admin, no UAC prompt, no PATH pollution. Launcher references the resulting `%LocalAppData%\Programs\Python\Python312\python.exe` by absolute path. `start.sh` on macOS downloads the official `.pkg` and `open -W`s the Apple Installer GUI (one admin-password prompt, user clicks Continue through 3 screens); on Linux it falls back to a one-line `apt`/`dnf`/`pacman` instruction since every silent path needs sudo. First-run adds ~30-60 s on Windows when Python is missing; zero extra time if Python is already present. Considered + rejected: winget (unreliable on older Win10), PyInstaller single-exe (1+ GB due to torch, Windows SmartScreen false positives on unsigned builds), embeddable Python zip (breaks torch install). (Phase V, D100)
 
 ## Never Do
 - Use React, Vue, or any frontend framework
@@ -183,7 +217,9 @@ abide-companion/
 ├── DESIGN-NOTES.md
 ├── TROUBLESHOOTING.md
 ├── start.bat            # Windows launcher — creates .venv, pip install, uvicorn, opens browser
-├── start.sh             # Mac/Linux equivalent
+├── start.command        # macOS launcher (Finder double-click compatible)
+├── start.sh             # Linux / developer launcher (same flow)
+├── .gitattributes       # Forces LF on start.sh/start.command so bash works on Mac/Linux
 ├── requirements.txt     # Python deps incl. duvc-ctl on Windows for PTZ
 ├── README-SETUP.txt
 ├── .env                 # Langfuse keys only (developer-only)

@@ -4,6 +4,44 @@ A running record of bugs encountered while building Abide Companion — **when**
 
 ---
 
+## 30. "What if Python isn't installed?" — zero-config auto-install (Phase V / D100)
+
+**When**: Final pre-demo review. Walking through `start.bat` as an imagined non-technical user: *double-click → see "ERROR: Python is not on PATH" → read three-step install instructions → click link to python.org → run installer → remember to tick "Add python.exe to PATH" → re-run start.bat.* That's seven steps, one of them a UI checkbox with a consequence the user doesn't understand. The brief explicitly forbids this ("no terminal commands, no Settings changes") and the evaluator confirmed the bar. We had a gap.
+
+**Why it was like that**: Earlier in the project we'd added the detect-and-instruct branch as a defensive measure when Python wasn't found. At the time it was the simplest thing that preserved the happy path — if Python was already installed, the launcher worked; if not, we'd tell the user what to do. That's fine for a developer audience, wrong for the audience we actually have.
+
+**How we fixed it**:
+
+- **Windows** (`start.bat`): if `where python` fails or returns a version <3.12, the launcher now `curl`s the official python.org installer and runs it with `/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0 Include_doc=0`. `InstallAllUsers=0` means per-user install (no admin, no UAC). `PrependPath=0` means we do not touch the user's PATH — the launcher references the resulting `%LocalAppData%\Programs\Python\Python312\python.exe` by absolute path for the rest of the run. `curl` has been built into Windows 10+ since the 1803 update, so no extra dependency.
+- **macOS** (`start.sh`): downloads the official `.pkg` from python.org to `/tmp/` and `open -W`s it. The Apple Installer GUI opens; user clicks Continue through three screens and enters their admin password once. `open -W` makes the shell wait for the installer to close before continuing. Post-install we re-check `python3 --version` and resume the normal flow.
+- **Linux** (`start.sh`): no silent path exists (`apt`/`dnf`/`pacman` all need sudo), so we print a one-line per-distro install command (`sudo apt install python3.12 python3.12-venv`, `sudo dnf install python3.12`, `sudo pacman -S python`) and exit. Modern desktop Linux usually has Python 3.12 pre-installed.
+
+All three paths fall through to a clear "install Python 3.12 manually from https://www.python.org/downloads/" error if auto-install can't proceed (no internet, proxy blocking python.org, installer exit code ≠ 0). The failure mode is instructive, not silent.
+
+**What the user sees now on a fresh Windows machine**:
+1. Download the Abide ZIP, extract it.
+2. Double-click `start.bat`.
+3. Console: *"No Python 3.12+ detected. Installing automatically..."*
+4. ~30 s later: *"[1/4] Python 3.12.7 ready."*
+5. ~3–5 min later (first-run pip install): browser opens.
+
+Zero terminal commands. Zero Settings changes. Zero checkboxes.
+
+**What we didn't do, and why**: We considered (a) `winget install Python.Python.3.12`, rejected because it's unreliable on older Windows 10 builds; (b) PyInstaller single-`.exe`, rejected because the output would be ~1–1.5 GB due to torch/CUDA and unsigned builds trip Windows SmartScreen; (c) shipping Python's embeddable zip alongside the repo, rejected because it strips `ensurepip` and `torch` has a history of failing against embeddable Python on Windows. DESIGN-NOTES.md D100 has the full trade-off record.
+
+**Files touched**: `start.bat`, `start.sh`, `README.md`, `README-SETUP.txt`, `CLAUDE.md`, `DESIGN-NOTES.md`.
+
+**Addendum — macOS: `.sh` double-click opens TextEdit; Gatekeeper blocks any unsigned launcher.** Walking the same user flow on macOS surfaced two additional gaps. (a) Finder treats a `.sh` file as plain text and opens it in TextEdit on double-click; the user would have to right-click → Open With → Terminal, which is a Settings-style interaction. (b) Any file downloaded from the internet carries the `com.apple.quarantine` extended attribute, and Gatekeeper refuses to run it on first launch with *"cannot be opened because it is from an unidentified developer"* unless the file is Apple-Developer-signed and notarized. No file format bypasses this — `.app`, `.command`, `.pkg`, `.dmg`, and PyInstaller bundles all hit the same wall without a $99/year Apple Developer account.
+
+**Shipped**:
+- **Added `start.command`** as a sibling to `start.sh` (identical content). macOS Finder recognizes the `.command` extension and double-clicks run it in Terminal. Linux users and developers keep `start.sh`.
+- **Added `.gitattributes`** that forces LF line endings on `start.sh` and `start.command`. Without this, a Mac user who extracts a ZIP built on Windows would see `/usr/bin/env: 'bash\r': No such file or directory` — a cryptic bash error caused by Windows CRLF line endings — and have no way to recover without dev tools.
+- **Documented the Gatekeeper prompt as a one-time bypass** in README.md, README-SETUP.txt, and CLAUDE.md: *right-click start.command → Open → click Open on the confirmation dialog.* Subsequent launches are silent. Chose not to sign + notarize because (a) $99/year for an eval-phase project is the wrong trade-off, (b) the one-time right-click is a widely-understood macOS interaction, and (c) no other unsigned path (py2app bundle, PyInstaller, bespoke `.pkg`) avoids the same prompt without signing anyway.
+
+**Files touched** (addendum): `start.command` (new), `.gitattributes` (new), `README.md`, `README-SETUP.txt`, `CLAUDE.md`, `DESIGN-NOTES.md`.
+
+---
+
 ## 29. Pre-demo security + robustness review — 8 findings, all shipped (Phase U.3 follow-up #6)
 
 **When**: Final review before the Ruben demo. Ran three parallel reviews (security / performance / error-handling) as one "honest pass before shipping" — all found things worth fixing, none catastrophic.
@@ -236,7 +274,7 @@ D86's planning referenced the older 1024 number. With `SYSTEM_PROMPT` at ~484 to
 1. Our `system` field was an array of two blocks: a static `SYSTEM_PROMPT` block with `cache_control` (~484 tokens), and a dynamic block holding the per-turn context (time of day, user facts, vision observations). Anthropic's minimum cacheable prefix on Sonnet is 1024 tokens; `SYSTEM_PROMPT` alone is below threshold so the cache never wrote.
 2. Even if we had added a second cache breakpoint deeper into the prefix (on the conversation history, say), it would still never hit — the dynamic system block changed every turn, invalidating every prefix position that came *after* it. Anything past the dynamic block had a fresh key on every turn.
 
-**How we fixed it**: Moved dynamic context out of the `system` array entirely and into the head of the newest user message, wrapped in `<turn_context>…</turn_context>` delimiters so Claude can tell ambient context from user speech. The `system` array is now one static block. Added a second cache breakpoint on `messages[-2]` (the previous completed turn's assistant reply) by converting its string content to a one-element content-block list with `cache_control: ephemeral`. The cached prefix is now `[SYSTEM_PROMPT + all turns up through the previous assistant reply]` — stable turn-over-turn. Once that crosses 1024 tokens (turn ~3–5), every subsequent turn reads the bulk of the prefix from cache. Verifiable via `cache_read_tokens > 0` in the `[TIMING] Claude response complete` log.
+**How we fixed it**: Moved dynamic context out of the `system` array entirely and into the head of the newest user message, wrapped in `<turn_context>…</turn_context>` delimiters so Claude can tell ambient context from user speech. The `system` array is now one static block. Added a second cache breakpoint on `messages[-2]` (the previous completed turn's assistant reply) by converting its string content to a one-element content-block list with `cache_control: ephemeral`. The cached prefix is now `[SYSTEM_PROMPT + all turns up through the previous assistant reply]` — stable turn-over-turn. Initial expectation here was 1024 tokens (turn ~3–5), but this was later corrected in entry #23 for Sonnet 4.6's 2048-token threshold (observed cache activation around turn ~15+). Verifiable via `cache_read_tokens > 0` in the `[TIMING] Claude response complete` log.
 
 **Files touched**: `app/conversation.py`. Documented inline; cross-referenced in [DESIGN-NOTES.md](DESIGN-NOTES.md) *Latency engineering* section.
 
@@ -609,11 +647,11 @@ Also pinned `CHUNK_SIZE = 2048` on the frontend to give the worklet a stable, pr
 
 ## Open items / known limitations
 
-- **Echo suppression is heuristic**, not acoustic. If the user's environment is unusually reverberant or uses loud speakers, the 300ms cooldown + 400ms sustained threshold may still let some phantom barge-ins through. Proper fix would be hardware AEC (Logitech MeetUp has it built in) or WebRTC's `RTCAudioProcessor`. Out of scope for this build.
+- **Echo suppression is heuristic**, not acoustic. If the user's environment is unusually reverberant or uses loud speakers, phantom barge-ins can still happen. Current defaults are MeetUp-tuned (150ms sustained + 4 loud windows) and should be reverted to 400ms + 6 loud windows on non-AEC laptop setups. Proper long-term fix would be a dedicated AEC DSP (`RTCAudioProcessor` or equivalent).
 - **Barge-in partial history** saves whatever Claude had streamed before the cut-off, but only full sentences were actually spoken aloud. Claude's history may therefore include text the user never heard. Acceptable tradeoff for now — keeps Claude from repeating itself, and the "unheard" portion is usually just the last half-sentence.
 - **`verbose_json` + confidence filter now in place** (Fix #10). Previously listed as an open item; superseded. The same response also carries per-segment `language`, so the Phase 7 language-detection TODO is closed too.
 - **Session summary analysis depends on Anthropic API availability.** If the API call fails at session end, the rest of the summary (duration, transcript, activity log) still renders — only the "Right / Wrong" section shows a fallback message. Non-blocking by design.
-- **Diary tab accumulates many entries in long sessions** (~one vision entry every 3.6s = ~250 entries in a 15-minute session). Scrollable and performant at this scale, but a production system would benefit from debouncing identical consecutive observations.
+- **Diary tab accumulates many entries in long sessions** (~one vision entry every 2.4s = ~375 entries in a 15-minute session). Scrollable and performant at this scale, but a production system would benefit from debouncing identical consecutive observations.
 
 ---
 

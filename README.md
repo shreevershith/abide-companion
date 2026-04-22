@@ -2,7 +2,7 @@
 
 A real-time multimodal AI companion for elderly care. Abide listens, watches, and talks back — a voice conversation loop with always-on vision that describes the user's current activity, draws a bounding box around them in the live video, detects falls, and gently checks in when something looks wrong.
 
-It runs on one machine as a native Python app. Double-click `start.bat` (or `start.sh`), the browser opens, enter three API keys, click **Start**, and talk. On Windows with a Logitech MeetUp, saying *"zoom in / out / reset"* moves the camera's optical zoom; MeetUp firmware does not expose mechanical pan/tilt — see [DESIGN-NOTES.md](DESIGN-NOTES.md) *The PTZ saga* for the story.
+It runs on one machine as a native Python app. Double-click `start.bat` on Windows, `start.command` on macOS (or `start.sh` on Linux), the browser opens, enter three API keys, click **Start**, and talk. On Windows with a Logitech MeetUp, saying *"zoom in / out / reset"* moves the camera's optical zoom; pan/tilt availability is detected per session and may vary by firmware/session conditions — see [DESIGN-NOTES.md](DESIGN-NOTES.md) decisions D79-D88.
 
 ---
 
@@ -88,9 +88,9 @@ It runs on one machine as a native Python app. Double-click `start.bat` (or `sta
                      |  [[CAM:zoom_in]] marker in reply
                      v
               +----------------+
-              | PTZController  |   Windows + MeetUp only
-              | duvc-ctl  -->  |   optical zoom (no pan/tilt
-              | DirectShow     |   on MeetUp firmware)
+              | PTZController  |   Windows + MeetUp
+              | duvc-ctl  -->  |   optical zoom; pan/tilt
+              | DirectShow     |   conditional per session
               +----------------+
 ```
 
@@ -112,7 +112,7 @@ All API calls (Claude, OpenAI, Groq) use persistent `httpx.AsyncClient`s with HT
 | Session analysis | Anthropic Claude (one-shot call at session end) |
 | Telemetry | Langfuse v2 (optional, graceful no-op if missing) |
 | Camera control | `duvc-ctl` (Windows DirectShow) — optical zoom on MeetUp |
-| Packaging | Native Python 3.12+ in `.venv`, launched via `start.bat` / `start.sh` |
+| Packaging | Native Python 3.12+ in `.venv`, launched via `start.bat` (Win) / `start.command` (Mac) / `start.sh` (Linux) |
 
 ---
 
@@ -122,11 +122,18 @@ All API calls (Claude, OpenAI, Groq) use persistent `httpx.AsyncClient`s with HT
 
 Follow [`README-SETUP.txt`](README-SETUP.txt). In short:
 
-1. Install [Python 3.12+](https://www.python.org/downloads/) (check *"Add python.exe to PATH"* on Windows)
-2. Double-click `start.bat` (Windows) or `start.sh` (Mac / Linux)
+1. Double-click the launcher for your OS:
+   - **Windows** — `start.bat`
+   - **macOS** — `start.command` *(not `start.sh`; macOS Finder treats `.sh` as text and will open it in TextEdit)*
+   - **Linux** — `start.sh` (run from terminal: `bash start.sh`)
+2. If Python 3.12+ isn't already installed, the launcher auto-installs it — per-user on Windows (no admin, no UAC, no PATH checkbox), via the official Apple Installer on macOS (one admin-password prompt). See [DESIGN-NOTES.md D100](DESIGN-NOTES.md).
 3. First run creates `.venv` and pip-installs dependencies (~3–5 min). Later runs start in seconds.
 4. Browser opens at `http://localhost:8000`
 5. Click the gear icon, paste your three API keys, click **Start**
+
+**macOS first-run Gatekeeper prompt.** The first time you double-click `start.command`, macOS may refuse to run it with *"cannot be opened because it is from an unidentified developer."* This is Apple's policy for any unsigned third-party app — not a code problem. Bypass it once: **right-click `start.command` in Finder → Open → click Open** on the confirmation dialog. Every future launch is a silent double-click. This is the one-time cost of not paying Apple $99/year for Developer ID signing; see [DESIGN-NOTES.md D100](DESIGN-NOTES.md) for the trade-off record.
+
+On Linux, `apt` / `dnf` / `pacman` all need `sudo`, so there's no clean silent path — if Python 3.12 isn't already present the launcher prints the one command your distro needs and exits. Every modern desktop Linux has Python 3.12 available through its package manager.
 
 ### Developer / manual
 
@@ -165,7 +172,7 @@ abide-companion/
 │   ├── audio.py            silero-vad + Groq Whisper STT + hallucination filters
 │   ├── conversation.py     Claude streaming via direct httpx (not SDK)
 │   ├── tts.py              OpenAI TTS streaming via direct httpx
-│   ├── vision.py           GPT-4o-mini multi-frame vision (JSON bbox output)
+│   ├── vision.py           GPT-4.1-mini multi-frame vision (JSON bbox output)
 │   ├── ptz.py              DirectShow camera control via duvc-ctl (Windows)
 │   ├── memory.py           Per-resident UserContext persistence (cross-session)
 │   ├── tts_cache_store.py  Persistent phrase-frequency counter (auto-prewarm)
@@ -173,7 +180,8 @@ abide-companion/
 ├── frontend/
 │   └── index.html          Entire UI: conversation + diary + summary + overlay
 ├── start.bat               Windows launcher: .venv + pip + uvicorn + open browser
-├── start.sh                Mac / Linux equivalent
+├── start.command           macOS launcher (Finder double-click): same flow as start.sh
+├── start.sh                Linux / developer launcher
 ├── requirements.txt
 ├── .env.example            Template for optional Langfuse env vars
 ├── README.md               This file
@@ -196,7 +204,7 @@ server       downsample to 16 kHz, silero-vad (512-sample windows)
      |
      |   speech segment as WAV on speech_end
      v
-Groq Whisper (STT, verbose_json, temperature=0, language=en)
+Groq Whisper (STT, verbose_json, temperature=0, language auto-detect)
      |
      |   confidence filter + hallucination blocklist
      v
@@ -219,7 +227,7 @@ browser      Web Audio API, sequential FIFO playback
 - Parallel TTS via HTTP/2 multiplexing over one connection
 - Connection prewarm on WebSocket open (HEAD to each API)
 - silero-vad runs locally — no API call on the critical path
-- Anthropic prompt caching (Phase O + R) — cached prefix `[system + prior turns]` kicks in from turn ~3–5
+- Anthropic prompt caching (Phase O + S.2) — cached prefix activates around turn ~15+ on Sonnet 4.6 (2048-token threshold)
 
 ---
 
@@ -229,7 +237,7 @@ Independent from the voice loop, fire-and-forget:
 
 1. Browser captures one JPEG every 1.2 s; ring buffer holds last 2 frames.
 2. Every 2nd capture, the 2-frame batch is sent to the server.
-3. Server sends to GPT-4o-mini with a structured JSON prompt.
+3. Server sends to GPT-4.1-mini with a structured JSON prompt.
 4. Response: `motion_cues` (chain-of-thought grounding), `activity` (≤10 words), `noteworthy` flag, bounding box.
 5. Scene chip + canvas overlay render on the frontend.
 6. Last 5 scene descriptions (with relative timestamps) get injected into Claude's system prompt.
@@ -307,7 +315,7 @@ Full per-stage histograms are in the Langfuse session summary trace. `scripts/sm
 
 Abide runs on the user's own machine. It's single-tenant, localhost-only, not a service. Under that threat model, we've explicitly audited and hardened:
 
-- **Loopback bind** — `start.bat` / `start.sh` bind uvicorn to `127.0.0.1`, not `0.0.0.0`. Neither the WebSocket endpoint nor `/api/analyze` is reachable from the LAN.
+- **Loopback bind** — `start.bat` / `start.command` / `start.sh` bind uvicorn to `127.0.0.1`, not `0.0.0.0`. Neither the WebSocket endpoint nor `/api/analyze` is reachable from the LAN.
 - **API key handling** — the three user-supplied keys (Groq / Anthropic / OpenAI) live only in browser `localStorage` and transit the WebSocket once per session. The server never writes them to disk or logs them in plaintext; the `Config received` line masks to `"set"/"missing"` only. Langfuse keys (developer-only, optional) sit in `.env` (gitignored).
 - **Prompt-injection defences** — vision-model output, user-provided name, topics, and mood signals, and client-side `fall_alert` text all go through a defence-in-depth pipeline: `<camera_observations>` / `<audio_events>` / `<turn_context>` delimited blocks in Claude's prompt, with `&lt;` / `&gt;` escape on every user-controlled string before concatenation. A name-injection blocklist drops `"abide" / "assistant" / "ai" / "user" / "companion" / "robot"` before they reach the system prompt, and the fact-extraction call is instructed never to extract "Abide" as the user's name. The `[[CAM:...]]` camera-action marker is only ever set from Claude's own output via a strict regex + action allowlist; there is no input path that can inject one from user data.
 - **Input validation on every WebSocket message type** — `frames` (JPEG b64 char class + size cap + 8-frame batch cap), `face_bbox` (exactly 4 floats in [0, 1], rejects bool-masquerading-as-int), `fall_alert` (string, truncated to 200 chars, then HTML-escaped), `config` (sample rate + timezone offset range-checked), audio PCM (multiple-of-4 byte check). A malformed message is dropped silently; nothing can crash the handler.
@@ -322,7 +330,7 @@ Abide runs on the user's own machine. It's single-tenant, localhost-only, not a 
 
 - **Pan/tilt on MeetUp is conditional and stability-TBD.** Firmware 1.0.244 consistently probes as `Pan: ok=False / Tilt: ok=False`. Firmware 1.0.272 has been observed returning both `ok=True` (with `pan=[-25,25] / tilt=[-15,15]`) AND `ok=False` across different sessions — we don't yet have a clean explanation for the difference. Per-session capability detection (`PTZController.axes_available`) is now baked into Claude's system prompt so the assistant only promises what the current hardware actually supports. Zoom (`[100, 500]`) works on every MeetUp we've tested. See [DESIGN-NOTES.md](DESIGN-NOTES.md) *The PTZ saga* + *Phase S*.
 - **Barge-in is ~150 ms on MeetUp / ~420 ms on laptop** — the MeetUp number depends on its hardware AEC.
-- **Vision bounding boxes are approximate** — GPT-4o-mini spatial grounding is "close" not "precise".
+- **Vision bounding boxes are approximate** — GPT-4.1-mini spatial grounding is "close" not "precise".
 - **Fall detection is prototype-grade** — no emergency dispatch. Abide offers to call someone; it does not dial anyone.
 - **Conversation history caps at 60 messages** — about 30 turns. Bumped from 20 after a live session showed the sliding-window truncation was invalidating prompt-cache reads on every turn; 60 keeps the cached prefix stable across a realistic 20–30 min session.
 - **Language handling** — Whisper now auto-detects (Phase U.1); Claude 4.6 is multilingual so replies come back in the detected language. English is the tested default; other languages work per Whisper's coverage.

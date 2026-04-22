@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Abide Companion — Mac / Linux launcher (zero-config, native Python)
-#  Run with:  bash start.sh   (or chmod +x start.sh && ./start.sh)
+#  Abide Companion — macOS launcher (zero-config, native Python)
+#  Double-click this file in Finder. On first run macOS may say
+#  "cannot be opened because it is from an unidentified developer"
+#  — right-click this file once and choose Open, then click Open
+#  on the confirmation dialog. After that, every future launch is
+#  silent and a normal double-click works.
+#
+#  (File extension is .command, not .sh, so Finder knows to run
+#  this in Terminal on double-click. Linux users: use start.sh.)
 # ============================================================
 #  First-run UX bar (from the brief):
-#    - no terminal commands (beyond the one that runs this script)
+#    - no terminal commands
 #    - no manual dependency install
-#    - no package-manager setup where possible
+#    - no Settings changes beyond the one-time Gatekeeper bypass
+#      above, which Apple requires for any unsigned app
 #
 #  If Python 3.12+ is missing on macOS, we download the official
 #  Apple Installer .pkg from python.org and open it via the
 #  Installer GUI. The user clicks Continue a few times and enters
 #  their admin password once; the installer handles everything
 #  else. We then continue automatically.
-#
-#  On Linux there is no generic silent-install path across distros
-#  (apt / dnf / pacman all need sudo), so we fall back to clear
-#  per-distro install instructions. For most modern Linux installs
-#  Python 3.12 is already present.
 #
 #  Why not Docker: WSL2 can't reach DirectShow for PTZ on Windows,
 #  so we dropped Docker for cross-platform consistency. See
@@ -43,47 +46,32 @@ PYTHON_BIN=""
 if have_python_312; then
     PYTHON_BIN="python3"
 else
-    OS="$(uname -s)"
-    if [ "$OS" = "Darwin" ]; then
-        # macOS — download the official .pkg and open the GUI installer.
-        # One admin-password prompt; no terminal config.
-        PKG_URL="https://www.python.org/ftp/python/3.12.7/python-3.12.7-macos11.pkg"
-        PKG_PATH="/tmp/abide-python-3.12.7.pkg"
-        echo " No Python 3.12+ detected. Downloading the official installer..."
-        echo " (one-time, ~45 MB; the Apple Installer will open when ready)"
+    # macOS — download the official .pkg and open the GUI installer.
+    # One admin-password prompt; no terminal config.
+    PKG_URL="https://www.python.org/ftp/python/3.12.7/python-3.12.7-macos11.pkg"
+    PKG_PATH="/tmp/abide-python-3.12.7.pkg"
+    echo " No Python 3.12+ detected. Downloading the official installer..."
+    echo " (one-time, ~45 MB; the Apple Installer will open when ready)"
+    echo
+    if ! curl --fail --location --silent --show-error -o "$PKG_PATH" "$PKG_URL"; then
         echo
-        if ! curl --fail --location --silent --show-error -o "$PKG_PATH" "$PKG_URL"; then
-            echo
-            echo " ERROR: could not download Python installer."
-            echo " Check your internet connection, then re-run this file."
-            echo " Or install Python 3.12 manually from:"
-            echo "     https://www.python.org/downloads/"
-            exit 1
-        fi
-        echo " Opening installer — please click through and enter your admin password."
-        # -W waits for the installer to close before we continue
-        open -W "$PKG_PATH"
-        rm -f "$PKG_PATH"
-        if have_python_312; then
-            PYTHON_BIN="python3"
-        else
-            echo
-            echo " ERROR: Python 3.12 install was not detected after the installer closed."
-            echo " Please install Python 3.12 manually from:"
-            echo "     https://www.python.org/downloads/"
-            exit 1
-        fi
+        echo " ERROR: could not download Python installer."
+        echo " Check your internet connection, then re-run this file."
+        echo " Or install Python 3.12 manually from:"
+        echo "     https://www.python.org/downloads/"
+        exit 1
+    fi
+    echo " Opening installer — please click through and enter your admin password."
+    # -W waits for the installer to close before we continue
+    open -W "$PKG_PATH"
+    rm -f "$PKG_PATH"
+    if have_python_312; then
+        PYTHON_BIN="python3"
     else
-        # Linux — no generic silent path, so point the user at their
-        # distro's package manager. Python 3.12 is usually one command.
-        echo " ERROR: Python 3.12+ is not installed."
         echo
-        echo " Please install it for your distribution:"
-        echo "   Debian / Ubuntu:   sudo apt install python3.12 python3.12-venv"
-        echo "   Fedora / RHEL:     sudo dnf install python3.12"
-        echo "   Arch:              sudo pacman -S python"
-        echo
-        echo " Then re-run this file."
+        echo " ERROR: Python 3.12 install was not detected after the installer closed."
+        echo " Please install Python 3.12 manually from:"
+        echo "     https://www.python.org/downloads/"
         exit 1
     fi
 fi
@@ -117,21 +105,13 @@ UVICORN_PID=$!
 
 # --- 6. Wait for port to bind, open browser ---
 sleep 3
-URL="http://localhost:8000"
-if command -v open >/dev/null 2>&1; then
-    open "$URL"            # macOS
-elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$URL" >/dev/null 2>&1 &   # Linux
-else
-    echo " (Could not auto-open — please visit $URL manually)"
-fi
+open "http://localhost:8000"
 
 echo
 echo " ============================================================"
 echo "  Abide Companion is running (pid $UVICORN_PID)."
 echo
-echo "  To STOP: press Ctrl+C in this terminal, or run:"
-echo "      kill $UVICORN_PID"
+echo "  To STOP: press Ctrl+C in this terminal window, or close it."
 echo " ============================================================"
 echo
 

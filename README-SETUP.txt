@@ -2,42 +2,68 @@ Abide Companion — Setup
 ========================
 
 --------------------------------------------------------------
- 5 steps to run Abide
+ 4 steps to run Abide
 --------------------------------------------------------------
 
- 1. Install Python 3.12 or newer (one-time, ~30 MB).
-      https://www.python.org/downloads/
-      During install, CHECK the box "Add python.exe to PATH".
-
- 2. Plug in the Logitech MeetUp (or any USB webcam + mic).
+ 1. Plug in the Logitech MeetUp (or any USB webcam + mic).
     Aim the MeetUp at where you'll sit — its wide 120-degree
     lens gives plenty of room, but framing is better if you
     start pointed at your usual seat.
 
- 3. Double-click:
+ 2. Double-click the launcher for your system:
         start.bat          (Windows)
-      or
-        start.sh           (Mac / Linux)
+        start.command      (macOS)
+        start.sh           (Linux — run from terminal: bash start.sh)
 
-    The first run creates a Python virtual environment and
-    installs dependencies — 3-5 minutes on a typical broadband
-    connection. Later runs start in a few seconds.
+    IMPORTANT for macOS users: the file is named start.command,
+    not start.sh, because Finder treats .sh as text and will open
+    it in TextEdit. Use start.command to double-click.
 
- 4. Your browser will open automatically at
+    The first time you double-click start.command on macOS, you
+    may see a dialog: "start.command can't be opened because it
+    is from an unidentified developer." This is Apple's standard
+    warning for any unsigned third-party app. To bypass it once:
+
+        Right-click start.command -> Open -> click Open on
+        the confirmation dialog that appears.
+
+    After that, every future launch is a normal silent double-
+    click. You only do this once per download.
+
+    If Python 3.12 is already installed, the launcher uses it.
+    If not, the launcher will install it for you automatically:
+
+      - On Windows: a per-user Python 3.12 install runs silently
+        in the background (no admin prompt, no UAC, no PATH
+        checkbox to click). Adds about 30 seconds to first-run.
+
+      - On macOS: the official Apple Installer opens. Click
+        through the Continue buttons and enter your admin
+        password once when asked. The launcher then continues.
+
+      - On Linux: if Python 3.12 isn't already installed, the
+        launcher prints one command for your distribution and
+        exits. Run it, then double-click start.sh again.
+
+    After Python is available, the first run creates a virtual
+    environment and installs dependencies — 3-5 minutes on a
+    typical broadband connection. Later runs start in seconds.
+
+ 3. Your browser will open automatically at
         http://localhost:8000
     Click the small gear icon at the bottom-right and paste in
     your API keys for Groq, Anthropic, and OpenAI. They are
     saved in your browser and never leave this machine.
 
- 5. Click the green "Start" button. Allow access to your
+ 4. Click the green "Start" button. Allow access to your
     microphone and camera when the browser asks. Speak to
     Abide — it will listen, watch, and respond by voice.
 
     On Windows with a Logitech MeetUp you can also say
     "zoom in", "zoom out", or "reset the zoom" to move the
-    camera's optical zoom. MeetUp does not have mechanical
-    pan or tilt (its 120-degree lens is fixed); if you ask
-    for pan or tilt, Abide will say so honestly.
+    camera's optical zoom. Pan/tilt availability is detected
+    per session and can vary by firmware/session conditions;
+    Abide will only claim capabilities that probe as available.
 
 --------------------------------------------------------------
  During a session
@@ -54,7 +80,7 @@ Abide Companion — Setup
  You can switch between tabs at any time. Click Hide to
  collapse the panel, Show to bring it back.
 
- If you step out of the camera's view for about 10 seconds,
+ If you step out of the camera's view for about 11 seconds,
  Abide will gently check in — "I can't see you right now,
  are you still there?". It's designed to notice when someone
  leaves the frame unexpectedly.
@@ -104,8 +130,39 @@ Abide Companion — Setup
 --------------------------------------------------------------
 
  "python is not recognised" or similar on Windows.
-    During Python install, check "Add python.exe to PATH".
-    If you missed it, reinstall from python.org.
+    The launcher tries to auto-install Python 3.12 on first
+    run. If that failed (for example: no internet), install
+    Python manually from https://www.python.org/downloads/
+    and re-run start.bat. You do NOT need to tick "Add to
+    PATH" — start.bat will find a per-user install at
+    %LocalAppData%\Programs\Python\Python312\ automatically.
+
+ Auto-install of Python failed.
+    Check your internet connection and re-run start.bat —
+    the download is attempted fresh each time Python is not
+    found. If you are behind a proxy or firewall that blocks
+    python.org, download the installer manually from
+    https://www.python.org/downloads/ and run it yourself;
+    start.bat will pick up the resulting install on the
+    next launch.
+
+ macOS: "start.command can't be opened" / "unidentified
+ developer" on first launch.
+    This is Apple's Gatekeeper warning for any unsigned
+    third-party app. Right-click start.command in Finder,
+    choose Open, then click Open on the confirmation
+    dialog. Subsequent launches are silent. You only do
+    this once. Bypassing Gatekeeper permanently requires
+    a paid Apple Developer ID, which Abide doesn't have
+    (and which wouldn't make the first-run any smoother
+    than the right-click-Open workflow above).
+
+ macOS: double-clicking start.sh opens TextEdit instead
+ of running it.
+    You clicked the wrong file. macOS Finder treats .sh
+    as plain text. On macOS, double-click start.command
+    instead — Finder recognizes .command and opens it
+    in Terminal.
 
  The browser did not open.
     Open it yourself and go to http://localhost:8000
@@ -138,13 +195,13 @@ Abide Companion — Setup
     rest of Abide still works normally.
 
  Camera is not panning or tilting.
-    MeetUp has a fixed 120-degree lens and no pan/tilt motors
-    over its UVC interface — only optical zoom. Any on-device
-    framing motion you see is Logitech RightSight digital
-    cropping inside the camera, not Abide. If you need
-    mechanical pan/tilt, a Logitech Rally Bar or Rally Bar
-    Mini exposes those axes; the same Abide code path will
-    drive them automatically.
+    Pan/tilt on MeetUp is conditional and may probe differently
+    across sessions/firmware. Check the startup axes line in
+    the "Abide Companion" console. If it reports only `zoom`,
+    Abide will use zoom-only behavior in that session.
+    If it reports `pan`, `tilt`, and/or `zoom`, those axes can
+    be used. Any on-device reframing motion you see may still
+    be Logitech RightSight digital cropping.
 
  Abide says it is having trouble reaching its services.
     Check that your API keys in the gear-icon settings
