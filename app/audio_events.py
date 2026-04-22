@@ -121,9 +121,13 @@ _RELEVANT_CLASSES: dict[int, str] = {
 # Minimum max-pooled probability to surface a tag. YAMNet's probability
 # distribution is usually peaky for clear events (0.5+ on a real
 # cough) but can land in 0.2-0.4 on partial / distant / overlapping
-# events. 0.30 picks recall > precision — we'd rather Claude see a
-# speculative "maybe a cough" and ask, than miss a real one.
-_CONFIDENCE_THRESHOLD = 0.30
+# events. 0.40 balances recall and precision for a care setting: at
+# 0.30 the classifier generated spurious "Cough" tags from ambient
+# noise and breathing, which triggered unnecessary welfare reactions
+# and eroded user trust. 0.40 still catches the clear events that
+# matter (loud cough, audible gasp, unmistakable sneeze) while
+# suppressing the borderline low-confidence detections that are noise.
+_CONFIDENCE_THRESHOLD = 0.40
 
 # ── Lazy-loaded interpreter state ─────────────────────────────────────
 # Created on first call to classify_segment(); reused thereafter. Guarded

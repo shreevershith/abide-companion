@@ -21,7 +21,7 @@ from starlette.websockets import WebSocketState
 from app.conversation import ConversationEngine, MODEL as CLAUDE_MODEL
 from app.memory import save_user_context
 from app.ptz import PTZController
-from app.tts import synthesize
+from app.tts import synthesize, stream_sentence
 from app.tts_cache_store import record_phrase
 from app.vision import VisionBuffer, analyze_frames
 from app import telemetry
@@ -100,11 +100,17 @@ def _log_bg_exception(name: str):
     `main.py:_log_prewarm_exception` but scoped to this module so we
     don't create a circular import."""
     def _cb(task: asyncio.Task):
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            log.warning("%s task failed (non-fatal): %s", name, exc)
+        try:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.warning("%s task failed: %s: %r", name, type(exc).__name__, exc)
+        except Exception as cb_exc:
+            # Defensive: asyncio silently discards exceptions raised inside
+            # done-callbacks. task.exception() itself can raise CancelledError
+            # if the task was cancelled between the cancelled() check and here.
+            log.error("[BUG] _log_bg_exception callback raised for %s: %s", name, cb_exc)
     return _cb
 
 
@@ -303,6 +309,12 @@ class Session:
         # Queued reactive activity — set when a reactive gesture is detected
         # while Abide is busy talking. Consumed at the end of _run_response().
         self._pending_reactive_activity: str | None = None
+
+        # Audio-events context from the most recently completed YAMNet
+        # classification. Set by main.py's done-callback (fire-and-forget),
+        # consumed and cleared by start_response() so it is injected into
+        # the NEXT turn rather than blocking the current one.
+        self._pending_audio_events_context: str = ""
 
         # Vision state
         self.vision_buffer: VisionBuffer = VisionBuffer()
@@ -541,6 +553,10 @@ class Session:
                 return
             await self._safe_send_bytes(ws, audio)
             self.mark_tts_sent()
+            # tts_done signals the frontend's playback worklet that no more
+            # audio is coming for this utterance so it can drain and fire
+            # playback_end. Must come before response_done.
+            await self._safe_send_json(ws, {"type": "tts_done"})
             await self._safe_send_json(ws, {"type": "response_done"})
             # Record in history so Claude knows what was already said
             engine._history.append({"role": "assistant", "content": text})
@@ -1080,62 +1096,121 @@ class Session:
             "first_bytes_sent_ts": None,
         }
 
+        def _make_fill_task(sentence: str, ts: float):
+            """Create a per-sentence asyncio.Queue + fill task using stream_sentence.
+
+            The fill task (a background asyncio.Task) calls stream_sentence() and
+            pushes each PCM chunk into chunk_q as it arrives. A None sentinel is
+            always pushed when the generator exhausts (or on error / cancellation).
+            This mirrors the old 'create_task(synthesize(...))' pattern but allows
+            the consumer to forward each chunk to the WS immediately, cutting TTFA
+            by the Ogg buffering delay (~300-600 ms on the first sentence).
+            Subsequent sentences' fill tasks start in parallel while the consumer
+            is streaming the current one — same overlap the old Task approach gave.
+            """
+            chunk_q: asyncio.Queue = asyncio.Queue()
+
+            async def _fill(s=sentence, q=chunk_q, s_ts=ts):
+                try:
+                    async for pcm in stream_sentence(s, openai_key, s_ts):
+                        if self._cancelled:
+                            return
+                        await q.put(pcm)
+                except Exception as exc:
+                    log.error("TTS stream error for %r: %s", s[:40], exc)
+                finally:
+                    q.put_nowait(None)  # sentinel — unbounded queue, never blocks
+
+            return chunk_q, asyncio.create_task(_fill())
+
         async def producer():
-            """Read Claude stream; launch a synthesize task per sentence."""
+            """Read Claude stream; launch a stream_sentence fill task per sentence."""
+            from app.conversation import ConversationError, APIKeyError
+
             text_buf = ""
             # Phase R — camera-action side-channel. At most one dispatch
             # per turn; we reset on next start_response via the engine's
             # own reset in respond().
             camera_dispatched = False
+
+            # Snapshot history length before respond() so we can roll back
+            # the user message engine.respond() appends on a failed attempt.
+            history_checkpoint = len(engine._history)
+
             try:
                 await self._safe_send_json(ws, {"type": "status", "state": "thinking"})
 
-                async for chunk in engine.respond(
-                    text,
-                    vision_context=vision_context,
-                    user_context=user_context,
-                    time_context=time_context,
-                    audio_events_context=audio_events_context,
-                ):
-                    if self._cancelled:
-                        log.info("Barge-in: stopping Claude stream")
-                        break
+                # Retry loop — up to 2 attempts for transient first-token stalls.
+                # Only retries when no output was produced (full_response still
+                # empty), meaning the timeout fired before any text_delta arrived.
+                # Mid-stream stalls (partial output already sent) are NOT retried
+                # because concatenating two partial responses produces incoherent
+                # speech. APIKeyError is never retried (user must fix the key).
+                # Barge-in (self._cancelled) exits cleanly without retry.
+                for _attempt in range(2):
+                    try:
+                        async for chunk in engine.respond(
+                            text,
+                            vision_context=vision_context,
+                            user_context=user_context,
+                            time_context=time_context,
+                            audio_events_context=audio_events_context,
+                        ):
+                            if self._cancelled:
+                                log.info("Barge-in: stopping Claude stream")
+                                break
 
-                    # Phase R — if Claude emitted a [[CAM:...]] marker at
-                    # the head of the response, the engine strips it from
-                    # the stream and sets last_camera_action. Dispatch
-                    # the PTZ action as early as possible so the lens
-                    # motion overlaps with Claude's verbal ack.
-                    if not camera_dispatched and engine.last_camera_action:
-                        self._dispatch_camera_action(engine.last_camera_action)
-                        camera_dispatched = True
+                            # Phase R — if Claude emitted a [[CAM:...]] marker at
+                            # the head of the response, the engine strips it from
+                            # the stream and sets last_camera_action. Dispatch
+                            # the PTZ action as early as possible so the lens
+                            # motion overlaps with Claude's verbal ack.
+                            if not camera_dispatched and engine.last_camera_action:
+                                self._dispatch_camera_action(engine.last_camera_action)
+                                camera_dispatched = True
 
-                    await self._safe_send_json(
-                        ws, {"type": "response_chunk", "text": chunk}
-                    )
-                    full_response.append(chunk)
+                            await self._safe_send_json(
+                                ws, {"type": "response_chunk", "text": chunk}
+                            )
+                            full_response.append(chunk)
 
-                    # Only scan the newly-appended region (plus a 1-char
-                    # overlap so a terminator at the tail of the prior
-                    # chunk + leading whitespace in this chunk still
-                    # matches). Previously this did `_SENTENCE_RE.split`
-                    # over the entire accumulated buffer on every chunk,
-                    # which is O(len(text_buf)) per chunk and ~2 KB of
-                    # wasted regex work per turn.
-                    scan_from = max(0, len(text_buf) - 1)
-                    text_buf += chunk
+                            # Only scan the newly-appended region (plus a 1-char
+                            # overlap so a terminator at the tail of the prior
+                            # chunk + leading whitespace in this chunk still
+                            # matches).
+                            scan_from = max(0, len(text_buf) - 1)
+                            text_buf += chunk
 
-                    match = _SENTENCE_RE.search(text_buf, scan_from)
-                    while match:
-                        sentence = text_buf[:match.start()].strip()
-                        if sentence and openai_key and not self._cancelled:
+                            match = _SENTENCE_RE.search(text_buf, scan_from)
+                            while match:
+                                sentence = text_buf[:match.start()].strip()
+                                if sentence and openai_key and not self._cancelled:
+                                    ts = time.monotonic()
+                                    if (
+                                        turn_ck["first_sentence_queued_ts"] is None
+                                        and self._current_turn_speech_end_ts is not None
+                                    ):
+                                        pre_sentence_ms = (
+                                            ts - self._current_turn_speech_end_ts
+                                        ) * 1000
+                                        log.info(
+                                            "[TIMING] speech_end \u2192 first sentence boundary = %.0fms",
+                                            pre_sentence_ms,
+                                        )
+                                    log.info("[TIMING] Sentence boundary: %r", sentence[:60])
+                                    record_phrase(sentence)
+                                    chunk_q, fill_task = _make_fill_task(sentence, ts)
+                                    tts_queue.put_nowait((sentence, chunk_q, fill_task, ts))
+                                    if turn_ck["first_sentence_queued_ts"] is None:
+                                        turn_ck["first_sentence_queued_ts"] = ts
+                                text_buf = text_buf[match.end():]
+                                match = _SENTENCE_RE.search(text_buf)
+
+                        # Final tail (text after the last sentence boundary or
+                        # an un-terminated last sentence).
+                        text_buf = text_buf.strip()
+                        if text_buf and openai_key and not self._cancelled:
                             ts = time.monotonic()
-                            # Phase U.3 follow-up #3 — extra timing anchor:
-                            # speech_end → first sentence boundary (the
-                            # moment TTS can begin for the first time this
-                            # turn). Lets us see, in combination with the
-                            # [TIMING] TTFA line, whether the slow path is
-                            # pre-sentence or TTS first-byte.
                             if (
                                 turn_ck["first_sentence_queued_ts"] is None
                                 and self._current_turn_speech_end_ts is not None
@@ -1144,154 +1219,141 @@ class Session:
                                     ts - self._current_turn_speech_end_ts
                                 ) * 1000
                                 log.info(
-                                    "[TIMING] speech_end \u2192 first sentence boundary = %.0fms",
+                                    "[TIMING] speech_end \u2192 first sentence boundary = %.0fms (final tail)",
                                     pre_sentence_ms,
                                 )
-                            log.info("[TIMING] Sentence boundary: %r", sentence[:60])
-                            # Record for the auto-populated TTS cache —
-                            # sentences heard repeatedly across sessions
-                            # get prewarmed next startup.
-                            record_phrase(sentence)
-                            # Launch TTS as a concurrent task — do NOT await here.
-                            # Next iteration of the Claude stream will start,
-                            # and the TTS task will run in parallel.
-                            task = asyncio.create_task(
-                                synthesize(sentence, openai_key, ts)
+                            log.info("[TIMING] Final tail: %r", text_buf[:60])
+                            record_phrase(text_buf)
+                            chunk_q, fill_task = _make_fill_task(text_buf, ts)
+                            tts_queue.put_nowait((text_buf, chunk_q, fill_task, ts))
+
+                        # Telemetry: Claude generation with token usage. Done here
+                        # (after the stream exits) so we have final usage numbers.
+                        try:
+                            full_system_prompt = engine.last_system_prompt
+                            messages_input = {
+                                "system": full_system_prompt,
+                                "messages": engine.last_messages_snapshot,
+                            }
+                            telemetry.observe_claude(
+                                turn_trace,
+                                model=CLAUDE_MODEL,
+                                messages=messages_input,  # type: ignore[arg-type]
+                                response_text="".join(full_response),
+                                input_tokens=engine.last_input_tokens,
+                                output_tokens=engine.last_output_tokens,
+                                latency_ms=engine.last_total_ms,
+                                first_token_ms=engine.last_first_token_ms,
                             )
-                            tts_queue.put_nowait((sentence, task, ts))
-                            # Stage-metric checkpoint: time of first sentence
-                            # queued (used for TTS-first-byte computation).
-                            if turn_ck["first_sentence_queued_ts"] is None:
-                                turn_ck["first_sentence_queued_ts"] = ts
-                        # Advance the buffer past this boundary. The
-                        # remaining text is what comes after the
-                        # whitespace separator; rescan from the start
-                        # of the (now shorter) buffer for more
-                        # boundaries in the same chunk.
-                        text_buf = text_buf[match.end():]
-                        match = _SENTENCE_RE.search(text_buf)
+                        except Exception as e:
+                            log.debug("Claude telemetry skipped: %s", e)
 
-                # Final tail (text after the last sentence boundary or an un-terminated last sentence)
-                text_buf = text_buf.strip()
-                if text_buf and openai_key and not self._cancelled:
-                    ts = time.monotonic()
-                    # Same diagnostic as the sentence-boundary branch: for
-                    # one-sentence replies there is no in-stream boundary
-                    # and the final tail IS the first TTS unit, so we
-                    # measure that anchor here too.
-                    if (
-                        turn_ck["first_sentence_queued_ts"] is None
-                        and self._current_turn_speech_end_ts is not None
-                    ):
-                        pre_sentence_ms = (
-                            ts - self._current_turn_speech_end_ts
-                        ) * 1000
-                        log.info(
-                            "[TIMING] speech_end \u2192 first sentence boundary = %.0fms (final tail)",
-                            pre_sentence_ms,
+                    except ConversationError as e:
+                        # Retry only on first-token stall with no output produced.
+                        # APIKeyError subclasses ConversationError — never retry.
+                        can_retry = (
+                            not isinstance(e, APIKeyError)
+                            and not self._cancelled
+                            and not full_response
+                            and _attempt < 1
                         )
-                    log.info("[TIMING] Final tail: %r", text_buf[:60])
-                    record_phrase(text_buf)
-                    task = asyncio.create_task(
-                        synthesize(text_buf, openai_key, ts)
-                    )
-                    tts_queue.put_nowait((text_buf, task, ts))
+                        if not can_retry:
+                            raise
+                        log.warning("[RETRY] Claude stall on attempt 1 — retrying in 1s: %s", e)
+                        # Roll back the user message respond() appended before stalling.
+                        del engine._history[history_checkpoint:]
+                        await asyncio.sleep(1.0)
+                        await self._safe_send_json(ws, {"type": "status", "state": "thinking"})
+                    else:
+                        break  # respond() completed — exit retry loop
 
-                # Telemetry: Claude generation with token usage. Done here
-                # (after the stream exits) so we have final usage numbers.
-                try:
-                    full_system_prompt = engine.last_system_prompt
-                    messages_input = {
-                        "system": full_system_prompt,
-                        "messages": engine.last_messages_snapshot,
-                    }
-                    telemetry.observe_claude(
-                        turn_trace,
-                        model=CLAUDE_MODEL,
-                        messages=messages_input,  # type: ignore[arg-type]
-                        response_text="".join(full_response),
-                        input_tokens=engine.last_input_tokens,
-                        output_tokens=engine.last_output_tokens,
-                        latency_ms=engine.last_total_ms,
-                        first_token_ms=engine.last_first_token_ms,
-                    )
-                except Exception as e:
-                    log.debug("Claude telemetry skipped: %s", e)
             finally:
                 # Sentinel — tells consumer no more items will arrive
                 tts_queue.put_nowait(None)
 
         async def consumer():
-            """Await TTS tasks in FIFO order; send their audio to the WebSocket."""
+            """Drain per-sentence PCM chunk queues in FIFO order, streaming
+            each chunk to the WebSocket as it arrives from OpenAI.
+
+            Each item in tts_queue is (sentence, chunk_q, fill_task, ts).
+            chunk_q is fed by the fill_task (a background asyncio.Task calling
+            stream_sentence). We forward chunks immediately so the browser's
+            playback worklet can start playing the first sentence ~300-600 ms
+            before the full sentence audio would have been available under the
+            old buffered-opus approach.
+            """
             first_tts = True
             while True:
                 item = await tts_queue.get()
                 if item is None:  # sentinel
                     return
 
-                sentence, task, ts = item
+                sentence, chunk_q, fill_task, ts = item
 
-                # If we've already been cancelled, drop the task and skip.
                 if self._cancelled:
-                    if not task.done():
-                        task.cancel()
+                    fill_task.cancel()
                     continue
 
-                try:
-                    audio = await task
-                except asyncio.CancelledError:
-                    continue
-                except Exception as e:
-                    log.error("TTS failed for %r: %s", sentence[:40], e)
-                    continue
+                total_bytes = 0
+                t_first_chunk: float | None = None
 
-                # Skip emoji-only / empty synthesise results (see
-                # `_strip_nonspeakable` in tts.py). Prevents us from
-                # flipping the "speaking" status and polluting TTFA
-                # with a zero-byte send that the client can't play.
-                if not audio:
-                    continue
+                # Drain all PCM chunks for this sentence. chunk_q.get() yields
+                # either a bytes chunk or None (sentinel = sentence complete).
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(chunk_q.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            "[STALL] TTS chunk queue timed out for %r — skipping",
+                            sentence[:40],
+                        )
+                        fill_task.cancel()
+                        break
 
-                # Stage-metric checkpoint: time the first TTS task yielded
-                # audio — i.e. the moment the bytes became available to
-                # send. Paired with first_sentence_queued_ts in the finally
-                # block to compute TTS first-byte latency.
-                if turn_ck["first_tts_ready_ts"] is None:
-                    turn_ck["first_tts_ready_ts"] = time.monotonic()
+                    if chunk is None:  # sentinel — sentence fully streamed
+                        break
 
-                # Telemetry: one span per TTS call. Latency is sentence-boundary
-                # to the moment the audio bytes became available locally.
-                tts_latency_ms = (time.monotonic() - ts) * 1000
-                telemetry.observe_tts(
-                    turn_trace,
-                    sentence=sentence,
-                    audio_bytes=len(audio),
-                    latency_ms=tts_latency_ms,
-                )
+                    if self._cancelled:
+                        fill_task.cancel()
+                        break
 
-                # Check cancellation again after the await — user may have
-                # barged in while we were waiting for OpenAI.
-                if self._cancelled:
-                    continue
+                    if not chunk:
+                        continue
 
-                if first_tts:
-                    await self._safe_send_json(
-                        ws, {"type": "status", "state": "speaking"}
+                    total_bytes += len(chunk)
+
+                    # Stage checkpoint: first bytes ready — earlier than before
+                    # because we no longer wait for the full sentence buffer.
+                    if t_first_chunk is None:
+                        t_first_chunk = time.monotonic()
+                        if turn_ck["first_tts_ready_ts"] is None:
+                            turn_ck["first_tts_ready_ts"] = t_first_chunk
+
+                    if first_tts:
+                        await self._safe_send_json(
+                            ws, {"type": "status", "state": "speaking"}
+                        )
+                        first_tts = False
+
+                    if turn_ck["first_bytes_sent_ts"] is None:
+                        turn_ck["first_bytes_sent_ts"] = time.monotonic()
+
+                    await self._safe_send_bytes(ws, chunk)
+                    self.mark_tts_sent()
+
+                # Per-sentence telemetry after all chunks delivered.
+                if total_bytes > 0 and not self._cancelled:
+                    tts_latency_ms = (time.monotonic() - ts) * 1000
+                    telemetry.observe_tts(
+                        turn_trace,
+                        sentence=sentence,
+                        audio_bytes=total_bytes,
+                        latency_ms=tts_latency_ms,
                     )
-                    first_tts = False
-
-                t_send = time.monotonic()
-                # Stage-metric checkpoint: time first audio bytes leave the
-                # server — this is what TTFA is measured against.
-                if turn_ck["first_bytes_sent_ts"] is None:
-                    turn_ck["first_bytes_sent_ts"] = t_send
-                await self._safe_send_bytes(ws, audio)
-                self.mark_tts_sent()
-                log.info(
-                    "[TIMING] WS send: %.0fms (%d bytes)",
-                    (time.monotonic() - t_send) * 1000,
-                    len(audio),
-                )
+                    log.info(
+                        "[TIMING] TTS sentence done: %r %.0fms %dB",
+                        sentence[:40], tts_latency_ms, total_bytes,
+                    )
 
         try:
             await asyncio.gather(producer(), consumer())
@@ -1316,9 +1378,10 @@ class Session:
             # runs on GeneratorExit / CancelledError propagation, so the
             # partial response is already in engine._history. No need to
             # save_partial() again here.
+            _cancel_reason = "user-interrupted" if self._cancelled else "network-drop"
             log.info(
-                "Hard cancel: %d chars streamed (history saved by engine)",
-                len("".join(full_response)),
+                "Hard cancel (%s): %d chars streamed (history saved by engine)",
+                _cancel_reason, len("".join(full_response)),
             )
             await self._safe_send_json(ws, {"type": "response_done"})
         except Exception as e:
@@ -1368,9 +1431,9 @@ class Session:
                     break
                 if leftover is None:
                     continue  # sentinel; keep draining in case consumer died first
-                _, leftover_task, _ = leftover
-                if not leftover_task.done():
-                    leftover_task.cancel()
+                _, _leftover_chunk_q, leftover_fill_task, _ = leftover
+                if not leftover_fill_task.done():
+                    leftover_fill_task.cancel()
 
             # End the turn trace with summary metadata + update session stats
             total_turn_ms = (time.monotonic() - t_turn_start) * 1000
@@ -1382,7 +1445,13 @@ class Session:
                     total_ms=total_turn_ms,
                 )
             except Exception as e:
-                log.debug("Turn trace end skipped: %s", e)
+                # Programmer errors (wrong arg types, etc.) are WARNING so
+                # they surface in dev; transient Langfuse network errors are
+                # DEBUG since they're non-fatal and expected in offline use.
+                if isinstance(e, (AttributeError, TypeError)):
+                    log.warning("Telemetry bug in end_turn_trace: %s: %r", type(e).__name__, e)
+                else:
+                    log.debug("Turn trace end skipped (non-fatal): %s", type(e).__name__)
             if not self._cancelled:
                 self.stats["completed_turns"] += 1
             # Bounded rolling window so a long session doesn't grow an

@@ -886,15 +886,18 @@ let captureCounter = 0;
 let latestBBox = null;
 let latestActivity = "";
 
-// ── TTS playback queue (Web Audio API) ──
-// rawQueue holds raw ArrayBuffers in the exact order the server sent them.
-// We decode strictly sequentially — decodeAudioData is async and its
-// callbacks fire in completion order, not queue order, so parallel decoding
-// causes sentences to play out of order or be skipped entirely.
-let rawQueue = [];
-let isProcessing = false;
-let playbackEpoch = 0;      // bumped on barge-in so in-flight decodes drop their result
-let currentSource = null;   // active AudioBufferSourceNode
+// ── TTS playback (PCM streaming via AudioWorklet ring buffer) ──
+// The server now streams raw 16-bit LE PCM (24 kHz mono) chunks over the
+// WebSocket as they arrive from OpenAI TTS. A dedicated AudioWorklet
+// (PlaybackProcessor) maintains a ring buffer; each chunk is posted to the
+// worklet immediately and played without waiting for a full sentence buffer.
+// This removes the Ogg container decode round-trip and cuts TTFA by
+// ~300-600 ms on the first sentence of each response. (D103)
+let playbackCtx = null;       // AudioContext at 24 kHz for TTS output
+let playbackNode = null;      // AudioWorkletNode running PlaybackProcessor
+let isPlayingBack = false;    // true while ring buffer has live audio
+let bargingIn = false;        // drops stale in-flight chunks after barge-in
+let pendingListeningStatus = false; // defers "listening" status until ring buffer drains
 
 // Audio-reactive hero glow (Phase J). outputAnalyser sits between every
 // TTS AudioBufferSourceNode and audioCtx.destination so we can read the
@@ -1264,70 +1267,29 @@ function setAudibleState(on) {
     }
 }
 
-function queueAudio(arrayBuffer) {
-    if (!audioCtx) return;
-    rawQueue.push(arrayBuffer);
-    if (!isProcessing) processNextAudio();
-}
-async function processNextAudio() {
-    if (rawQueue.length === 0) {
-        isProcessing = false;
-        currentSource = null;
-        // Transition back to idle — tell the server playback has ended
-        // so barge-in is no longer gated on this pseudo-state.
-        setAudibleState(false);
-        return;
+// Convert an ArrayBuffer of Int16LE PCM samples to Float32 and push into
+// the playback worklet's ring buffer. Called for every binary WS message.
+function handlePCMChunk(arrayBuffer) {
+    if (!playbackNode || bargingIn) return;
+    const int16 = new Int16Array(arrayBuffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+    // Transferable buffer — zero-copy hand-off to the AudioWorklet thread.
+    playbackNode.port.postMessage({ type: "audio", pcm: float32 }, [float32.buffer]);
+    if (!isPlayingBack) {
+        isPlayingBack = true;
+        setAudibleState(true);
     }
-    // Transition to audible — idempotent, only fires once per run.
-    setAudibleState(true);
-    isProcessing = true;
-    const buf = rawQueue.shift();
-    const epoch = playbackEpoch;
+}
 
-    let decoded;
-    try {
-        decoded = await audioCtx.decodeAudioData(buf.slice(0));
-    } catch (err) {
-        console.error("Audio decode error:", err);
-        processNextAudio();
-        return;
-    }
-    if (epoch !== playbackEpoch) {
-        // Barge-in fired while we were decoding — drop this clip.
-        processNextAudio();
-        return;
-    }
-    const source = audioCtx.createBufferSource();
-    source.buffer = decoded;
-    // Route through the output analyser so the hero glow can sync with
-    // Abide's voice amplitude (Phase J). Falls back to a direct
-    // connection on the unlikely path where the analyser wasn't created
-    // yet (would only happen if processNextAudio ran before the Start
-    // handler finished initialising audioCtx — current code paths can't).
-    if (outputAnalyser) {
-        source.connect(outputAnalyser);
-        outputAnalyser.connect(audioCtx.destination);
-    } else {
-        source.connect(audioCtx.destination);
-    }
-    currentSource = source;
-    source.onended = () => {
-        if (currentSource === source) currentSource = null;
-        processNextAudio();
-    };
-    source.start(0);
-}
 function stopPlayback() {
-    playbackEpoch++;
-    if (currentSource) {
-        try { currentSource.stop(); } catch(e) {}
-        currentSource = null;
-    }
-    rawQueue = [];
-    isProcessing = false;
-    // Tell the server we're no longer playing — the server also clears
-    // its own client_playing flag when it fires a barge-in, so this is
-    // belt-and-suspenders, but it's essential for the Stop button path.
+    // Raise flag before flushing so in-flight WS chunks arriving in the
+    // next ~300 ms are silently dropped rather than played as stale audio.
+    bargingIn = true;
+    setTimeout(() => { bargingIn = false; }, 300);
+    if (playbackNode) playbackNode.port.postMessage({ type: "flush" });
+    isPlayingBack = false;
+    pendingListeningStatus = false;
     setAudibleState(false);
 }
 
@@ -1790,6 +1752,64 @@ class CaptureProcessor extends AudioWorkletProcessor {
 registerProcessor("capture-processor", CaptureProcessor);
 `;
 
+// ── PlaybackProcessor AudioWorklet ──
+// Ring-buffer worklet that plays raw Float32 PCM streamed from the server.
+// Chunks are posted via port.postMessage({type:"audio", pcm:Float32Array}).
+// "flush" clears the buffer instantly (barge-in). "tts_done" marks the end
+// of a response; when the buffer then drains to empty the worklet posts
+// {type:"drained"} back so the main thread can send playback_end.
+const playbackCode = `
+class PlaybackProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this._cap = 24000 * 8;   // 8 s ring buffer at 24 kHz
+        this._buf = new Float32Array(this._cap);
+        this._wr = 0; this._rd = 0; this._n = 0;
+        this._ttsDone = false;
+        this.port.onmessage = ({ data }) => {
+            if (data.type === "flush") {
+                this._wr = 0; this._rd = 0; this._n = 0;
+                this._ttsDone = false;
+            } else if (data.type === "audio") {
+                const f = data.pcm;
+                for (let i = 0; i < f.length; i++) {
+                    this._buf[this._wr] = f[i];
+                    this._wr = (this._wr + 1) % this._cap;
+                }
+                this._n += f.length;
+            } else if (data.type === "tts_done") {
+                // If buffer already empty, fire drained immediately so
+                // playback_end reaches the server without waiting for process().
+                if (this._n === 0) { this.port.postMessage({ type: "drained" }); }
+                else { this._ttsDone = true; }
+            }
+        };
+    }
+    process(inputs, outputs) {
+        const out = outputs[0][0];
+        const n = out.length;          // 128 frames per callback
+        const prev = this._n;
+        if (this._n >= n) {
+            for (let i = 0; i < n; i++) {
+                out[i] = this._buf[this._rd];
+                this._rd = (this._rd + 1) % this._cap;
+            }
+            this._n -= n;
+        } else {
+            out.fill(0);
+            this._n = 0;
+        }
+        // Signal playback_end when buffer drains after tts_done was received.
+        if (this._ttsDone && prev > 0 && this._n === 0) {
+            this.port.postMessage({ type: "drained" });
+            this._ttsDone = false;
+        }
+        return true;
+    }
+}
+registerProcessor("playback-processor", PlaybackProcessor);
+`;
+
 // ── Mic ring pulse (driven by analyser) ──
 function updateMicRing(level) {
     // level: 0..1. Scales an inset box-shadow glow.
@@ -1847,17 +1867,47 @@ $startBtn.onclick = async () => {
         }
         updateLevel();
 
+        // Playback context — separate AudioContext at 24 kHz to match the
+        // PCM sample rate OpenAI TTS returns (avoids OS-level resampling).
+        // Capture stays on the system-rate audioCtx; TTS output lives here.
+        playbackCtx = new AudioContext({ sampleRate: 24000 });
+        const playblob = new Blob([playbackCode], { type: "application/javascript" });
+        const playurl = URL.createObjectURL(playblob);
+        await playbackCtx.audioWorklet.addModule(playurl);
+        URL.revokeObjectURL(playurl);
+        playbackNode = new AudioWorkletNode(playbackCtx, "playback-processor");
+
         // Output analyser for Phase J — audio-reactive hero glow. Sits in
-        // the TTS playback chain (see processNextAudio) so we can sample
-        // the amplitude of Abide's actual voice. Sampling uses time-domain
-        // data (not FFT bins) — we want loudness, not spectrum.
-        outputAnalyser = audioCtx.createAnalyser();
+        // the TTS playback chain so we can sample the amplitude of Abide's
+        // actual voice. Now on playbackCtx; playbackNode → outputAnalyser →
+        // playbackCtx.destination. Sampling uses time-domain data (loudness).
+        outputAnalyser = playbackCtx.createAnalyser();
         outputAnalyser.fftSize = 256;
         outputAnalyser.smoothingTimeConstant = 0.5;
         outputLevelBuf = new Uint8Array(outputAnalyser.fftSize);
         smoothedVoice = 0;
+        playbackNode.connect(outputAnalyser);
+        outputAnalyser.connect(playbackCtx.destination);
+
+        // When the ring buffer drains after tts_done, signal the server
+        // that playback has ended (used for barge-in gating).
+        playbackNode.port.onmessage = ({ data }) => {
+            if (data.type === "drained") {
+                isPlayingBack = false;
+                setAudibleState(false);
+                // Apply deferred "listening" status now that the ring
+                // buffer is truly empty. Without this, the hero glow
+                // disappears while audio is still playing because the
+                // server sends status:listening right after response_done.
+                if (pendingListeningStatus) {
+                    pendingListeningStatus = false;
+                    setStatus("Listening", "listening");
+                }
+            }
+        };
+
         function updateVoiceGlow() {
-            if (!audioCtx) return;
+            if (!playbackCtx) return;
             outputAnalyser.getByteTimeDomainData(outputLevelBuf);
             // Mean absolute deviation from the centre (128 = silence in
             // unsigned 8-bit PCM), normalised to [0, 1]. At typical TTS
@@ -1926,7 +1976,7 @@ $startBtn.onclick = async () => {
 
         ws.onmessage = (e) => {
             if (e.data instanceof ArrayBuffer) {
-                queueAudio(e.data);
+                handlePCMChunk(e.data);
                 return;
             }
             const msg = JSON.parse(e.data);
@@ -1939,7 +1989,15 @@ $startBtn.onclick = async () => {
                     thinking:  "Thinking…",
                     speaking:  "Speaking…",
                 };
-                setStatus(labels[msg.state] || msg.state, msg.state);
+                if (msg.state === "listening" && isPlayingBack) {
+                    // Ring buffer still playing — defer the visual
+                    // transition so the speaking glow stays until audio
+                    // actually finishes, not just until server is done.
+                    pendingListeningStatus = true;
+                } else {
+                    pendingListeningStatus = false;
+                    setStatus(labels[msg.state] || msg.state, msg.state);
+                }
             } else if (msg.type === "transcript") {
                 addUserMsg(msg.text);
             } else if (msg.type === "response_chunk") {
@@ -1951,7 +2009,10 @@ $startBtn.onclick = async () => {
                 stopPlayback();
                 finalizeAssistantMsg();
             } else if (msg.type === "tts_done") {
-                // no-op
+                // Tell the playback worklet no more audio is coming for this
+                // response. It will fire "drained" when the ring buffer empties,
+                // which triggers playback_end → server clears client_playing.
+                if (playbackNode) playbackNode.port.postMessage({ type: "tts_done" });
             } else if (msg.type === "scene") {
                 $sceneChip.classList.remove("empty");
                 latestActivity = msg.text || "";
@@ -2098,6 +2159,8 @@ function stop() {
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
     if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    if (playbackCtx) { playbackCtx.close(); playbackCtx = null; playbackNode = null; }
+    isPlayingBack = false; bargingIn = false; pendingListeningStatus = false;
     updateMicRing(0);
     $visionNotice.classList.remove("show");
     $video.classList.remove("hidden");

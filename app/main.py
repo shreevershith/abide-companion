@@ -145,7 +145,21 @@ async def _on_shutdown() -> None:
 
 # Persistent HTTP/2 client for the analysis endpoint. Module-level so we
 # don't pay TCP+TLS handshake per call (~300-500ms). Reused across sessions.
-_analyze_client = httpx.AsyncClient(timeout=30.0, http2=True)
+# Split connect vs read timeout: 5 s is enough to establish TLS to Anthropic;
+# 25 s gives the model time to stream up to 500 tokens. A combined 30 s
+# timeout would let a hung connection stall the handler for 30 s before
+# the read phase even starts.
+_analyze_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=5.0, read=25.0),
+    http2=True,
+)
+
+# Most-recent session's Anthropic key, stored server-side at WS config time.
+# /api/analyze uses this instead of accepting a key from the request body,
+# preventing an adversarial page from relaying arbitrary keys through the
+# local server. Falls back to the body key only if no session has run since
+# server start (e.g. a test caller hitting the endpoint directly).
+_last_session_anthropic_key: str | None = None
 
 ANALYZE_PROMPT = (
     "Review this conversation between Abide (an AI elderly care companion) and a user. "
@@ -171,12 +185,32 @@ async def analyze_session(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    history = body.get("history", [])
-    activity_log = body.get("activity_log", "")
-    api_key = body.get("api_key", "")
+    # Input validation ── size caps prevent a multi-MB payload from
+    # being forwarded verbatim to the Anthropic API.
+    raw_history = body.get("history", [])
+    if not isinstance(raw_history, list):
+        raw_history = []
+    # Sanitize: only user/assistant turns, cap per-message content, last 60 turns.
+    history = [
+        {
+            "role": m["role"],
+            "content": str(m.get("content", ""))[:5_000],
+        }
+        for m in raw_history[-60:]
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+    ]
 
+    activity_log = body.get("activity_log", "")
+    if not isinstance(activity_log, str):
+        activity_log = ""
+    activity_log = activity_log[:50_000]  # 50 KB max
+
+    # Prefer the key cached from the most recent WS session so the API
+    # key doesn't need to travel in the request body. Fall back to the
+    # body key for backward compat (e.g. direct test calls).
+    api_key = _last_session_anthropic_key or body.get("api_key", "")
     if not api_key:
-        return JSONResponse({"error": "Missing API key"}, status_code=400)
+        return JSONResponse({"error": "No API key available — start a session first"}, status_code=400)
     if not history:
         return JSONResponse({"analysis": "No conversation to analyze."})
 
@@ -221,7 +255,7 @@ async def analyze_session(request: Request) -> JSONResponse:
         return JSONResponse({"analysis": text.strip()})
 
     except Exception as e:
-        log.error("Analysis request failed: %s", e)
+        log.error("Analysis request failed: %s: %r", type(e).__name__, e)
         return JSONResponse({"error": "Analysis failed"}, status_code=500)
 
 
@@ -514,6 +548,12 @@ async def websocket_endpoint(ws: WebSocket):
     # so hides the raw incoming rate.
     face_bbox_recv_count = 0
     face_bbox_rate_window_start = time.monotonic()
+    # Simple per-message rate gate for face_bbox. Client should send at
+    # ≤5 Hz; we tolerate up to 15 Hz before dropping silently. Prevents
+    # a runaway client from flooding the event loop with bbox validation
+    # work even though dispatch_face_bbox already throttles PTZ nudges.
+    _BBOX_MIN_INTERVAL_S = 1.0 / 15  # 15 Hz ceiling
+    _bbox_last_accept_ts = 0.0
 
     # Telemetry — one session id per WS connection, shared across all turns.
     # Langfuse client is None if LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are
@@ -630,6 +670,8 @@ async def websocket_endpoint(ws: WebSocket):
                     )
 
                     if anthropic_key:
+                        global _last_session_anthropic_key
+                        _last_session_anthropic_key = anthropic_key
                         engine = ConversationEngine(api_key=anthropic_key)
                         # Phase S.1 — bake per-session camera capabilities
                         # into the cacheable system prompt once at connect.
@@ -865,17 +907,22 @@ async def websocket_endpoint(ws: WebSocket):
                     # or adversarial client can't feed us overflow-sized
                     # floats that would blow up `nudge_to_bbox`'s arithmetic.
                     bbox = data.get("bbox")
-                    if (
-                        isinstance(bbox, list)
-                        and len(bbox) == 4
-                        and all(
-                            isinstance(v, (int, float))
-                            and not isinstance(v, bool)
-                            and 0.0 <= float(v) <= 1.0
-                            for v in bbox
-                        )
-                    ):
-                        session.dispatch_face_bbox([float(v) for v in bbox])
+                    _now_bbox = time.monotonic()
+                    if _now_bbox - _bbox_last_accept_ts >= _BBOX_MIN_INTERVAL_S:
+                        _bbox_last_accept_ts = _now_bbox
+                        if (
+                            isinstance(bbox, list)
+                            and len(bbox) == 4
+                            and all(
+                                isinstance(v, (int, float))
+                                and not isinstance(v, bool)
+                                and 0.0 <= float(v) <= 1.0
+                                for v in bbox
+                            )
+                            and float(bbox[0]) < float(bbox[2])   # x1 < x2
+                            and float(bbox[1]) < float(bbox[3])   # y1 < y2
+                        ):
+                            session.dispatch_face_bbox([float(v) for v in bbox])
 
                     # Receive-rate telemetry. Client is supposed to cap
                     # at 5 Hz (POSE_BBOX_SEND_INTERVAL_MS = 200 in
@@ -1059,18 +1106,31 @@ async def websocket_endpoint(ws: WebSocket):
                             audio_events_task = asyncio.create_task(
                                 audio_events.classify_segment(pcm)
                             )
-                            # Consistency with the other prewarm tasks
-                            # in this module — surface unhandled
-                            # exceptions instead of relying on Python's
-                            # GC-time warning. classify_segment()
-                            # itself swallows classifier errors and
-                            # returns [], but any schedule-side
-                            # exception (e.g. a refcount issue on the
-                            # shared pcm buffer) would otherwise
-                            # disappear.
-                            audio_events_task.add_done_callback(
-                                _log_prewarm_exception("audio-events")
-                            )
+                            # Fire-and-forget: store result on session when
+                            # done; injected into the NEXT turn's Claude prompt.
+                            # This removes the entire YAMNet await (~900-1400 ms
+                            # on longer utterances) from the TTFA critical path.
+                            # A cough detected in turn N reaches Claude in turn
+                            # N+1 ("I noticed you coughed a moment ago…"), which
+                            # is imperceptible for welfare signals. D102 adds
+                            # _pending_audio_events_context to Session.
+                            def _store_audio_events(task, _sess=session):
+                                if task.cancelled():
+                                    return
+                                exc = task.exception()
+                                if exc is not None:
+                                    log.debug("Audio events task failed (%s)", type(exc).__name__)
+                                    return
+                                events = task.result()
+                                if events:
+                                    _sess._pending_audio_events_context = (
+                                        audio_events.format_events_for_prompt(events)
+                                    )
+                                    log.info(
+                                        "[AUDIO-EVENTS] detected: %s",
+                                        ", ".join(f"{e.tag}:{e.confidence:.2f}" for e in events),
+                                    )
+                            audio_events_task.add_done_callback(_store_audio_events)
                         text = await transcribe(
                             wav_bytes,
                             groq_key,
@@ -1108,24 +1168,12 @@ async def websocket_endpoint(ws: WebSocket):
                                     latency_ms=stt_latency_ms,
                                 )
 
-                                # Audio-event classification was kicked off
-                                # in parallel with Whisper at the top of this
-                                # branch. Await the result here — typically
-                                # already resolved by now, so this adds at
-                                # most a few ms when Whisper was the
-                                # bottleneck. See Phase U.3 follow-up #3.
-                                audio_events_context = ""
-                                if audio_events_task is not None:
-                                    try:
-                                        events = await audio_events_task
-                                        if events:
-                                            audio_events_context = audio_events.format_events_for_prompt(events)
-                                            log.info(
-                                                "[AUDIO-EVENTS] detected: %s",
-                                                ", ".join(f"{e.tag}:{e.confidence:.2f}" for e in events),
-                                            )
-                                    except Exception as e:
-                                        log.debug("Audio event classification skipped: %s", e)
+                                # Pull audio-events context detected during the
+                                # PREVIOUS turn's YAMNet run (fire-and-forget,
+                                # stored by _store_audio_events callback above).
+                                # Consume and clear so each event is injected once.
+                                audio_events_context = session._pending_audio_events_context
+                                session._pending_audio_events_context = ""
 
                                 # Launch response as concurrent task (non-blocking).
                                 # Pass through speech_end_ts + stt_latency_ms so

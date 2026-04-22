@@ -659,11 +659,83 @@ Format for each entry:
 - Fix: `if abs(oy) >= _TILT_DEAD_ZONE` in `nudge_to_bbox()`. At 0.35, tilt only fires when the subject is truly at the extreme edge of frame, not just standing normally. Pan still uses 0.15 for responsive left/right tracking.
 - Trade-offs: Tilt tracking is now essentially dormant for most seated and standing positions. That is intentional for this narrow-range hardware (MeetUp tilt range is only +-15 total). Wider-range PTZ cameras could use a smaller _TILT_DEAD_ZONE.
 
+### D103. PCM streaming TTS — AudioWorklet ring buffer replaces buffered Ogg/Opus
+
+- Decision: Changed OpenAI TTS `response_format` from `"opus"` to `"pcm"` across `tts.py`. Added `stream_sentence()` async generator that yields raw 16-bit LE PCM chunks (24 kHz, mono) as they arrive. Session producer launches each sentence as a fill-task + per-sentence `asyncio.Queue`; consumer forwards each chunk to the WebSocket immediately. Frontend `PlaybackProcessor` AudioWorklet maintains an 8-second ring buffer on a dedicated `AudioContext({ sampleRate: 24000 })`; `tts_done` JSON triggers drain detection; `"drained"` worklet message fires `playback_end`.
+- Context: Under the buffered Ogg/Opus approach the consumer awaited `synthesize()` — a coroutine that collected the entire sentence before returning — then sent one large blob. `decodeAudioData` on the frontend then decoded the complete Ogg container before playback could start. The accumulated buffering cost was ~1100-1700 ms beyond the first-byte arrival from OpenAI. Raw PCM has no container, so the first ~4 KB chunk (~85 ms of audio) can be forwarded and played as soon as it arrives (~100-300 ms into the TTS call).
+- Alternatives considered: Ogg/Opus with chunked forwarding (not viable — `decodeAudioData` requires a complete Ogg container with both headers present; partial frames are rejected). WebM/Opus with `SourceBuffer` (MSE): viable on Chrome but Firefox on older Windows lacks MSE for audio. PCM with resampling: OpenAI returns 24 kHz, system AudioContext is usually 44.1/48 kHz; solved cleanly by `new AudioContext({ sampleRate: 24000 })` for the playback context while keeping the existing capture context at system rate.
+- Trade-offs: Raw PCM is ~12x larger than Opus per second (48 KB/s vs ~4 KB/s); a 3-second sentence is ~144 KB vs ~12 KB. Still well within WebSocket and memory budgets. Cache entries (prewarm phrases) now store PCM; cache is in-memory and small (≤64 entries, ~9 MB peak). Barge-in adds a 300 ms `bargingIn` flag to drop stale in-flight WS chunks rather than the `playbackEpoch` counter used in the old `processNextAudio` path.
+- Expected gain: ~300-600 ms TTFA reduction on the first sentence. Subsequent sentences were already overlapped by the producer/consumer gather; the per-sentence gain is the Ogg decode overhead (~100-200 ms) removed.
+
 ### D101. macOS start.command launcher plus Gatekeeper documentation
 - Decision: Ship start.command alongside start.sh as a Finder-double-clickable macOS sibling with identical contents; add .gitattributes forcing LF endings on shell scripts so Windows-committed scripts still run on Mac/Linux; document the one-time Gatekeeper right-click-Open bypass rather than Apple-sign the binaries.
 - Context: macOS Finder opens .sh files in TextEdit on double-click, and every downloaded file gets Gatekeeper-quarantined regardless of format (.app/.command/.pkg/.dmg all blocked) unless Apple-Developer-signed and notarized.
 - Alternatives considered: py2app bundle (same Gatekeeper block, no advantage), ship only .command (breaks Linux convention), xattr -d com.apple.quarantine in launcher (requires terminal, violates brief), $99/year Apple Developer ID signing (rejected for eval-phase build).
 - Trade-offs: One-time right-click-Open on first macOS launch; two launcher files instead of one (small duplication, zero user confusion); .gitattributes mandated to prevent Windows CRLF from breaking bash on Mac/Linux.
+
+### D104. Architecture review + three targeted robustness fixes (Phase W)
+
+**Context:** Full system design review conducted across all pipelines (audio/STT, vision, LLM, TTS, YAMNet, memory, PTZ, security). Identified eight gaps; three shipped immediately as the highest-impact / lowest-risk changes. Remaining five documented below as future work.
+
+**Fix 1 — Groq Whisper retry on timeout** (`app/audio.py`)
+- Decision: Wrap `asyncio.wait_for(client.audio.transcriptions.create(...))` in a two-attempt loop with a 1 s gap, returning `""` (silent drop) only if both timeout.
+- Context: Claude and TTS both have first-token / first-byte deadlines with retry (D97, D103). Whisper was the only pipeline on the hot path with no retry — a single Groq stall silently dropped the user's utterance. Elderly user would have to repeat themselves without knowing why.
+- Alternatives: surfacing a retry-prompt to the user ("I didn't catch that") — adds UX friction for what is a transient network hiccup. Silent retry is the right default.
+- Trade-offs: Worst-case adds `STT_TIMEOUT_S` (8 s) to turn latency on a double-timeout. That path is rare; the benefit on the single-timeout path (drops from ~8 s silent wait to 1 s gap + second attempt) outweighs the tail risk. `t_start` moved inside the loop so `api_ms` measures the successful call only.
+
+**Fix 2 — YAMNet confidence threshold 0.30 → 0.40** (`app/audio_events.py`)
+- Decision: Raise `_CONFIDENCE_THRESHOLD` from 0.30 to 0.40.
+- Context: 0.30 was calibrated for maximum recall ("we'd rather Claude see a speculative maybe-cough"). In practice it generated spurious `Cough` and `Throat clearing` tags from ambient noise and breathing, causing unnecessary welfare reactions that eroded user trust. 0.40 still catches the clear events (loud cough, audible gasp, unmistakable sneeze — all score 0.5+ on real events) while suppressing the borderline low-confidence detections that are noise.
+- Alternatives: per-class thresholds (e.g., 0.30 for Gasp, 0.45 for Cough). More granular but adds maintenance surface. A single higher threshold is easier to reason about and adjust.
+- Trade-offs: Slightly lower recall on distant or partially-occluded events. Recoverable one-line change if clinical testing suggests we're missing real events.
+
+**Fix 3 — Defer `status: listening` until ring buffer drains** (`frontend/index.html`)
+- Decision: When `status: listening` arrives from the server while `isPlayingBack === true`, set `pendingListeningStatus = true` instead of immediately calling `setStatus`. On `drained`, apply the deferred transition.
+- Context: The server sends `status: listening` immediately after `response_done` / `tts_done` — while the ring buffer still holds 1–3 s of audio. The hero amber glow and `speaking` animation were disappearing while Abide was still audibly speaking, because `setStatus("Listening", "listening")` removes the `speaking` class from the hero. This looked like a visual glitch: audio playing, but the UI showing idle state.
+- Root cause: The server has no way to know when the client's ring buffer is actually empty; it sends the status transition as soon as it finishes its own pipeline. The correct trigger is the `drained` worklet message, which fires when `this._n === 0` after `tts_done` is received.
+- Alternatives: Server waits for `playback_end` before sending `status: listening`. This couples the server's state machine to client playback timing, which slows the barge-in window reopening and complicates the stall/error paths. Frontend deferral is simpler and doesn't change the server protocol.
+- Trade-offs: If `drained` never fires (ring-buffer stuck), the status stays on `speaking` indefinitely. Mitigated by `_CLIENT_PLAYING_STALENESS_S = 60` stale-flag guard on the server side, which would force-clear `client_playing` after 60 s.
+
+**Remaining gaps documented, not shipped:**
+- Adaptive vision frame rate (motion-triggered sampling) — cost optimization, not correctness.
+- JPEG quality control from canvas — minor cost/quality tuning.
+- File locking on `memory/<id>.json` — low risk for single-user desktop use.
+- Output safety filter — product-liability consideration for future clinical deployment.
+- Single-model dependency / fallback — availability improvement, larger architecture change.
+
+### D105. Security, performance, and error-handling audit — full fix batch (Phase X)
+
+Full codebase audit covering security vulnerabilities, performance bottlenecks, and inconsistent error handling. Ten concrete changes across four files.
+
+**`app/main.py` — five changes**
+
+- **Server-side Anthropic key for `/api/analyze`** — previously the endpoint accepted `api_key` from the POST body, making it a potential credential relay (any page on localhost could POST with an arbitrary key). Now: `_last_session_anthropic_key` module-level variable is set at WS config time; `/api/analyze` uses it, falling back to the body key only if no session has run since server start. The API key no longer needs to travel in the request body for normal usage.
+- **`/api/analyze` input validation** — `history` was passed through verbatim (no type check, no per-message size cap, no turn limit). A malicious or buggy client could POST megabytes of history. Now: `history` is sanitized to the last 60 turns × 5 KB per message with role validation; `activity_log` is capped at 50 KB; type guards (`isinstance` checks) on both before they reach the Claude context builder.
+- **Split connect/read timeout on `_analyze_client`** — was `timeout=30.0` (combined). A hung Anthropic connection would block the handler for the full 30 s before the read phase even started. Now: `httpx.Timeout(connect=5.0, read=25.0)` — connection failures surface fast; the read phase still has plenty of runway for 500-token generation.
+- **`face_bbox` geometry validation** — added `x1 < x2` and `y1 < y2` checks. Previously an inverted bbox `[1.0, 1.0, 0.0, 0.0]` passed validation and reached `nudge_to_bbox` arithmetic with a backwards centroid.
+- **`face_bbox` per-message rate gate** — `_BBOX_MIN_INTERVAL_S = 1.0 / 15` (15 Hz ceiling vs. client spec of 5 Hz). Messages arriving above the ceiling are dropped before validation runs, protecting the event loop from a runaway client. The existing per-100-message rate telemetry log is preserved for diagnostics.
+
+**`app/audio.py` — two changes**
+
+- **`import httpx`** — added so `httpx.TransportError` is resolvable in the retry clause.
+- **Whisper retry catches `httpx.TransportError`** — previously only `asyncio.TimeoutError` was retried. A Groq connection reset (`httpx.RemoteProtocolError`, `httpx.ConnectError`) would not retry, silently dropping the user's utterance. Now both are caught; the log message includes `type(exc).__name__` so the specific error is visible.
+
+**`app/session.py` — three changes**
+
+- **Defensive `try/except` in `_log_bg_exception` callback** — `task.exception()` can raise `CancelledError` if the task is cancelled in the narrow window between the `cancelled()` check and the `exception()` call. asyncio silently discards exceptions raised inside done-callbacks, so this was an invisible failure mode. Wrapped in `try/except Exception` with an `[BUG]`-prefixed ERROR log.
+- **`CancelledError` reason in log** — hard-cancel path now logs `"user-interrupted"` when `self._cancelled` is set, `"network-drop"` otherwise. Previously the single log line was identical for both causes, making session analysis harder.
+- **Telemetry `except Exception` log level differentiated** — `end_turn_trace` failure was always `log.debug(...)`. Programmer errors (`AttributeError`, `TypeError`) are now `log.warning(...)` so they surface in dev logs; transient Langfuse network errors stay `log.debug(...)`.
+
+**`app/vision.py` — one change**
+
+- **`VisionBuffer.as_context()` TTL filter** — entries older than `ENTRY_TTL_S = 900.0` s (15 min) are silently excluded before the context string is built. The 5-entry rolling cap means a single stale entry could pollute "recent activity history" if vision was quiet during a long break (e.g. user left for 20 min and came back). 15 min is chosen to cover bathroom breaks and short errands while discarding anything genuinely stale.
+
+**Findings skipped (false positives or by-design):**
+- Vision JSON parse guard — already present at `vision.py:474` (`try/except json.JSONDecodeError`).
+- TTS cache race condition — asyncio is single-threaded; no true concurrent race on `_get_client()`.
+- User name Whisper prompt injection — already filtered: `"".join(c for c in clean_name if c.isalnum() or c in " -'.")` at `audio.py:415`.
+- API keys in localStorage — deliberate product design; noted in Known Limitations.
+- CSRF on WebSocket — mitigated by `127.0.0.1` bind and `_ALLOWED_ORIGINS` origin check.
 
 ---
 

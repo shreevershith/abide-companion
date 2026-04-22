@@ -167,7 +167,7 @@ async def synthesize(text: str, api_key: str, sentence_detected_ts: float | None
         "model": "tts-1",
         "voice": "nova",
         "input": speakable,
-        "response_format": "opus",
+        "response_format": "pcm",
     }
 
     t_call = time.monotonic()
@@ -252,6 +252,116 @@ async def synthesize(text: str, api_key: str, sentence_detected_ts: float | None
     return audio
 
 
+async def stream_sentence(
+    text: str,
+    api_key: str,
+    sentence_detected_ts: float | None = None,
+):
+    """Async generator: yields raw PCM chunks (16-bit LE, 24 kHz, mono) as they
+    arrive from OpenAI TTS.
+
+    Cache hit path: yields the cached bytes in one shot and returns.
+    Live path: streams from OpenAI, yielding each ~4 KB chunk (~85 ms of audio)
+    as it lands — first chunk arrives ~100-300 ms into the call, so the
+    browser can start playing before synthesis is complete.
+
+    Graceful degradation:
+      - Emoji-only text → yields nothing (empty generator).
+      - First-byte timeout → yields nothing (same as synthesize()).
+      - APIKeyError → re-raised so session.py can surface it to the UI.
+    """
+    speakable = _strip_nonspeakable(text)
+    if not speakable:
+        log.info("[TTS] Skipping emoji-only sentence: %r", text[:40])
+        return
+
+    cache_key = _normalize_phrase(speakable)
+    cached = _tts_cache.get(cache_key)
+    if cached is not None:
+        if sentence_detected_ts is not None:
+            ms = (time.monotonic() - sentence_detected_ts) * 1000
+            log.info("[TTS-CACHE] Hit '%s...' (sentence\u2192first=%.0fms, %dB)", text[:40], ms, len(cached))
+        else:
+            log.info("[TTS-CACHE] Hit '%s...' (%dB)", text[:40], len(cached))
+        yield cached
+        return
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "tts-1",
+        "voice": "nova",
+        "input": speakable,
+        "response_format": "pcm",
+    }
+
+    t_call = time.monotonic()
+    first_byte_ts: float | None = None
+    total_bytes = 0
+
+    client = _get_client()
+    try:
+        timeout_cm = asyncio.timeout(_TTS_FIRST_BYTE_TIMEOUT_S)
+        async with timeout_cm:
+            async with client.stream("POST", TTS_URL, headers=headers, json=payload) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    log.error("TTS error %d: %s", resp.status_code, body[:200])
+                    if resp.status_code == 401:
+                        raise APIKeyError(
+                            "Please check your OpenAI API key in the settings panel (gear icon)."
+                        )
+                    raise Exception(f"TTS API returned {resp.status_code}: {body[:200]!r}")
+
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    if first_byte_ts is None:
+                        first_byte_ts = time.monotonic()
+                        timeout_cm.reschedule(None)
+                        if sentence_detected_ts is not None:
+                            log.info(
+                                "[TIMING] TTS first byte '%s...' | sentence\u2192first=%.0fms call\u2192first=%.0fms",
+                                text[:40],
+                                (first_byte_ts - sentence_detected_ts) * 1000,
+                                (first_byte_ts - t_call) * 1000,
+                            )
+                    total_bytes += len(chunk)
+                    if total_bytes > _MAX_TTS_BYTES:
+                        log.warning(
+                            "TTS response exceeded %d bytes (%d) — aborting stream",
+                            _MAX_TTS_BYTES, total_bytes,
+                        )
+                        return
+                    yield chunk
+    except TimeoutError:
+        log.warning(
+            "[STALL] TTS first-byte deadline (%.1fs) tripped for %r — skipping",
+            _TTS_FIRST_BYTE_TIMEOUT_S, text[:40],
+        )
+        return
+
+    t_done = time.monotonic()
+    total_api_ms = (t_done - t_call) * 1000
+    first_to_done_ms = (t_done - first_byte_ts) * 1000 if first_byte_ts else -1
+    if sentence_detected_ts is not None:
+        log.info(
+            "[TIMING] TTS done '%s...' | sentence\u2192call=%.0fms first\u2192last=%.0fms total=%.0fms size=%dB",
+            text[:40],
+            (t_call - sentence_detected_ts) * 1000,
+            first_to_done_ms,
+            total_api_ms,
+            total_bytes,
+        )
+    else:
+        log.info(
+            "[TIMING] TTS done '%s...' | first\u2192last=%.0fms total=%.0fms size=%dB",
+            text[:40], first_to_done_ms, total_api_ms, total_bytes,
+        )
+
+
 # Hard cap on the cache size. The cache is module-level and persists
 # for the server process lifetime; this guard prevents unbounded growth
 # if someone ever passes a large phrase list to prewarm_cache().
@@ -281,7 +391,7 @@ async def _prewarm_single(phrase: str, api_key: str) -> None:
             "model": "tts-1",
             "voice": "nova",
             "input": speakable,
-            "response_format": "opus",
+            "response_format": "pcm",
         }
         client = _get_client()
         chunks: list[bytes] = []

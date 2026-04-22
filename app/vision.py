@@ -270,6 +270,12 @@ class VisionBuffer:
     # Seconds after which a stable activity gets re-injected as a reminder.
     # Below this, as_context() returns "" to avoid Claude repeating itself.
     STABLE_REMIND_S = 30.0
+    # Entries older than this are excluded from the injected context.
+    # 5-entry cap means a single stale entry can skew "recent history" if
+    # vision was quiet for a long time (e.g. user left the room for 20 min,
+    # came back). 15 minutes is a safe TTL: enough to cover a bathroom break
+    # or short errand; old enough that anything older is genuinely stale.
+    ENTRY_TTL_S = 900.0
 
     def as_context(self) -> str:
         """Format the buffer for injection into Claude's system prompt.
@@ -279,11 +285,17 @@ class VisionBuffer:
         has been stable (same 3+ times) for less than STABLE_REMIND_S seconds
         (suppresses redundant "still sitting" commentary). Includes relative
         timestamps so Claude has temporal awareness of activity changes.
+        Entries older than ENTRY_TTL_S are silently excluded so stale
+        observations from a long-ago part of the session don't pollute context.
         """
         if not self.entries:
             return ""
 
         now = time.monotonic()
+        # Filter out entries older than the TTL before stability checks.
+        live_entries = [e for e in self.entries if (now - e.ts) < self.ENTRY_TTL_S]
+        if not live_entries:
+            return ""
         # Stability suppression: if the activity hasn't changed recently
         # AND we already injected less than STABLE_REMIND_S seconds ago,
         # skip injection so Claude stops saying "I still see you sitting".
@@ -299,7 +311,7 @@ class VisionBuffer:
             self._last_stable_inject_ts = now
 
         lines = ["Recent activity history (most recent last):"]
-        for e in self.entries:
+        for e in live_entries:
             ago = now - e.ts
             if ago < 10:
                 label = "just now"

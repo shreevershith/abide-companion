@@ -6,6 +6,7 @@ import logging
 import re
 import time
 import wave
+import httpx
 import numpy as np
 import torch
 from silero_vad import load_silero_vad, VADIterator
@@ -389,7 +390,6 @@ async def transcribe(
     the session. Dynamic prompt biasing — see D25c for the general rule
     (only bias on rare-word disambiguation, never conversational filler).
     """
-    t_start = time.monotonic()
     client = _get_groq_client(api_key)
     # Whisper accepts a `prompt` string as a biasing hint — not part of
     # the audio, just context used to weight the decoder's vocabulary.
@@ -429,16 +429,40 @@ async def transcribe(
     # language arrives in `result.language` and we log it. Claude 4.6
     # is multilingual so it naturally responds in whatever language
     # the transcript is in — no extra plumbing needed.
-    result = await asyncio.wait_for(
-        client.audio.transcriptions.create(
-            file=("audio.wav", wav_bytes),
-            model="whisper-large-v3",
-            prompt=stt_prompt,
-            response_format="verbose_json",
-            temperature=0.0,
-        ),
-        timeout=STT_TIMEOUT_S,
-    )
+    #
+    # Retry: one silent retry with 1 s gap on asyncio.TimeoutError.
+    # Matches the Claude first-token (D97) and TTS first-byte patterns.
+    # On a Groq-side stall the user doesn't need to re-speak; if both
+    # attempts fail we drop the segment and return "" (handled upstream
+    # as "Empty transcript, skipping").  t_start is inside the loop so
+    # api_ms measures only the successful attempt.
+    for _attempt in range(2):
+        t_start = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                client.audio.transcriptions.create(
+                    file=("audio.wav", wav_bytes),
+                    model="whisper-large-v3",
+                    prompt=stt_prompt,
+                    response_format="verbose_json",
+                    temperature=0.0,
+                ),
+                timeout=STT_TIMEOUT_S,
+            )
+            break  # success — exit retry loop
+        except (asyncio.TimeoutError, httpx.TransportError) as exc:
+            if _attempt < 1:
+                log.warning(
+                    "[RETRY] Groq Whisper error on attempt 1 (%s) — retrying in 1s",
+                    type(exc).__name__,
+                )
+                await asyncio.sleep(1.0)
+                continue
+            log.warning(
+                "[STT] Groq Whisper failed after 2 attempts (%s) — dropping segment",
+                type(exc).__name__,
+            )
+            return ""
     t_done = time.monotonic()
     api_ms = (t_done - t_start) * 1000
 
