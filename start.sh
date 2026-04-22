@@ -49,8 +49,14 @@ echo " [3/4] Installing / verifying dependencies (first run may take a few minut
 .venv/bin/python -m pip install -r requirements.txt --quiet
 
 # --- 5. Launch uvicorn in the background so we can also open the browser ---
+# Bind to 127.0.0.1 (loopback only) so the WebSocket + /api/analyze
+# endpoints are not exposed to the LAN. Abide runs on the same machine
+# as the user; loopback is all we need. Switch to 0.0.0.0 only if you
+# understand the security trade-off — anyone on the same Wi-Fi could
+# otherwise open a WS to this server and drive the assistant, or use
+# /api/analyze as an anonymous Anthropic proxy.
 echo " [4/4] Starting Abide Companion on http://localhost:8000 ..."
-.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 UVICORN_PID=$!
 
 # --- 6. Wait for port to bind, open browser ---

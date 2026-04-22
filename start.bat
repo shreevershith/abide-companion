@@ -66,8 +66,14 @@ if errorlevel 1 (
 )
 
 REM --- 5. Launch uvicorn in a new window so this script can open the browser ---
+REM Bind to 127.0.0.1 (loopback only) so the WebSocket + /api/analyze
+REM endpoints are not exposed to the LAN. Abide runs on the same
+REM machine as the user; loopback is all we need. Switch to 0.0.0.0
+REM only if you understand the security trade-off — anyone on the
+REM same Wi-Fi could otherwise open a WS to this server and drive the
+REM assistant, or use /api/analyze as an anonymous Anthropic proxy.
 echo  [4/4] Starting Abide Companion on http://localhost:8000 ...
-start "Abide Companion" cmd /k ".venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
+start "Abide Companion" cmd /k ".venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
 
 REM --- 6. Give uvicorn a moment to bind the port, then open the browser ---
 timeout /t 3 /nobreak >nul

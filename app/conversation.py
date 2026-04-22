@@ -1,5 +1,6 @@
 """Claude conversation engine with streaming responses via direct httpx."""
 
+import asyncio
 import json
 import logging
 import re
@@ -9,6 +10,24 @@ from collections.abc import AsyncGenerator
 import httpx
 
 log = logging.getLogger("abide.conversation")
+
+# Phase U.3 follow-up #4 — hard cap on how long we'll wait for Claude to
+# emit its first token before we abort the stream and fail the turn.
+# Live session `abide-63d2e9245567` had THREE separate Claude requests
+# produce zero output for 4 s / 12 s / 17 s before the user spoke again
+# and barge-in cancelled them — Anthropic never sent `message_start`,
+# so the stream just sat there. With no timeout the user hears silence
+# and assumes Abide is dead. 15 s is well above normal p95 TTFT (~2-3 s)
+# so genuine slow-but-working responses still complete; anything past
+# that is almost certainly an API-side stall and failing fast lets us
+# surface a friendly message + recover to "listening" cleanly.
+_CLAUDE_FIRST_TOKEN_TIMEOUT_S = 15.0
+
+# Threshold for "this looked like an API stall" post-hoc warning log.
+# A response that ended with zero output tokens AND spent more than this
+# in total is recorded at WARNING so stalls are greppable across
+# sessions, even if we didn't trip the hard deadline above.
+_CLAUDE_STALL_WARN_MS = 5000.0
 
 # Phase R — camera-action marker. Claude emits `[[CAM:<action>]]` at the
 # very start of a reply to request a hardware camera action (currently
@@ -21,6 +40,34 @@ _CAM_MARKER_RE = re.compile(r"^\s*\[\[CAM:([a-z_]+)\]\]\s*", re.IGNORECASE)
 _CAM_MARKER_PREFIX = "[[CAM:"
 _CAM_MARKER_MAX_BUFFER = 40  # give up after this many chars — a real marker is <25
 _CAM_ALLOWED_ACTIONS = frozenset({"zoom_in", "zoom_out", "zoom_reset"})
+
+# Phase S.3 follow-up — defence-in-depth strip for XML-like tags that
+# Claude occasionally mirrors into its reply despite SYSTEM_PROMPT
+# forbidding it (observed once in-session: Claude prefixed a reply with
+# `<audio_events>cough detected</audio_events>\n\n` after being taught
+# the incoming tag format).
+#
+# Phase U follow-up: narrowed the tag capture from `\w+` to a closed
+# whitelist of the three known sensor tags, so a legitimate inline HTML
+# fragment Claude might emit for emphasis (`<b>bold</b>` etc.) doesn't
+# get silently eaten. Strict balanced-pair match — dangling `<tag>`
+# without a close is left intact so a bracket used in normal prose
+# (e.g. `<` comparison, `< 5 minutes ago`) never gets stripped.
+_LEADING_XML_BLOCK_RE = re.compile(
+    r"\A\s*<(?P<tag>audio_events|camera_observations|turn_context)[^>]*>.*?</(?P=tag)>\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_leading_xml_defensive(text: str) -> tuple[str, bool]:
+    """Strip any leading `<tag>...</tag>` blocks from the head of a
+    streamed Claude reply. Returns (cleaned_text, was_stripped)."""
+    prev = None
+    cur = text
+    while prev != cur:
+        prev = cur
+        cur = _LEADING_XML_BLOCK_RE.sub("", cur)
+    return cur, cur != text
 
 
 def _marker_still_possible(buf: str) -> bool:
@@ -46,7 +93,15 @@ class ConversationError(Exception):
     is safe to show to the end user — implementation details are in logs."""
 
 MODEL = "claude-sonnet-4-6"  # Phase P — was "claude-sonnet-4-20250514"; upgraded for ~10-20% faster TTFT + better quality. Revert if eval session shows regression.
-MAX_HISTORY = 20  # messages (10 turns)
+# Phase U.3 follow-up: bumped 20 → 60 so the prompt-cache prefix stays
+# stable across a typical 20-30 min session. With MAX_HISTORY = 20 the
+# oldest message gets sliced off on turn 11, shifting the sequence that
+# the cache_control marker on messages[-2] was written against — so every
+# subsequent turn was a cache miss (`cache_read=0` on all 51 turns of
+# live session `abide-585f1dec5ee2`). 60 messages ≈ 30 turns, enough to
+# cover realistic companion interactions while still capping history
+# before Claude's input grows past ~6-8 k tokens.
+MAX_HISTORY = 60
 API_URL = "https://api.anthropic.com/v1/messages"
 
 SYSTEM_PROMPT = """\
@@ -96,19 +151,75 @@ then the substance, or nothing else.
 - Do not thank the user for the correction or for their patience.
 - Move on quickly and keep the conversation flowing.
 
+INCOMING SENSOR TAGS (read-only, never emit):
+Your prompt may contain delimited sensor blocks. These are READ-ONLY \
+data flowing INTO you from the server — they are NOT response \
+formats. The tags currently in use are:
+  - `<turn_context>...</turn_context>` — ambient time / user / vision \
+context prepended to the user message.
+  - `<camera_observations>...</camera_observations>` — live scene \
+descriptions from the vision model.
+  - `<audio_events>...</audio_events>` — non-speech sounds detected \
+by the audio-event classifier (cough, sneeze, gasp, etc.).
+
+ABSOLUTE RULE: Never output these tags, their content, or any \
+XML-like `<tag>` markup in your reply. Your reply is plain \
+conversational text that will be spoken aloud by TTS. If you emit \
+`<audio_events>` or similar, the user literally hears the server \
+speak "audio events" out loud — never do this. The only marker you \
+are ever allowed to emit is the `[[CAM:...]]` camera-zoom marker \
+described in CAMERA CONTROL; nothing else belongs in your stream.
+
+HOW TO USE THE INCOMING TAGS:
+- When `<audio_events>` contains a health-relevant event (cough, \
+sneeze, gasp, breathlessness), briefly and gently acknowledge it in \
+plain prose — e.g. *"Heard that cough — you doing alright?"* — \
+before responding to what they said. Do NOT echo the tag itself.
+- When no `<audio_events>` block is present, say nothing about audio \
+events. Do NOT fabricate one.
+- Camera observations and turn context inform your reply but are \
+rarely worth verbalising directly.
+
+LEFT / RIGHT CONVENTION:
+Camera observations describe direction from the CAMERA'S point of \
+view (a bbox at x=0.2 is on the left of the camera image). But when \
+YOU speak to the user about direction, always use the USER'S \
+perspective — their left and their right, as if you were facing \
+them. Example: if the camera image shows the subject's hand at the \
+left of the frame, that is the user's RIGHT hand (they are mirrored \
+relative to the camera). Never say "move to your left" when you \
+mean the camera-image left. When in doubt, avoid left/right \
+language entirely — say "the hand you're raising" or "the side \
+closer to the window".
+
 CAMERA CONTROL:
-You can control the camera's optical zoom when the user asks for it. \
-If, and ONLY if, the user asks you to zoom in, zoom out, or reset the \
-zoom, begin your reply with ONE of these markers before any other \
-text:
+You can move the camera the user can see through. Two modes:
+
+1. ZOOM (on spoken request). Emit a marker ONLY when the user's most \
+recent utterance is an unambiguous zoom command. Valid triggers are \
+literal spatial commands like "zoom in", "zoom out", "zoom back", \
+"reset zoom", "closer" (meaning move the camera closer), "pull back", \
+"wider view". Questions about visibility — "can you see me?", "are \
+you able to see my face?", "do I look okay?" — are NOT zoom commands; \
+answer them verbally without emitting a marker. If in doubt, do NOT \
+emit a marker. When a zoom command does fire, begin your reply with \
+ONE of these markers before any other text:
   [[CAM:zoom_in]]     — closer to the subject
   [[CAM:zoom_out]]    — wider view
   [[CAM:zoom_reset]]  — back to the default zoom level
 Then respond naturally in one short sentence (e.g. "Zooming in now.", \
 "Got it, pulling back."). The marker is consumed by the system — the \
 user never sees it. Never mention the marker. Never emit a marker \
-unless the user asked you to. If the user asks for pan or tilt, \
-decline briefly and honestly (you can zoom but not pan/tilt).
+unless the user asked you to.
+
+2. PAN / TILT (automatic subject-follow). On camera hardware that \
+supports it, the camera re-centres on the person as they move around \
+the room — no spoken command is needed. If the user asks you to pan \
+or tilt, consult the "Session camera capabilities" line that will \
+appear at the end of this prompt when the session is live: if pan or \
+tilt is listed as available, reassure them that the camera is already \
+tracking them automatically; if it isn't listed, briefly and honestly \
+say the current camera supports only zoom and can't move otherwise.
 """
 
 
@@ -145,7 +256,9 @@ class ConversationEngine:
         # Phase O — Anthropic prompt-cache telemetry. Populated from
         # the message_start event's usage field when caching is active.
         # None when the API didn't return the keys (pre-caching path or
-        # when the prefix was below the 1024-token activation threshold).
+        # when the cached prefix was below the model's activation
+        # threshold — 2048 tokens for Sonnet 4.6, 1024 for Sonnet 4.5
+        # and earlier; confirmed via Anthropic's GA docs).
         self.last_cache_read_tokens: int | None = None
         self.last_cache_creation_tokens: int | None = None
         # Phase R — camera action emitted by the most recent Claude
@@ -153,6 +266,13 @@ class ConversationEngine:
         # turn by Session's producer, which dispatches it to PTZController.
         # Reset at the start of each respond() call.
         self.last_camera_action: str | None = None
+        # Phase S.1 — optional per-session system prompt override. When
+        # set (main.py assigns it right after PTZController init), the
+        # engine uses this in place of the static SYSTEM_PROMPT. Keeps
+        # the session-invariant hardware context (available camera axes)
+        # inside the cacheable prefix instead of the per-turn ambient
+        # block. None = use module-level SYSTEM_PROMPT as before.
+        self.system_prompt_override: str | None = None
         log.info("ConversationEngine initialized (persistent HTTP/2 client)")
 
     async def prewarm(self):
@@ -185,6 +305,7 @@ class ConversationEngine:
         vision_context: str = "",
         user_context: str = "",
         time_context: str = "",
+        audio_events_context: str = "",
     ) -> AsyncGenerator[str, None]:
         """Stream Claude's response to user_text, yielding text chunks.
 
@@ -200,35 +321,56 @@ class ConversationEngine:
         time of day so Claude can reference it naturally in greetings and
         check-ins (see Session.time_of_day_context). Empty string if the
         browser hasn't reported its timezone yet.
+
+        `audio_events_context`, if provided, is a pre-formatted
+        `<audio_events>...</audio_events>` block from
+        `app.audio_events.format_events_for_prompt()` describing any
+        non-speech sounds (cough, sneeze, gasp, etc.) detected in the
+        user's last utterance. Injected verbatim — this keeps Claude's
+        elderly-care welfare reactions grounded in what was actually
+        heard, not hallucinated from text-only context.
         """
         self._history.append({"role": "user", "content": user_text})
 
         if len(self._history) > MAX_HISTORY:
             self._history = self._history[-MAX_HISTORY:]
 
-        # Phase O (revised, Phase R.1 refinement) — Anthropic prompt caching.
+        # Phase O (revised, Phase R.1 refinement, Phase S.2 threshold
+        # correction) — Anthropic prompt caching.
         #
         # Original Phase O put dynamic turn context (time / user facts /
         # vision) into a second `system` block. That kept SYSTEM_PROMPT
         # stable but meant the *overall prefix* was dynamic (the second
-        # system block changed every turn), so even after the prefix
-        # crossed Anthropic's 1024-token activation threshold the cache
-        # never hit — every log line showed `cache_read=0 cache_create=0`.
+        # system block changed every turn), so the cache never hit.
         #
-        # The fix: keep `system` a single static block (SYSTEM_PROMPT
-        # only) and move dynamic per-turn context into the NEWEST user
-        # message, wrapped in clearly-labelled delimiter blocks so Claude
-        # can tell ambient-context from user speech. Then place a second
-        # cache breakpoint on messages[-2] (the previous completed turn's
+        # Phase R.1 fix: keep `system` as a single static block
+        # (SYSTEM_PROMPT only), move dynamic per-turn context into the
+        # NEWEST user message wrapped in clearly-labelled delimiters
+        # (`<turn_context>...</turn_context>`), and place a second cache
+        # breakpoint on messages[-2] (the previous completed turn's
         # assistant reply) so the growing conversation history is the
-        # cached prefix. Once [system + accumulated turns] crosses 1024
-        # tokens (turn ~3-5), every subsequent turn pays cache-read
-        # pricing on the bulk of the prefix and only gets billed full
-        # rate on the newest user message + response.
+        # cached prefix.
+        #
+        # Phase S.2 correction: the activation threshold for Claude
+        # Sonnet 4.6 is 2048 tokens, not 1024 (the older Sonnet floor).
+        # Our cached-prefix length is `system (~484 tokens) +
+        # accumulated turns`. Typical turn is 30-80 tokens of user +
+        # 15-50 of assistant, so we cross 2048 around turn 15-25,
+        # not turn 3-5. Short sessions will log `cache_read=0` as
+        # expected; long sessions eventually pay cache-read pricing on
+        # the bulk of the prefix and only get billed full rate on the
+        # newest user message + response. Prompt caching is GA now, so
+        # the `anthropic-beta: prompt-caching-2024-07-31` header is no
+        # longer required (and was removed below).
+        # Phase S.1 — prefer the per-session prompt (SYSTEM_PROMPT +
+        # hardware-specific capability note) if main.py supplied one,
+        # falling back to the static module-level SYSTEM_PROMPT for
+        # back-compat. The whole block goes into the cached prefix.
+        system_text = self.system_prompt_override or SYSTEM_PROMPT
         system_blocks: list[dict] = [
             {
                 "type": "text",
-                "text": SYSTEM_PROMPT,
+                "text": system_text,
                 "cache_control": {"type": "ephemeral"},
             },
         ]
@@ -237,6 +379,12 @@ class ConversationEngine:
             dynamic_parts.append(time_context)
         if user_context:
             dynamic_parts.append(user_context)
+        if audio_events_context:
+            # Already wrapped in <audio_events>...</audio_events> by the
+            # formatter — inject verbatim. Same defence-in-depth pattern
+            # as <camera_observations>: delimited sensor data, not
+            # instructions.
+            dynamic_parts.append(audio_events_context)
         if vision_context:
             # Wrap vision output in an explicit delimited block so any text
             # in the scene descriptions is treated as untrusted data, not as
@@ -294,22 +442,30 @@ class ConversationEngine:
 
         # Flat representation for telemetry / logging (Langfuse sees a
         # single combined "system prompt + ambient context" per turn).
-        system_prompt_flat = SYSTEM_PROMPT
+        system_prompt_flat = system_text
         if dynamic_parts:
-            system_prompt_flat = SYSTEM_PROMPT + "\n\n[ambient]\n" + "\n\n".join(dynamic_parts)
+            system_prompt_flat = system_text + "\n\n[ambient]\n" + "\n\n".join(dynamic_parts)
 
         headers = {
             "x-api-key": self._api_key,
             "anthropic-version": "2023-06-01",
-            # Phase O: opt into prompt caching. Safe to send even on
-            # requests where no block has cache_control — server just
-            # ignores the header in that case.
-            "anthropic-beta": "prompt-caching-2024-07-31",
+            # Phase O/S.2: prompt caching is GA. The beta header that
+            # used to enable it (`prompt-caching-2024-07-31`) is no
+            # longer required — removed to keep the request clean.
             "content-type": "application/json",
         }
         payload = {
             "model": MODEL,
-            "max_tokens": 300,
+            # Phase U.3 follow-up #3 — dropped 300 → 180.
+            # Live session `abide-621b915bf3e3` showed output_tokens
+            # averaging 15–30 for normal replies, peaking at 51 on a
+            # rhyme. 300 was loose headroom; 180 keeps the rhyme use
+            # case (plenty of room) and tells Claude the reply must
+            # fit into a short window, which correlates with faster
+            # sentence-boundary arrival → faster TTS kick → lower
+            # TTFA on multi-sentence turns. The SYSTEM_PROMPT already
+            # instructs "2-3 sentences max"; this is the hard cap.
+            "max_tokens": 180,
             "system": system_blocks,
             "messages": api_messages,
             "stream": True,
@@ -345,7 +501,14 @@ class ConversationEngine:
         log.info("[TIMING] Claude request sent")
 
         try:
-            async with self._client.stream("POST", API_URL, headers=headers, json=payload) as resp:
+            # Phase U.3 follow-up #4 — asyncio.timeout around the stream
+            # setup + first-token phase. Once we've received the first
+            # text token we call `.reschedule(None)` to disable the
+            # deadline, letting the rest of the generation run as long
+            # as it needs. Python 3.11+; we're on 3.12.
+            timeout_cm = asyncio.timeout(_CLAUDE_FIRST_TOKEN_TIMEOUT_S)
+            async with timeout_cm:
+              async with self._client.stream("POST", API_URL, headers=headers, json=payload) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
                     # Log the full response server-side, but don't leak it to clients.
@@ -410,6 +573,11 @@ class ConversationEngine:
                                     "[TIMING] Claude first token: %.0fms after request sent",
                                     first_token_ms,
                                 )
+                                # First token arrived — remove the
+                                # deadline so the rest of the stream can
+                                # run as long as it needs. `reschedule(None)`
+                                # disables the outer `asyncio.timeout`.
+                                timeout_cm.reschedule(None)
                             # Phase R — camera-action marker handling.
                             # We compute the VISIBLE portion of this chunk
                             # (after any marker-stripping) before appending
@@ -433,8 +601,24 @@ class ConversationEngine:
                                         "[CAMERA] marker buffer exceeded hard cap (%d chars) — flushing",
                                         len(marker_buf),
                                     )
+                                    # Defence-in-depth: if Claude mirrored
+                                    # one of the incoming sensor tags (e.g.
+                                    # <audio_events>...</audio_events>) at
+                                    # the head of its reply despite the
+                                    # SYSTEM_PROMPT prohibition, strip the
+                                    # tag block before it reaches transcript
+                                    # or TTS. Observed once in S.3's first
+                                    # live session.
+                                    cleaned, was_stripped = _strip_leading_xml_defensive(marker_buf)
+                                    if was_stripped:
+                                        log.warning(
+                                            "[STREAM-GUARD] Stripped leading XML-like tag block from Claude reply (dropped %d chars)",
+                                            len(marker_buf) - len(cleaned),
+                                        )
+                                    marker_buf = cleaned
                                     marker_resolved = True
-                                    visible_parts.append(marker_buf)
+                                    if marker_buf:
+                                        visible_parts.append(marker_buf)
                                     marker_buf = ""
                                     for part in visible_parts:
                                         full_response.append(part)
@@ -465,9 +649,19 @@ class ConversationEngine:
                                 else:
                                     # Definitely not a marker — flush the
                                     # buffered prefix as normal content.
+                                    # Defence-in-depth XML strip here too
+                                    # so a leading `<audio_events>...`
+                                    # hallucination never reaches the
+                                    # transcript/TTS even on this path.
+                                    cleaned, was_stripped = _strip_leading_xml_defensive(marker_buf)
+                                    if was_stripped:
+                                        log.warning(
+                                            "[STREAM-GUARD] Stripped leading XML-like tag block from Claude reply (dropped %d chars)",
+                                            len(marker_buf) - len(cleaned),
+                                        )
                                     marker_resolved = True
-                                    if marker_buf:
-                                        visible_parts.append(marker_buf)
+                                    if cleaned:
+                                        visible_parts.append(cleaned)
                                     marker_buf = ""
 
                             for part in visible_parts:
@@ -487,6 +681,19 @@ class ConversationEngine:
             if not marker_resolved and marker_buf:
                 full_response.append(marker_buf)
                 yield marker_buf
+        except TimeoutError:
+            # Phase U.3 follow-up #4 — first-token deadline tripped.
+            # Treat identically to an HTTP-level failure: log + raise a
+            # user-safe `ConversationError` so Session's response pipeline
+            # surfaces the friendly message and resets to "listening".
+            elapsed = time.monotonic() - t_request_sent
+            log.warning(
+                "[STALL] Claude first-token deadline (%.1fs) tripped after %.1fs — aborting stream",
+                _CLAUDE_FIRST_TOKEN_TIMEOUT_S, elapsed,
+            )
+            raise ConversationError(
+                "Give me a moment — trouble reaching my services, try again."
+            )
         finally:
             # ALWAYS save whatever was streamed before an exception or early
             # break — this keeps conversation history consistent so a retry
@@ -506,6 +713,20 @@ class ConversationEngine:
                 self.last_cache_read_tokens,
                 self.last_cache_creation_tokens,
             )
+            # Stall detector — flag responses that completed with zero
+            # output tokens but spent non-trivial wall time. Common
+            # pattern in live logs: Anthropic hung, user barged in,
+            # total_ms looks like 12000/17000, out_tokens stayed None.
+            # Raising these to WARNING makes them grep-friendly.
+            if (
+                total_ms > _CLAUDE_STALL_WARN_MS
+                and (self.last_output_tokens is None or self.last_output_tokens == 0)
+                and not full_response
+            ):
+                log.warning(
+                    "[STALL] Claude turn produced zero output in %.0fms (likely API stall or cancelled mid-setup)",
+                    total_ms,
+                )
 
     def save_partial(self, text: str):
         """Save a partial assistant response to history (used on barge-in)."""

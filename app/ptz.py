@@ -60,18 +60,51 @@ except Exception as e:
     _DUVC_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 
-# Bbox-to-motion tuning for pan/tilt nudges. Only actually used if the
-# device exposes pan AND tilt (MeetUp does not — see module docstring);
-# retained here so this code keeps working if a future PTZ-capable camera
-# is plugged in.
-_DEAD_ZONE = 0.12
-_DELTA_FRACTION = 0.20
-_DAMPING = 0.30
+# Bbox-to-motion tuning for pan/tilt nudges.
+#
+# Phase S.1 retune: MeetUp firmware 1.0.272 turns out to expose pan/tilt
+# after all (reversing the earlier D82 correction — kept under observation
+# for stability). But MeetUp's range is narrow (pan ±25, tilt ±15), so
+# the Phase N constants (fraction 0.20, damping 0.30 → effective 0.06)
+# produced 1-unit nudges the user couldn't see.
+#
+# Phase S.3 follow-up retune: first live session with the S.1 values
+# still felt sluggish ("the pan is a little slow, don't you think?" —
+# user quote). Bumped `_DELTA_FRACTION` from 0.50 to 0.70 (effective
+# motion 0.25 → 0.35 at frame edge). Kept damping at 0.50 so small
+# bbox jitter from GPT-4o-mini/4.1-mini's loose spatial grounding
+# doesn't cause oscillation.
+#
+# Phase S.3 follow-up #2 (dead-zone fix): the shared-dead-zone logic
+# caused tilt to monotonically drift to max (+15 on MeetUp). When pan
+# needed to move (|ox| > dead_zone), we proceeded to compute BOTH pan
+# and tilt deltas — and for a seated user whose head sits slightly
+# above frame centre (|oy| ≈ 0.05-0.10), the tilt delta consistently
+# rounded to +1. Every pan nudge dragged tilt up by a unit; over ~30 s
+# tilt was pinned at the rail. Fix: pan and tilt skip their nudge
+# independently based on their own offset. Also widened the zone from
+# 0.12 to 0.15 since the S.1 retune made the camera chase small jitter
+# ("we keep moving with the camera" — user quote). For wider-range PTZ
+# cameras (Rally Bar etc.) these values still compute sensible nudges.
+_DEAD_ZONE = 0.15
+_DELTA_FRACTION = 0.70
+_DAMPING = 0.50
 
 # Zoom step as a fraction of the zoom range per `zoom("in"|"out")` call.
 # 0.25 picks a lens jump big enough the user notices on the first
 # command, but small enough a second "zoom in" still has somewhere to go.
 _ZOOM_STEP_FRACTION = 0.25
+
+# Phase U.3 follow-up — soft cap on user-driven zoom-in. MeetUp's raw
+# zoom range is [100, 500], but past ~200 the subject fills the frame
+# so aggressively that the pose-bbox clips at the edges and a gentle
+# head turn pushes the user out of view. Live session user feedback:
+# "300 is too much zoom in." Cap at 200 so `[[CAM:zoom_in]]` stops
+# advancing once it hits that ceiling; `zoom_reset` still returns to
+# `zr.min` (widest) unchanged. Applies only to the in-session user
+# experience — the hardware range is untouched so Logi Tune etc. can
+# still zoom further if the user opens those tools outside Abide.
+_ZOOM_USER_MAX = 200
 
 
 def _clamp(value: int, lo: int, hi: int) -> int:
@@ -97,6 +130,15 @@ class PTZController:
         self._tilt_range = None
         self._zoom_range = None
         self._init()
+        # Phase S.3 follow-up: center the camera at session start, not
+        # just at session end. Without this, a session inherits whatever
+        # pan/tilt/zoom the previous session (or Logi Tune, or anyone
+        # else) left on the device — observed in live testing as tilt
+        # stuck at +15 (max up) across multiple sessions, with our small
+        # nudges unable to bring it back. Safe on zoom-only cameras
+        # thanks to the axis-aware guards in center().
+        if self.available:
+            self.center()
 
     def _init(self) -> None:
         if not _DUVC_AVAILABLE:
@@ -189,6 +231,23 @@ class PTZController:
     def available(self) -> bool:
         return self._device is not None
 
+    @property
+    def axes_available(self) -> tuple[str, ...]:
+        """Return the axis names this device exposes — subset of
+        `("pan", "tilt", "zoom")`, in that stable order. Empty tuple
+        when no device was selected (PTZ fully disabled). Used by the
+        conversation engine to tell Claude what camera capabilities
+        apply to the current session so it doesn't claim motion it
+        can't deliver."""
+        axes: list[str] = []
+        if self._pan_range is not None:
+            axes.append("pan")
+        if self._tilt_range is not None:
+            axes.append("tilt")
+        if self._zoom_range is not None:
+            axes.append("zoom")
+        return tuple(axes)
+
     def nudge_to_bbox(self, bbox) -> None:
         """Apply a single damped pan/tilt correction so `bbox`'s centre
         drifts toward the frame centre. Sync call — caller should wrap
@@ -207,13 +266,21 @@ class PTZController:
         cy = (y1 + y2) / 2.0
         ox = cx - 0.5
         oy = cy - 0.5
-        if abs(ox) < _DEAD_ZONE and abs(oy) < _DEAD_ZONE:
-            return
 
         pan_span = self._pan_range.max - self._pan_range.min
         tilt_span = self._tilt_range.max - self._tilt_range.min
-        pan_delta = int(round(ox * pan_span * _DELTA_FRACTION * _DAMPING))
-        tilt_delta = int(round(-oy * tilt_span * _DELTA_FRACTION * _DAMPING))
+
+        # Axis-independent dead-zone: pan and tilt each skip their own
+        # nudge when their own offset is inside the zone. Prevents tilt
+        # from drifting to the rail when pan is doing all the work.
+        if abs(ox) >= _DEAD_ZONE:
+            pan_delta = int(round(ox * pan_span * _DELTA_FRACTION * _DAMPING))
+        else:
+            pan_delta = 0
+        if abs(oy) >= _DEAD_ZONE:
+            tilt_delta = int(round(-oy * tilt_span * _DELTA_FRACTION * _DAMPING))
+        else:
+            tilt_delta = 0
 
         pan_step = max(1, getattr(self._pan_range, "step", 1) or 1)
         tilt_step = max(1, getattr(self._tilt_range, "step", 1) or 1)
@@ -221,6 +288,16 @@ class PTZController:
         tilt_delta = (tilt_delta // tilt_step) * tilt_step
 
         if pan_delta == 0 and tilt_delta == 0:
+            # Log at INFO so a "why didn't the camera move?" debug session
+            # can tell us the code path ran but the computed step was
+            # smaller than the device's minimum unit. Common on narrow-
+            # range devices like MeetUp (pan ±25) when the subject is
+            # near frame centre. Without this line the nudge is invisible
+            # in both the log and the camera view.
+            log.info(
+                "[PTZ] nudge skip (step rounds to 0): bbox centre=(%.2f,%.2f) offset=(%.2f,%.2f)",
+                cx, cy, ox, oy,
+            )
             return
 
         cur_pan = self._read_property(_duvc.CamProp.Pan, default=0)
@@ -253,6 +330,11 @@ class PTZController:
 
         current = self._read_property(_duvc.CamProp.Zoom, default=zr.min)
 
+        # Hardware max stays zr.max; user-driven zoom_in is soft-capped
+        # at _ZOOM_USER_MAX to keep the subject from clipping out of
+        # frame. `out` and `reset` ignore the soft cap.
+        user_cap = min(zr.max, _ZOOM_USER_MAX)
+
         if direction == "in":
             target = current + step
         elif direction == "out":
@@ -263,7 +345,10 @@ class PTZController:
             log.info("[PTZ] zoom: unknown direction %r", direction)
             return
 
-        target = _clamp(target, zr.min, zr.max)
+        if direction == "in":
+            target = _clamp(target, zr.min, user_cap)
+        else:
+            target = _clamp(target, zr.min, zr.max)
         zoom_step = max(1, getattr(zr, "step", 1) or 1)
         target = (target // zoom_step) * zoom_step
 

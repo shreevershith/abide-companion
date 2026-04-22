@@ -70,34 +70,100 @@ _HALLUCINATION_PATTERNS = [
 ]
 _HALLUCINATION_RE = re.compile("|".join(_HALLUCINATION_PATTERNS), re.IGNORECASE)
 
-# Short-standalone hallucinations: phrases that are real English but, when
+# Short-standalone hallucinations: phrases that are real words but, when
 # emitted by Whisper as the *entire* transcript on near-silent audio, are
-# almost always hallucinations. "Thank you." is the single most common
-# Whisper hallucination — it's memorized from video outros. We only drop
-# these when they are the whole utterance; "thank you for the reminder"
-# and other in-sentence uses pass through untouched.
+# almost always hallucinations. "Thank you." is the single most common —
+# memorized from video outros. We only drop these when they are the whole
+# utterance; "thank you for the reminder" and in-sentence uses pass through.
+#
+# Phase U.1 dropped `language="en"` so Whisper now auto-detects. The
+# multilingual expansion below is the Phase U follow-up — Whisper's
+# memorized YouTube outros exist in every language it was trained on,
+# and a silent segment misdetected as Spanish / French / German / etc.
+# would previously slip through untouched. Posterior-probability filter
+# (`no_speech_prob` + `avg_logprob` at transcribe() below) catches most
+# of them language-agnostically, but this lexical set is the belt-and-
+# suspenders layer for the cases where confidence heuristics aren't
+# decisive enough on their own.
 _STANDALONE_HALLUCINATIONS = {
-    "thank you",
-    "thanks",
-    "thank you.",
-    "thanks.",
-    "thank you!",
-    "thanks!",
-    "thank you so much",
-    "thank you very much",
-    "bye",
-    "bye.",
-    "goodbye",
-    "goodbye.",
-    "you",
-    "you.",
-    ".",
-    "uh",
-    "um",
-    "hmm",
-    "mm-hmm",
-    "mmhmm",
+    # English — the original set, most-observed in live testing.
+    "thank you", "thanks", "thank you.", "thanks.", "thank you!", "thanks!",
+    "thank you so much", "thank you very much",
+    "bye", "bye.", "goodbye", "goodbye.",
+    "you", "you.", ".",
+    "uh", "um", "hmm", "mm-hmm", "mmhmm",
+    # Spanish
+    "gracias", "gracias.", "muchas gracias", "adiós", "adios",
+    "hola", "hola.", "sí", "si", "no.", "vale",
+    # French
+    "merci", "merci.", "merci beaucoup",
+    "bonjour", "bonjour.", "au revoir", "salut",
+    "oui", "non", "d'accord",
+    # German
+    "danke", "danke.", "danke schön", "danke schon",
+    "tschüss", "tschuss", "hallo", "hallo.",
+    "ja", "nein",
+    # Italian
+    "grazie", "grazie.", "grazie mille",
+    "ciao", "ciao.", "prego",
+    # Portuguese
+    "obrigado", "obrigada", "obrigado.", "obrigada.",
+    "olá", "ola", "adeus", "tchau",
+    # Hindi / romanized
+    "dhanyavaad", "namaste", "namaste.",
+    # Japanese (romanized) / common memorized outro
+    "arigato", "arigatou", "arigato gozaimasu",
+    # Russian / Mandarin (romanized) — short hello/thanks commonly
+    # hallucinated by Whisper on quiet multilingual training data
+    "spasibo", "xie xie", "xiexie",
 }
+
+
+def _is_mixed_script(text: str) -> bool:
+    """Return True if `text` mixes Latin + CJK/Cyrillic/Arabic scripts.
+
+    Live sessions have repeatedly surfaced transcripts like
+    ``'Que é我跟你講 not...'`` — Portuguese + Chinese + English glued
+    together. A genuine multilingual user switches languages over
+    TURNS, not mid-transcript; cross-script contamination inside a
+    single utterance is Whisper fabricating tokens from its training
+    prior. Flagging this is safe — the worst case is we drop a real
+    utterance that happens to mix Chinese characters into English
+    prose, which is very rare for spoken input.
+    """
+    has_latin = False
+    has_cjk_or_other = False
+    for ch in text:
+        o = ord(ch)
+        # ASCII Latin letters
+        if 0x41 <= o <= 0x5A or 0x61 <= o <= 0x7A:
+            has_latin = True
+        # CJK Unified Ideographs, Hiragana, Katakana, Hangul, Cyrillic, Arabic
+        elif (
+            0x3040 <= o <= 0x30FF
+            or 0x3400 <= o <= 0x4DBF
+            or 0x4E00 <= o <= 0x9FFF
+            or 0xAC00 <= o <= 0xD7AF
+            or 0x0400 <= o <= 0x04FF
+            or 0x0600 <= o <= 0x06FF
+        ):
+            has_cjk_or_other = True
+        if has_latin and has_cjk_or_other:
+            return True
+    return False
+
+
+# Minimum alphanumeric-character count for a transcript we forward to
+# Claude. Whisper on very short audio (<0.7 s) or loud-but-silent
+# segments routinely emits a single 2–4 letter "word" that is not what
+# the user said — observed live: "Lift." (nothing said, lang=German),
+# "Huh.", "Abide." (on the first packet of an unrelated segment). Real
+# user single-word utterances that DO matter ("yes", "no", "hi", "hey",
+# "why", "wait") are all ≥2 alpha chars so we use 2 as the floor after
+# stripping punctuation. Combined with the VAD MIN_SPEECH_SAMPLES and
+# MIN_SPEECH_RMS filters this closes the "<3 alpha-chars slip-through"
+# hole without rejecting short real replies.
+_MIN_TRANSCRIPT_ALPHA_CHARS = 2
 
 
 def _is_hallucination(text: str) -> bool:
@@ -109,6 +175,19 @@ def _is_hallucination(text: str) -> bool:
     # Standalone match: strip trailing punctuation/whitespace and compare.
     if text.strip().lower() in _STANDALONE_HALLUCINATIONS:
         return True
+    # Mixed-script hallucination (Latin + CJK/etc. in one transcript).
+    if _is_mixed_script(text):
+        return True
+    # Very-short single-token transcripts on otherwise-passed audio —
+    # the only real path to this point is if the VAD-RMS filter passed
+    # something short. Count alphanumeric chars only (punctuation /
+    # whitespace don't count). Applies only to single-token output so
+    # "yes." and "no!" are preserved but "Q.", "A.", "x." are dropped.
+    stripped = text.strip()
+    if stripped and " " not in stripped:
+        alpha_count = sum(1 for c in stripped if c.isalnum())
+        if alpha_count < _MIN_TRANSCRIPT_ALPHA_CHARS:
+            return True
     return False
 
 
@@ -126,6 +205,13 @@ class AudioProcessor:
         self._speech_buf: list[np.ndarray] = []
         self._remainder = np.array([], dtype=np.float32)
         self.last_speech_end_ts: float | None = None  # monotonic timestamp of last speech_end
+        # Phase S.3 — raw 16 kHz float32 PCM of the most recently captured
+        # speech segment, kept in parallel with the WAV bytes that go to
+        # Whisper. Audio-event classification (`app/audio_events.py`) wants
+        # the raw waveform, not a re-decoded WAV, and runs off this buffer.
+        # Cleared after each read in main.py's speech-captured branch so
+        # a stale segment doesn't get re-classified on an unrelated turn.
+        self.last_speech_pcm: np.ndarray | None = None
         # Running max RMS over the current in-progress speech segment.
         # Kept for diagnostic logging; the barge-in gate uses the
         # loud-window counter below instead (see note).
@@ -226,6 +312,9 @@ class AudioProcessor:
                                 n_samples, n_samples / SAMPLE_RATE, rms,
                             )
                             result = _pcm_to_wav(audio)
+                            # Phase S.3 — stash the raw PCM so the audio-event
+                            # classifier can process it in parallel with STT.
+                            self.last_speech_pcm = audio
             elif self._collecting:
                 self._speech_buf.append(window)
                 # Update the running max RMS and loud-window counter
@@ -332,6 +421,14 @@ async def transcribe(
     # suppress hallucinated segments). temperature=0 makes the decoder
     # deterministic and avoids sampling from low-probability paths that
     # produce most hallucinations.
+    #
+    # Phase U.1 — multi-language: dropped the `language="en"` lock so
+    # Whisper auto-detects. The target resident for elderly care is
+    # often a first-generation immigrant whose primary language isn't
+    # English; hardcoding "en" excluded them entirely. The detected
+    # language arrives in `result.language` and we log it. Claude 4.6
+    # is multilingual so it naturally responds in whatever language
+    # the transcript is in — no extra plumbing needed.
     result = await asyncio.wait_for(
         client.audio.transcriptions.create(
             file=("audio.wav", wav_bytes),
@@ -339,21 +436,24 @@ async def transcribe(
             prompt=stt_prompt,
             response_format="verbose_json",
             temperature=0.0,
-            language="en",
         ),
         timeout=STT_TIMEOUT_S,
     )
     t_done = time.monotonic()
     api_ms = (t_done - t_start) * 1000
 
+    detected_language = getattr(result, "language", None)
     if speech_end_ts is not None:
         total_ms = (t_done - speech_end_ts) * 1000
         log.info(
-            "[TIMING] STT: speech_end \u2192 transcript = %.0fms (Groq API %.0fms, audio %d bytes)",
-            total_ms, api_ms, len(wav_bytes),
+            "[TIMING] STT: speech_end \u2192 transcript = %.0fms (Groq API %.0fms, audio %d bytes, lang=%s)",
+            total_ms, api_ms, len(wav_bytes), detected_language or "?",
         )
     else:
-        log.info("[TIMING] STT: Groq API %.0fms (audio %d bytes)", api_ms, len(wav_bytes))
+        log.info(
+            "[TIMING] STT: Groq API %.0fms (audio %d bytes, lang=%s)",
+            api_ms, len(wav_bytes), detected_language or "?",
+        )
 
     transcript = (getattr(result, "text", "") or "").strip()
 

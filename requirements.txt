@@ -15,3 +15,15 @@ python-dotenv>=1.0,<2.0
 # that don't advertise PTZ through DirectShow. Ignore install errors
 # on Mac/Linux — the app imports it via a try/except in app/ptz.py.
 duvc-ctl>=1.0,<3.0 ; sys_platform == "win32"
+# Phase T — TFLite runtime for YAMNet audio-event classification
+# (app/audio_events.py). ~20 MB install. The model + labels live in
+# models/yamnet.tflite + models/yamnet_labels.txt and are loaded
+# lazily on first speech segment; module imports cleanly even when
+# these are missing (classifier silently returns []).
+#
+# Platform support: Google ships wheels for Windows x86_64, Linux
+# (x86_64 + ARM64), and macOS ARM64 only. Intel Mac has NO wheel and
+# there is no source build — excluded by the marker so pip install
+# doesn't fail on that platform. On Intel Mac the audio-event pipeline
+# silently degrades to a stub and the rest of Abide runs normally.
+ai-edge-litert>=2.1,<3.0 ; sys_platform != "darwin" or platform_machine == "arm64"

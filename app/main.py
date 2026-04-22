@@ -36,8 +36,9 @@ except Exception as _dotenv_exc:
 else:
     _DOTENV_LOAD_ERROR = None
 
+from app import audio_events
 from app.audio import AudioProcessor, transcribe
-from app.conversation import ConversationEngine
+from app.conversation import ConversationEngine, MODEL as CLAUDE_MODEL
 from app.memory import (
     _ID_RE as _MEMORY_ID_RE,
     delete_user_context,
@@ -68,6 +69,30 @@ else:
 app = FastAPI(title="Abide Companion")
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+MODELS_DIR = Path(__file__).parent.parent / "models"
+
+# Phase U follow-up — serve the self-hosted MediaPipe assets (vendor
+# bundle, WASM runtime) and on-device ML models (YAMNet tflite, pose
+# landmarker .task) directly from the repo. Removes the CDN dependency
+# on cdn.jsdelivr.net + storage.googleapis.com that Phase U.2/U.3
+# originally introduced — that CDN path was a supply-chain XSS risk
+# since the page holds user API keys in localStorage. `check_dir=False`
+# so the app still starts even if /models is absent (e.g. user cloned
+# without the binaries, or Intel Mac where YAMNet isn't usable).
+from fastapi.staticfiles import StaticFiles
+
+if (FRONTEND_DIR / "vendor").exists():
+    app.mount(
+        "/vendor",
+        StaticFiles(directory=str(FRONTEND_DIR / "vendor")),
+        name="vendor",
+    )
+if MODELS_DIR.exists():
+    app.mount(
+        "/models",
+        StaticFiles(directory=str(MODELS_DIR)),
+        name="models",
+    )
 
 
 @app.on_event("startup")
@@ -173,7 +198,12 @@ async def analyze_session(request: Request) -> JSONResponse:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                # Use the same MODEL as the live conversation path so a
+                # Phase-P-style upgrade covers both. Hardcoding
+                # `claude-sonnet-4-20250514` here (what this line used
+                # to say) left a silent deprecation bomb — Anthropic
+                # sunsets that model on 2026-06-15.
+                "model": CLAUDE_MODEL,
                 "max_tokens": 500,
                 "system": ANALYZE_PROMPT,
                 "messages": [{"role": "user", "content": user_content}],
@@ -460,6 +490,19 @@ async def websocket_endpoint(ws: WebSocket):
     # Echo-suppression state
     pending_barge_in_start: float | None = None
 
+    # Phase U.3 follow-up — per-connection face_bbox receive-rate tracker.
+    # Live session `abide-585f1dec5ee2` showed TTFA regress from ~3300 ms
+    # to ~4968 ms on a long (9 min) session. One hypothesis: the 5 Hz
+    # pose-bbox WS traffic from the browser congests the event loop
+    # alongside the voice loop. This counter logs once per ~100 received
+    # messages so we can see whether the client is adhering to its 5 Hz
+    # cap or misbehaving. Non-invasive — no throttling here, just
+    # observability. Dedicated rate tracking on the receive side because
+    # `dispatch_face_bbox` already throttles at the dispatch point and
+    # so hides the raw incoming rate.
+    face_bbox_recv_count = 0
+    face_bbox_rate_window_start = time.monotonic()
+
     # Telemetry — one session id per WS connection, shared across all turns.
     # Langfuse client is None if LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are
     # not in env, in which case every telemetry call becomes a silent no-op.
@@ -496,9 +539,13 @@ async def websocket_endpoint(ws: WebSocket):
             except Exception as e:
                 log.debug("Connectivity probe skipped: %s", e)
         _probe_task = asyncio.create_task(_emit_probe())
-        _probe_task.add_done_callback(
-            lambda t: t.exception() if not t.cancelled() else None
-        )
+        # Consistent with the other prewarm/background tasks: if the
+        # probe raises something we didn't anticipate, surface it at
+        # WARNING rather than discarding with a silent
+        # `t.exception() if not t.cancelled() else None` lambda. The
+        # body of `_emit_probe` already catches Exception, so this
+        # done-callback should rarely have work to do.
+        _probe_task.add_done_callback(_log_prewarm_exception("Langfuse probe"))
 
     try:
         while True:
@@ -572,6 +619,42 @@ async def websocket_endpoint(ws: WebSocket):
 
                     if anthropic_key:
                         engine = ConversationEngine(api_key=anthropic_key)
+                        # Phase S.1 — bake per-session camera capabilities
+                        # into the cacheable system prompt once at connect.
+                        # Cleaner than re-injecting per-turn (which would
+                        # fragment the cache) and honest to the user's
+                        # actual hardware (MeetUp exposing pan/tilt is
+                        # firmware-dependent — see D82 correction history).
+                        axes = session._ptz.axes_available
+                        if axes:
+                            cap_note = (
+                                "\n\nSession camera capabilities:\n"
+                                f"- Available axes: {', '.join(axes)}.\n"
+                                "- Zoom responds to spoken requests via the "
+                                "[[CAM:...]] markers described above.\n"
+                                + (
+                                    "- Pan and tilt are driven automatically "
+                                    "by subject-following (the camera "
+                                    "re-centres on the person as they move); "
+                                    "no spoken command is needed. If the user "
+                                    "asks to pan or tilt, reassure them that "
+                                    "the camera is tracking them.\n"
+                                    if ("pan" in axes or "tilt" in axes)
+                                    else "- Pan and tilt are NOT available on "
+                                    "this camera. If the user asks for pan or "
+                                    "tilt, briefly and honestly say so.\n"
+                                )
+                            )
+                        else:
+                            cap_note = (
+                                "\n\nSession camera capabilities:\n"
+                                "- No motorised camera control available on "
+                                "this setup. If the user asks to zoom, pan, "
+                                "or tilt, briefly and honestly say that the "
+                                "current camera cannot move.\n"
+                            )
+                        from app.conversation import SYSTEM_PROMPT as _SP
+                        engine.system_prompt_override = _SP + cap_note
 
                     # Store refs on session so vision-reactive triggers
                     # can call start_response() from _run_vision().
@@ -591,6 +674,22 @@ async def websocket_endpoint(ws: WebSocket):
                     # doesn't pay ~250ms of handshake on their first turn.
                     # Fire-and-forget — failures are non-fatal and logged via
                     # done_callbacks so unhandled task exceptions aren't lost.
+                    # Pre-load YAMNet (audio-event classifier). Prior to
+                    # this, the tflite interpreter lazy-loaded on the
+                    # first speech segment, paying ~600-900 ms of model
+                    # load + tensor allocation inside the TTFA window of
+                    # turn 1. The `[TIMING] speech_end → _run_response
+                    # started` anchor shipped D96 showed this as a
+                    # consistent 2.5 s tax on turn 1 that disappeared
+                    # from turn 2 onward. Loading it here, off-loop,
+                    # moves the cost into the connect-to-first-utterance
+                    # window where the user is not waiting. No API key
+                    # required — model is local, so this runs
+                    # unconditionally alongside the cloud prewarms.
+                    t_audio_events = asyncio.create_task(audio_events.prewarm())
+                    t_audio_events.add_done_callback(
+                        _log_prewarm_exception("YAMNet")
+                    )
                     if engine is not None:
                         t_claude = asyncio.create_task(engine.prewarm())
                         t_claude.add_done_callback(_log_prewarm_exception("Claude"))
@@ -642,6 +741,17 @@ async def websocket_endpoint(ws: WebSocket):
                     # initiates conversation based on what it sees on camera.
                     checkin_task = asyncio.create_task(
                         _proactive_checkin_loop(ws, session, engine, openai_key)
+                    )
+                    # Surface any unhandled exception from the check-in
+                    # loop instead of letting Python's "Task exception
+                    # was never retrieved" warning surface at GC time
+                    # (which happens long after the WS has closed). The
+                    # loop body already wraps each iteration in a try/
+                    # except, but errors in the guard-check window
+                    # between `asyncio.sleep` and the inner try would
+                    # otherwise disappear.
+                    checkin_task.add_done_callback(
+                        _log_prewarm_exception("Check-in loop")
                     )
 
                     await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
@@ -728,6 +838,60 @@ async def websocket_endpoint(ws: WebSocket):
                     # Browser has drained its audio queue OR has stopped
                     # playback in response to a barge-in. Idempotent.
                     session.client_playing = False
+
+                elif msg_type == "face_bbox":
+                    # Phase U.2 — client-side MediaPipe pose landmarks →
+                    # min-max bbox of visible keypoints → smooth PTZ. Up
+                    # to ~5 Hz from the browser; server rate-limits again
+                    # in Session.dispatch_face_bbox so DirectShow doesn't
+                    # get hammered.
+                    #
+                    # Strict validation: bbox must be 4 numeric floats (NOT
+                    # bools — `isinstance(True, int)` returns True without
+                    # the explicit exclusion) AND each coordinate must be
+                    # in the [0, 1] range MediaPipe normalises to. A bogus
+                    # or adversarial client can't feed us overflow-sized
+                    # floats that would blow up `nudge_to_bbox`'s arithmetic.
+                    bbox = data.get("bbox")
+                    if (
+                        isinstance(bbox, list)
+                        and len(bbox) == 4
+                        and all(
+                            isinstance(v, (int, float))
+                            and not isinstance(v, bool)
+                            and 0.0 <= float(v) <= 1.0
+                            for v in bbox
+                        )
+                    ):
+                        session.dispatch_face_bbox([float(v) for v in bbox])
+
+                    # Receive-rate telemetry. Client is supposed to cap
+                    # at 5 Hz (POSE_BBOX_SEND_INTERVAL_MS = 200 in
+                    # frontend); if we see much more than that something
+                    # is wrong and it likely correlates with TTFA drift.
+                    face_bbox_recv_count += 1
+                    if face_bbox_recv_count >= 100:
+                        now_ts = time.monotonic()
+                        window = max(1e-3, now_ts - face_bbox_rate_window_start)
+                        rate_hz = face_bbox_recv_count / window
+                        log.info(
+                            "[FACE-BBOX] recv rate: %.1f Hz over last %d msgs (%.1fs window)",
+                            rate_hz,
+                            face_bbox_recv_count,
+                            window,
+                        )
+                        face_bbox_recv_count = 0
+                        face_bbox_rate_window_start = now_ts
+
+                elif msg_type == "fall_alert":
+                    # Phase U.3 — client-side pose fall heuristic fired
+                    # (nose y ≥ hip y for ~1 s of sustained horizontal
+                    # torso). Treat identically to a vision-prompt FALL:
+                    # prefix: red banner + urgent next-turn context.
+                    raw_text = data.get("text", "")
+                    if isinstance(raw_text, str):
+                        text = raw_text[:200].strip() or "Possible fall detected by pose estimation."
+                        await session.handle_client_fall(ws, text)
 
                 elif msg_type == "forget_me":
                     # Cross-session memory wipe (Phase E). Delete the
@@ -864,8 +1028,37 @@ async def websocket_endpoint(ws: WebSocket):
                     await Session._safe_send_json(ws,{"type": "status", "state": "processing"})
                     log.info("Speech segment captured, transcribing...")
 
+                    audio_events_task: asyncio.Task | None = None
                     try:
                         stt_t0 = time.monotonic()
+                        # Phase U.3 follow-up #3 — fire audio-event
+                        # classification off as a background task BEFORE
+                        # awaiting Whisper, instead of the prior sequential
+                        # transcribe → classify flow. YAMNet inference
+                        # (~280 ms CPU via `asyncio.to_thread`) can complete
+                        # alongside Groq Whisper (typical ~300 ms API call)
+                        # so by the time the transcript lands the audio
+                        # events are usually also ready. Removes ~200-280 ms
+                        # of TTFA drag on every turn. Silent no-op path
+                        # (returns []) on missing PCM / classifier errors.
+                        pcm = processor.last_speech_pcm
+                        processor.last_speech_pcm = None
+                        if pcm is not None:
+                            audio_events_task = asyncio.create_task(
+                                audio_events.classify_segment(pcm)
+                            )
+                            # Consistency with the other prewarm tasks
+                            # in this module — surface unhandled
+                            # exceptions instead of relying on Python's
+                            # GC-time warning. classify_segment()
+                            # itself swallows classifier errors and
+                            # returns [], but any schedule-side
+                            # exception (e.g. a refcount issue on the
+                            # shared pcm buffer) would otherwise
+                            # disappear.
+                            audio_events_task.add_done_callback(
+                                _log_prewarm_exception("audio-events")
+                            )
                         text = await transcribe(
                             wav_bytes,
                             groq_key,
@@ -903,19 +1096,52 @@ async def websocket_endpoint(ws: WebSocket):
                                     latency_ms=stt_latency_ms,
                                 )
 
-                                # Launch response as concurrent task (non-blocking)
+                                # Audio-event classification was kicked off
+                                # in parallel with Whisper at the top of this
+                                # branch. Await the result here — typically
+                                # already resolved by now, so this adds at
+                                # most a few ms when Whisper was the
+                                # bottleneck. See Phase U.3 follow-up #3.
+                                audio_events_context = ""
+                                if audio_events_task is not None:
+                                    try:
+                                        events = await audio_events_task
+                                        if events:
+                                            audio_events_context = audio_events.format_events_for_prompt(events)
+                                            log.info(
+                                                "[AUDIO-EVENTS] detected: %s",
+                                                ", ".join(f"{e.tag}:{e.confidence:.2f}" for e in events),
+                                            )
+                                    except Exception as e:
+                                        log.debug("Audio event classification skipped: %s", e)
+
+                                # Launch response as concurrent task (non-blocking).
+                                # Pass through speech_end_ts + stt_latency_ms so
+                                # Session can compute TTFA and the per-stage
+                                # rollup at session-summary time (see D85).
                                 session.start_response(
                                     ws, engine, text, openai_key,
                                     turn_trace=turn_trace,
+                                    speech_end_ts=processor.last_speech_end_ts,
+                                    stt_latency_ms=stt_latency_ms,
+                                    audio_events_context=audio_events_context,
                                 )
                             else:
                                 await Session._safe_send_json(ws,{"type": "error", "message": "Anthropic API key not set"})
                         else:
                             log.info("Empty transcript, skipping")
+                            # If audio-events was pre-dispatched for this
+                            # segment but transcript was empty/filtered,
+                            # cancel the task so we don't run YAMNet for
+                            # nothing (saves CPU, doesn't affect TTFA).
+                            if audio_events_task is not None and not audio_events_task.done():
+                                audio_events_task.cancel()
                             if not session.is_audible:
                                 await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
                     except asyncio.TimeoutError:
                         log.error("Transcription timed out")
+                        if audio_events_task is not None and not audio_events_task.done():
+                            audio_events_task.cancel()
                         await Session._safe_send_json(ws,{
                             "type": "error",
                             "message": "I didn't catch that — please try again.",
@@ -926,6 +1152,8 @@ async def websocket_endpoint(ws: WebSocket):
                         # Log the real error server-side but send a safe,
                         # non-leaky message to the client.
                         log.error("Transcription failed: %s", e)
+                        if audio_events_task is not None and not audio_events_task.done():
+                            audio_events_task.cancel()
                         await Session._safe_send_json(ws,{
                             "type": "error",
                             "message": "I'm having trouble hearing you right now. Please try again.",
@@ -942,22 +1170,37 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             import statistics as _stats  # stdlib only — deferred import keeps startup slim
             duration_s = time.monotonic() - session_start_ts
+
+            def _p50_p95(samples: list[float]) -> tuple[float, float]:
+                """Return (P50, P95) rounded to 1 dp, with max-fallback
+                when <20 samples to avoid a bogus percentile on short
+                sessions. Empty → (0, 0)."""
+                if not samples:
+                    return 0, 0
+                p50 = round(_stats.median(samples), 1)
+                if len(samples) >= 20:
+                    p95 = round(_stats.quantiles(samples, n=20)[-1], 1)
+                else:
+                    p95 = round(max(samples), 1)
+                return p50, p95
+
             latencies = session.stats.get("turn_latencies_ms", [])
             avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else 0
-            # Phase Q — percentiles alongside avg/min/max. P95 is more
-            # evaluator-friendly than max (max is dominated by outliers).
-            # `quantiles(n=20)[-1]` gives the 95th percentile — needs ≥20
-            # samples to be meaningful, otherwise fall back to max to
-            # avoid a bogus "P95" on a 3-turn session.
-            if latencies:
-                p50 = round(_stats.median(latencies), 1)
-                if len(latencies) >= 20:
-                    p95 = round(_stats.quantiles(latencies, n=20)[-1], 1)
-                else:
-                    p95 = round(max(latencies), 1)
-            else:
-                p50 = 0
-                p95 = 0
+            p50_turn, p95_turn = _p50_p95(latencies)
+
+            # Per-stage percentiles — D85. Whole-turn metric is retained
+            # for backwards-compat with any existing Langfuse dashboards;
+            # the new stage fields tell you WHERE the latency actually
+            # went. `ttfa_*` is the brief's real SLA number.
+            ttfa_p50, ttfa_p95 = _p50_p95(session.stats.get("ttfa_ms_samples", []))
+            stt_p50, stt_p95 = _p50_p95(session.stats.get("stt_ms_samples", []))
+            ttft_p50, ttft_p95 = _p50_p95(
+                session.stats.get("claude_ttft_ms_samples", [])
+            )
+            tts_fb_p50, tts_fb_p95 = _p50_p95(
+                session.stats.get("tts_first_byte_ms_samples", [])
+            )
+
             summary = {
                 "session_id": session_id,
                 "duration_seconds": round(duration_s, 1),
@@ -966,11 +1209,25 @@ async def websocket_endpoint(ws: WebSocket):
                 "barge_in_count": session.stats["barge_in_count"],
                 "fall_count": session.stats["fall_count"],
                 "vision_calls": session.stats["vision_calls"],
+                # Whole-turn (speech_end → last TTS byte handed to WS).
+                # Kept for backwards compat; see D85 for why this is
+                # different from — and bigger than — TTFA.
                 "avg_turn_latency_ms": avg_latency,
-                "p50_turn_latency_ms": p50,
-                "p95_turn_latency_ms": p95,
+                "p50_turn_latency_ms": p50_turn,
+                "p95_turn_latency_ms": p95_turn,
                 "max_turn_latency_ms": max(latencies) if latencies else 0,
                 "min_turn_latency_ms": min(latencies) if latencies else 0,
+                # Stage breakdown — the actually-diagnosable metrics.
+                # TTFA = speech_end → first audio byte on the wire;
+                # the brief's <1.5s SLA target applies to this number.
+                "ttfa_p50_ms": ttfa_p50,
+                "ttfa_p95_ms": ttfa_p95,
+                "stt_p50_ms": stt_p50,
+                "stt_p95_ms": stt_p95,
+                "claude_ttft_p50_ms": ttft_p50,
+                "claude_ttft_p95_ms": ttft_p95,
+                "tts_first_byte_p50_ms": tts_fb_p50,
+                "tts_first_byte_p95_ms": tts_fb_p95,
             }
             log.info("Session summary: %s", summary)
             telemetry.log_session_summary(lf, session_id, summary)

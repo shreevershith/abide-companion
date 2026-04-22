@@ -333,38 +333,44 @@ main {
 .vision-notice.show { display: block; }
 
 /* Fall alert banner — red, top of main, only shown on fall event */
+/* Fall-alert banner. Must read clearly on BOTH dark and light modes.
+   Previous palette (light-pink text on a faint pink background) was
+   invisible on light mode where --bg is #f8f5ef — the whole banner
+   disappeared into the page. Now: saturated crimson bg + white text,
+   same on both themes, with a stronger border and shadow so the
+   urgency still reads at a glance. */
 .fall-alert {
     display: none;
     margin-bottom: 20px;
     padding: 16px 20px;
-    background: linear-gradient(135deg, rgba(255, 100, 120, 0.18), rgba(255, 100, 120, 0.08));
-    border: 1px solid rgba(255, 100, 120, 0.55);
+    background: linear-gradient(135deg, #c0283a, #a01f30);
+    border: 1px solid #8a1829;
     border-radius: var(--radius-md);
-    color: #ffd8df;
+    color: #ffffff;
     font-size: 15px;
     font-weight: 500;
-    box-shadow: 0 0 30px rgba(255, 100, 120, 0.22);
+    box-shadow: 0 4px 18px rgba(192, 40, 58, 0.45);
     animation: fall-pulse 1.8s ease-in-out infinite;
 }
 .fall-alert.show { display: flex; align-items: center; gap: 14px; }
 .fall-alert .icon {
     width: 36px; height: 36px;
     border-radius: 50%;
-    background: rgba(255, 100, 120, 0.25);
-    border: 1px solid rgba(255, 100, 120, 0.6);
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.55);
     display: flex; align-items: center; justify-content: center;
     font-size: 18px; font-weight: 700;
-    color: #ff8fa0;
+    color: #ffffff;
     flex-shrink: 0;
 }
 .fall-alert .label {
     font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
-    color: #ff9fb0; text-transform: uppercase; display: block; margin-bottom: 2px;
+    color: #ffe4e9; text-transform: uppercase; display: block; margin-bottom: 2px;
 }
-.fall-alert .text { color: #ffe4e9; }
+.fall-alert .text { color: #ffffff; }
 @keyframes fall-pulse {
-    0%, 100% { box-shadow: 0 0 24px rgba(255, 100, 120, 0.18); }
-    50%      { box-shadow: 0 0 44px rgba(255, 100, 120, 0.38); }
+    0%, 100% { box-shadow: 0 4px 18px rgba(192, 40, 58, 0.35); }
+    50%      { box-shadow: 0 4px 32px rgba(192, 40, 58, 0.65); }
 }
 
 /* ── Transcript panel ── */
@@ -849,9 +855,16 @@ const CHUNK_SIZE = 2048;
 // to the server every SEND_EVERY_N captures. Net: one vision API call
 // every (CAPTURE_INTERVAL_MS * SEND_EVERY_N) ms, each call containing
 // FRAMES_PER_CALL consecutive frames ~CAPTURE_INTERVAL_MS apart.
+//
+// Phase S.3 follow-up tuning: FRAMES_PER_CALL + SEND_EVERY_N were both
+// 3 (→ 3.6 s vision cycle). Dropped to 2 each (→ 2.4 s cycle) so the
+// out-of-frame welfare check fires at ~7 s instead of ~11 s without
+// reducing the 3-consecutive-cycles confirmation threshold that
+// prevents false-fires on single-frame misclassifications. Costs ~33 %
+// more vision API calls but keeps frames-per-minute identical.
 const CAPTURE_INTERVAL_MS = 1200;
-const FRAMES_PER_CALL = 3;
-const SEND_EVERY_N = 3;
+const FRAMES_PER_CALL = 2;
+const SEND_EVERY_N = 2;
 
 let audioCtx, micStream, workletNode, ws;
 let currentAssistantMsg = null;
@@ -1146,6 +1159,32 @@ function setStatus(text, cls) {
     $statusPill.className = "status-pill" + (cls ? " " + cls : "");
     if (cls === "speaking") $hero.classList.add("speaking");
     else $hero.classList.remove("speaking");
+    // Phase U.3 follow-up #4 — "still thinking…" escalation.
+    // Live session `abide-63d2e9245567` had Anthropic-side stalls of
+    // 4-17 s where the server stayed on `status: thinking` with no
+    // audio. The silent wait read as "Abide is dead" to the user. This
+    // timer watches for the thinking state lingering past
+    // SLOW_THINKING_MS and softens the pill label so the user knows
+    // it's working, just slow. Any state transition clears the timer
+    // so a normal thinking→speaking flow never shows the hint.
+    clearSlowThinkingHint();
+    if (cls === "thinking" || cls === "processing") {
+        slowThinkingTimer = setTimeout(() => {
+            if ($statusPill.classList.contains("thinking") ||
+                $statusPill.classList.contains("processing")) {
+                $status.textContent = "Still thinking…";
+            }
+        }, SLOW_THINKING_MS);
+    }
+}
+
+let slowThinkingTimer = null;
+const SLOW_THINKING_MS = 3000;
+function clearSlowThinkingHint() {
+    if (slowThinkingTimer) {
+        clearTimeout(slowThinkingTimer);
+        slowThinkingTimer = null;
+    }
 }
 
 // ── Transcript helpers ──
@@ -1428,6 +1467,10 @@ async function startVision() {
     frameTimer = setInterval(captureFrameTick, CAPTURE_INTERVAL_MS);
     // Warm up the ring with an initial capture shortly after permission.
     setTimeout(captureFrameTick, 600);
+    // Phase U.2 + U.3 — kick off browser-local pose tracking alongside
+    // the GPT-4.1-mini vision cycle. Fire-and-forget; if the CDN / WASM
+    // init fails, it logs a warning and the rest of the app is unaffected.
+    startPoseTracking();
     return true;
 }
 
@@ -1487,6 +1530,222 @@ function stopVision() {
     latestActivity = "";
     drawOverlay();
     hideFallAlert();
+    stopPoseTracking();
+}
+
+// ── MediaPipe pose tracking (Phase U.2 + U.3) ──────────────────────────
+// Loaded lazily from CDN when startVision() succeeds. PoseLandmarker
+// runs ~15-30 fps locally on CPU via WASM and yields 33 body keypoints
+// per frame. Two consumers:
+//   - Face/person bbox (min-max over visible landmarks) → emitted to
+//     server at up to 5 Hz as `face_bbox` WS messages, driving smooth
+//     PTZ subject-follow 6× faster than the 2.4 s GPT-4.1-mini cycle.
+//   - Fall heuristic (nose y ≥ hip y → torso horizontal; sustained
+//     ~1 s → emit `fall_alert`). Doesn't replace the vision-prompt
+//     `FALL:` path; it's a second, pose-based source of fall signals.
+// Graceful degradation: if the CDN blocks or WASM fails to bootstrap,
+// `poseLandmarker` stays null, the loop never starts, and the rest
+// of Abide runs unchanged against the GPT-4.1-mini bbox cycle.
+let poseLandmarker = null;
+let poseLoopHandle = null;
+let lastPoseDetectTs = 0;
+let lastPoseBboxSendTs = 0;
+let fallFrameCounter = 0;
+let fallAlertFired = false;
+const POSE_DETECT_MIN_INTERVAL_MS = 30;        // ~30 fps cap
+const POSE_BBOX_SEND_INTERVAL_MS = 200;         // 5 Hz to server (PTZ throttles further server-side)
+// Phase U.3 follow-up retune: earlier threshold (`FALL_HORIZONTAL_TOLERANCE = 0.08`
+// paired with `nose.y >= hipY - tol`) fired on seated users leaning forward
+// to a table or laptop — nose merely coming close to hip line was enough.
+// Live session `abide-585f1dec5ee2` saw 5 false-positive fires in 9 minutes
+// before the user said "Off with the fall detection." New rule: nose must be
+// clearly BELOW the hip line (positive offset) sustained for 1.5 s+ at 30 fps.
+// A genuinely fallen person has nose at or below hip on the image y-axis
+// (0=top, 1=bottom); a seated bent-over person virtually never does.
+const FALL_THRESHOLD_FRAMES = 45;               // ~1.5 s at 30 fps of sustained fallen posture
+const FALL_NOSE_BELOW_HIP = 0.05;               // nose must be ≥ 0.05 below hip on normalised y to count
+
+async function startPoseTracking() {
+    try {
+        // Dynamic import so index.html stays a plain <script> block —
+        // MediaPipe ships as an ES module; this is the cleanest way
+        // to pull it in without converting the whole file to `type="module"`.
+        //
+        // Phase U follow-up: self-hosted under /vendor/ and /models/
+        // instead of fetched from cdn.jsdelivr.net + storage.googleapis.com.
+        // Removes the supply-chain risk of a CDN-compromise path to XSS
+        // on this page (which holds the user's API keys in localStorage)
+        // and makes Abide truly offline-capable for everything except
+        // the LLM / STT / TTS API calls themselves. Vendor bundle +
+        // WASM runtime + pose model together are ~24 MB committed to
+        // the repo.
+        const mod = await import("/vendor/tasks-vision/vision_bundle.mjs");
+        const { FilesetResolver, PoseLandmarker } = mod;
+        const vision = await FilesetResolver.forVisionTasks(
+            "/vendor/tasks-vision/wasm"
+        );
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+            baseOptions: {
+                modelAssetPath: "/models/pose_landmarker_lite.task",
+                delegate: "CPU",
+            },
+            runningMode: "VIDEO",
+            numPoses: 1,
+        });
+        console.log("[POSE] MediaPipe PoseLandmarker loaded");
+        fallFrameCounter = 0;
+        fallAlertFired = false;
+        lastPoseDetectTs = 0;
+        lastPoseBboxSendTs = 0;
+        poseLoopHandle = requestAnimationFrame(poseTrackLoop);
+    } catch (err) {
+        console.warn("[POSE] Failed to initialize MediaPipe — PTZ falls back to GPT-4.1-mini bbox only:", err);
+        poseLandmarker = null;
+    }
+}
+
+function stopPoseTracking() {
+    if (poseLoopHandle !== null) {
+        cancelAnimationFrame(poseLoopHandle);
+        poseLoopHandle = null;
+    }
+    if (poseLandmarker) {
+        try { poseLandmarker.close(); } catch (e) { /* best-effort */ }
+        poseLandmarker = null;
+    }
+    fallFrameCounter = 0;
+    fallAlertFired = false;
+}
+
+function poseTrackLoop() {
+    if (!poseLandmarker) return;
+    // Only queue the next frame once we've completed this one so we
+    // don't pile up inference calls when the CPU is under load.
+    const tsMs = performance.now();
+    if (tsMs - lastPoseDetectTs < POSE_DETECT_MIN_INTERVAL_MS) {
+        poseLoopHandle = requestAnimationFrame(poseTrackLoop);
+        return;
+    }
+    if (!$video || $video.readyState < 2) {
+        poseLoopHandle = requestAnimationFrame(poseTrackLoop);
+        return;
+    }
+    lastPoseDetectTs = tsMs;
+
+    let result;
+    try {
+        result = poseLandmarker.detectForVideo($video, tsMs);
+    } catch (err) {
+        console.warn("[POSE] detectForVideo error:", err);
+        poseLoopHandle = requestAnimationFrame(poseTrackLoop);
+        return;
+    }
+
+    if (result && result.landmarks && result.landmarks.length > 0) {
+        const landmarks = result.landmarks[0];
+
+        // Consumer 1: bbox → server (throttled).
+        const bbox = _computeBboxFromLandmarks(landmarks);
+        if (bbox) {
+            const now = performance.now();
+            if (now - lastPoseBboxSendTs >= POSE_BBOX_SEND_INTERVAL_MS) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "face_bbox", bbox }));
+                }
+                lastPoseBboxSendTs = now;
+            }
+        }
+
+        // Consumer 2: fall heuristic — DISABLED (Phase U.3 follow-up #2).
+        // Even with the stricter "nose below hip by 0.05 sustained 1.5 s"
+        // rule, the heuristic fires on anyone standing at a desk who
+        // bends over a laptop: from the camera's POV the head dips to
+        // or below hip level, there is no ankle landmark visible to
+        // disambiguate, and the fall banner pops up mid-session. The
+        // vision-prompt `FALL:` prefix (GPT-4.1-mini) already covers
+        // genuine falls and is semantic-aware (distinguishes "leaning
+        // over laptop" from "lying on the floor"), so we drop the pose
+        // path rather than keep piling on heuristics that keep the
+        // false-positive problem without solving it.
+        // _checkFallHeuristic is kept below (dead) so a future,
+        // more-reliable re-enable is still easy to wire back in.
+    } else {
+        // No person detected — reset fall state so a later fall starts
+        // from a clean counter.
+        fallFrameCounter = 0;
+        fallAlertFired = false;
+    }
+
+    poseLoopHandle = requestAnimationFrame(poseTrackLoop);
+}
+
+// Landmark subset for the PTZ bbox: face (0-10) + shoulders (11, 12)
+// only. We deliberately EXCLUDE arms/hands/hips/legs because including
+// them made the camera chase whichever hand moved most, producing the
+// "AC panning left and right" effect the user flagged: every time
+// hands moved on the keyboard the bbox centroid shifted and PTZ tried
+// to follow. Face+shoulders is a stable anchor that tracks actual
+// head/body position, not transient gestures. `set` lookup is O(1) so
+// the per-frame cost is unchanged.
+const _PTZ_LANDMARK_INDICES = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+function _computeBboxFromLandmarks(landmarks) {
+    // Use only face + shoulder landmarks, and only those with decent
+    // visibility, so off-frame extrapolations don't blow up the bbox.
+    // Require at least 4 visible head/shoulder points — not confident
+    // enough for a stable bbox otherwise.
+    let xMin = 1, yMin = 1, xMax = 0, yMax = 0, n = 0;
+    for (let i = 0; i < landmarks.length; i++) {
+        if (!_PTZ_LANDMARK_INDICES.has(i)) continue;
+        const lm = landmarks[i];
+        if ((lm.visibility || 0) < 0.3) continue;
+        if (lm.x < xMin) xMin = lm.x;
+        if (lm.y < yMin) yMin = lm.y;
+        if (lm.x > xMax) xMax = lm.x;
+        if (lm.y > yMax) yMax = lm.y;
+        n++;
+    }
+    if (n < 4 || xMax <= xMin || yMax <= yMin) return null;
+    // Clamp to [0, 1] — MediaPipe sometimes returns slightly negative
+    // or >1 values near edges.
+    xMin = Math.max(0, Math.min(1, xMin));
+    xMax = Math.max(0, Math.min(1, xMax));
+    yMin = Math.max(0, Math.min(1, yMin));
+    yMax = Math.max(0, Math.min(1, yMax));
+    return [xMin, yMin, xMax, yMax];
+}
+
+function _checkFallHeuristic(landmarks) {
+    // COCO 33-point skeleton: 0 = nose, 23/24 = left/right hip.
+    // Under normal upright posture (standing or seated) the nose sits
+    // well above the hips on the normalized y axis (0=top, 1=bottom).
+    // A fallen person's nose approaches or drops below hip level.
+    const nose = landmarks[0];
+    const lHip = landmarks[23];
+    const rHip = landmarks[24];
+    if (!nose || !lHip || !rHip) return null;
+    // Require reasonable confidence so we don't fire on low-visibility frames.
+    if ((nose.visibility || 0) < 0.4 ||
+        (lHip.visibility || 0) < 0.4 ||
+        (rHip.visibility || 0) < 0.4) {
+        return null;
+    }
+    const hipY = (lHip.y + rHip.y) / 2;
+    // Nose must be meaningfully BELOW hip line (image y grows downward),
+    // not merely near it. Keeps seated-and-leaning users from tripping the
+    // heuristic while still firing on someone actually gone horizontal.
+    const isFallen = nose.y >= hipY + FALL_NOSE_BELOW_HIP;
+    if (isFallen) {
+        fallFrameCounter++;
+        if (fallFrameCounter >= FALL_THRESHOLD_FRAMES && !fallAlertFired) {
+            fallAlertFired = true;
+            return "Pose heuristic: torso appears horizontal (possible fall)";
+        }
+    } else {
+        fallFrameCounter = 0;
+        fallAlertFired = false;  // upright again → ready for next potential fall
+    }
+    return null;
 }
 
 // ── Fall alert ──

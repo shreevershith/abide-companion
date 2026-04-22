@@ -43,7 +43,7 @@ _TTS_QUEUE_MAXSIZE = 32
 _CLIENT_PLAYING_STALENESS_S = 60.0
 
 # Minimum seconds between vision-reactive responses. Without this,
-# a sustained wave would trigger a response every ~3.6s (vision cycle).
+# a sustained wave would trigger a response every ~2.4s (vision cycle).
 _VISION_REACT_COOLDOWN_S = 15.0
 
 # Whether an observed scene is "noteworthy" is decided by the vision
@@ -62,17 +62,26 @@ _VISION_REACT_MIN_SILENCE_S = 10.0
 
 # Phase K — out-of-frame welfare check.
 # Consecutive "Out of frame" vision cycles before Abide verbally checks
-# in. 3 cycles × ~3.6 s ≈ 11 s of absence — long enough to skip brief
-# trips (glass of water, stepping out of shot to grab something) but
-# short enough to notice if the person has fallen outside the camera's
-# view or wandered off. Works alongside the frontend PTZ subject-follow
-# (Phase K frontend): when the camera can't keep the person in view
-# despite tracking, Abide speaks up.
+# in. 3 cycles × ~2.4 s ≈ 7 s of absence (was ~11 s before the Phase
+# S.3 follow-up retune to a 2.4 s vision cycle) — short enough for
+# Abide to feel present when the user briefly steps out, long enough
+# to skip routine brief trips (bending to pick something up, turning
+# to another person). Three-consecutive-cycles gate still prevents
+# single-frame misclassification false-fires. Works alongside the
+# frontend PTZ subject-follow: when the camera can't keep the person
+# in view despite tracking, Abide speaks up.
 _OUT_OF_FRAME_CHECKIN_THRESHOLD = 3
 # Cooldown between successive welfare nudges so a sustained absence
 # doesn't spam the user on their return, and so Abide doesn't chain
 # multiple check-ins if the person lingers out of frame.
 _OUT_OF_FRAME_CHECKIN_COOLDOWN_S = 30.0
+
+# Phase U follow-up — minimum seconds between consecutive client-side
+# fall_alert events. A buggy or adversarial client could otherwise spam
+# alerts at pose-loop rate (~15-30 Hz), inflating `fall_count` and
+# flashing the red UI banner continuously. 10 s matches the out-of-
+# frame welfare logic's "give the user a moment" posture.
+_CLIENT_FALL_ALERT_COOLDOWN_S = 10.0
 
 # Names that must never be stored as the user's name. Defence-in-depth
 # against extract_user_facts() drift: if Claude ever mis-tags "Abide"
@@ -314,6 +323,17 @@ class Session:
         # vision result with a non-null bbox we nudge the camera toward
         # the subject so it follows them around the room.
         self._ptz: PTZController = PTZController()
+        # Phase U.2 — browser-local MediaPipe pose landmarks drive a
+        # second, higher-frequency PTZ nudge source than the 2.4 s
+        # GPT-4.1-mini vision cycle. Client emits `face_bbox` up to
+        # ~5 Hz; we rate-limit server-side before touching DirectShow so
+        # the property-set calls don't queue up. `_last_face_nudge_ts`
+        # is the monotonic time of the most recent dispatched nudge.
+        self._last_face_nudge_ts: float = 0.0
+        # Phase U follow-up — cooldown timer for client-side pose-heuristic
+        # fall alerts so a buggy/malicious client can't spam the red
+        # banner + bump `fall_count`.
+        self._last_client_fall_ts: float = 0.0
         # Fall-alert state: when a fall is detected, this holds the text
         # until it has been surfaced to Claude as urgent context for one
         # response turn. After that turn, cleared.
@@ -328,6 +348,13 @@ class Session:
         self.telemetry_session_id: str | None = None
         self._current_turn_trace = None
         # Rolling session stats, flushed to Langfuse on disconnect.
+        # `turn_latencies_ms` is the whole-turn metric (speech_end → last
+        # TTS byte handed to WS). `ttfa_ms_samples` is the brief's real
+        # SLA — speech_end → first audio byte on the wire (D85 note).
+        # The per-stage lists (STT / Claude TTFT / TTS first-byte) let
+        # main.py's session-summary finally block roll up P50/P95 per
+        # stage so a slow session is diagnosable end-to-end, not just at
+        # the aggregate level.
         self.stats = {
             "total_turns": 0,
             "completed_turns": 0,
@@ -335,7 +362,15 @@ class Session:
             "fall_count": 0,
             "vision_calls": 0,
             "turn_latencies_ms": [],
+            "ttfa_ms_samples": [],
+            "stt_ms_samples": [],
+            "claude_ttft_ms_samples": [],
+            "tts_first_byte_ms_samples": [],
         }
+        # Per-turn state populated by start_response and consumed by
+        # _run_response's finally block. Cleared at the end of every turn.
+        self._current_turn_speech_end_ts: float | None = None
+        self._current_turn_stt_ms: float | None = None
 
     @property
     def is_responding(self) -> bool:
@@ -523,6 +558,17 @@ class Session:
             except Exception:
                 pass
 
+    def _record_stage_sample(self, key: str, value_ms: float | None) -> None:
+        """Append a per-turn stage-latency sample to `self.stats[key]` and
+        bound the list to `_MAX_TURN_LATENCY_SAMPLES`. Silent no-op when
+        `value_ms` is None (stage didn't run or wasn't measured this turn)."""
+        if value_ms is None:
+            return
+        lst = self.stats.setdefault(key, [])
+        lst.append(round(float(value_ms), 1))
+        if len(lst) > _MAX_TURN_LATENCY_SAMPLES:
+            del lst[0:len(lst) - _MAX_TURN_LATENCY_SAMPLES]
+
     def start_response(
         self,
         ws: WebSocket,
@@ -530,12 +576,27 @@ class Session:
         text: str,
         openai_key: str | None,
         turn_trace=None,
+        speech_end_ts: float | None = None,
+        stt_latency_ms: float | None = None,
+        audio_events_context: str = "",
     ):
         """Launch the response+TTS pipeline as a background task.
 
         `turn_trace` is an optional Langfuse trace handle created by main.py
         right after STT. If provided, Claude and TTS spans are attached to
         it and it is finalized in `_run_response`.
+
+        `speech_end_ts` is the monotonic timestamp of the user's VAD
+        speech_end event (from `AudioProcessor.last_speech_end_ts`). Used
+        by `_run_response` to compute TTFA — the brief's "<1.5s to first
+        audio after user finishes speaking" SLA. None for proactive /
+        vision-reactive / welfare-check turns where there was no preceding
+        user speech; TTFA is skipped for those turns.
+
+        `stt_latency_ms` is the wall-clock time Groq Whisper took for
+        this turn's transcription, measured in main.py. Passed through so
+        the per-turn stage-breakdown in the session summary has STT
+        latency alongside Claude TTFT and TTS first-byte.
 
         If a previous response is still running, it is cancelled first to
         prevent orphaned tasks and overlapping audio.
@@ -549,6 +610,8 @@ class Session:
             log.info("Previous response task cancelled before starting new one")
         self._cancelled = False
         self._current_turn_trace = turn_trace
+        self._current_turn_speech_end_ts = speech_end_ts
+        self._current_turn_stt_ms = stt_latency_ms
         self.stats["total_turns"] += 1
         vision_context = self.vision_buffer.as_context()
         # If there is a pending fall alert, prepend an urgent instruction
@@ -570,6 +633,7 @@ class Session:
             self._run_response(
                 ws, engine, text, openai_key,
                 vision_context, user_context, time_context,
+                audio_events_context,
             )
         )
 
@@ -583,7 +647,7 @@ class Session:
              etc.) vs routine behavior (sitting, talking with gestures).
           2. The activity text has actually CHANGED since the previous
              observation. Without this, a sustained wave would re-trigger
-             on every 3.6s vision cycle. The cooldown in _run_vision is
+             on every 2.4s vision cycle. The cooldown in _run_vision is
              a second layer of protection; this is belt-and-suspenders.
 
         NOTE: called AFTER vision_buffer.append(), so `result` is already
@@ -624,6 +688,13 @@ class Session:
         self._frame_task = asyncio.create_task(
             self._run_vision(frames_b64, openai_key, ws)
         )
+        # `_run_vision` wraps its full body in try/except, so in the
+        # current code nothing should escape — but a future refactor
+        # might move work outside that wrapper. Defensive done-callback
+        # surfaces any unhandled exception instead of letting Python's
+        # GC print "Task exception was never retrieved" long after the
+        # vision pipeline has moved on. Cheap insurance.
+        self._frame_task.add_done_callback(_log_bg_exception("vision"))
 
     async def _run_vision(
         self,
@@ -784,6 +855,68 @@ class Session:
         except Exception as e:
             log.error("Vision worker error: %s", e)
 
+    # Minimum seconds between face-bbox-driven PTZ nudges. At 5 Hz
+    # from the browser we'd try to write DirectShow 300 times/minute
+    # — DirectShow `set_camera_property` can take 50-100 ms each and
+    # nudges don't stack meaningfully faster than the lens can slew.
+    # 5 Hz (every 200 ms) is the sweet spot: visibly smoother than the
+    # 2.4 s vision cycle without flooding the camera.
+    _FACE_NUDGE_MIN_INTERVAL_S = 0.20
+
+    def dispatch_face_bbox(self, bbox: list[float]) -> None:
+        """Phase U.2 — take a MediaPipe-derived bbox from the browser
+        and apply a PTZ nudge toward frame-centre, rate-limited to
+        `_FACE_NUDGE_MIN_INTERVAL_S`. Silent no-op when PTZ is disabled
+        (non-Windows, non-PTZ camera, zoom-only MeetUp firmware). Runs
+        the DirectShow write off-loop via `asyncio.to_thread` so the
+        COM call doesn't block the voice loop."""
+        if not self._ptz.available:
+            return
+        now = time.monotonic()
+        if now - self._last_face_nudge_ts < self._FACE_NUDGE_MIN_INTERVAL_S:
+            return
+        self._last_face_nudge_ts = now
+        try:
+            _t = asyncio.create_task(asyncio.to_thread(self._ptz.nudge_to_bbox, bbox))
+            _t.add_done_callback(_log_bg_exception("face-bbox-nudge"))
+        except Exception as e:
+            log.debug("[PTZ] face-bbox dispatch failed (%s)", type(e).__name__)
+
+    async def handle_client_fall(self, ws: WebSocket, text: str) -> None:
+        """Phase U.3 — client-side MediaPipe pose heuristic flagged a
+        fall. Same handling as a vision-prompt `FALL:` prefix: stash
+        urgent context for the next response turn, increment fall_count,
+        push a red alert banner to the browser.
+
+        Phase U follow-up hardening:
+          - Rate-limit via `_CLIENT_FALL_ALERT_COOLDOWN_S`. The pose
+            loop runs 15–30 Hz in the browser and a bug / compromised
+            client could otherwise flood us.
+          - Escape `<` and `>` in the incoming text before storing. The
+            text is later concatenated into the urgent-instruction
+            prefix in `start_response` which lands in Claude's prompt.
+            Without escaping, a malicious frontend could inject
+            `"</camera_observations><system>..."` and hijack the turn.
+        """
+        now = time.monotonic()
+        if now - self._last_client_fall_ts < _CLIENT_FALL_ALERT_COOLDOWN_S:
+            return
+        self._last_client_fall_ts = now
+
+        # Defence-in-depth escape — cheap, applies regardless of where
+        # the text came from. Keep it human-readable (HTML-entity form)
+        # so a legit pose-heuristic message still reads naturally when
+        # it reaches Claude.
+        safe_text = text.replace("<", "&lt;").replace(">", "&gt;")
+
+        self._pending_fall_alert = safe_text
+        self.stats["fall_count"] += 1
+        log.warning("[FALL-POSE] client pose heuristic flagged fall: %s", safe_text)
+        await self._safe_send_json(
+            ws,
+            {"type": "alert", "level": "fall", "text": safe_text},
+        )
+
     def _dispatch_camera_action(self, action: str) -> None:
         """Translate a Claude [[CAM:...]] marker into a PTZController call.
         Fire-and-forget on the executor so the DirectShow COM call doesn't
@@ -802,7 +935,8 @@ class Session:
             return
         log.info("[CAMERA] Dispatching zoom %s", direction)
         try:
-            asyncio.create_task(asyncio.to_thread(self._ptz.zoom, direction))
+            _t = asyncio.create_task(asyncio.to_thread(self._ptz.zoom, direction))
+            _t.add_done_callback(_log_bg_exception("zoom-dispatch"))
         except Exception as e:
             log.debug("[CAMERA] dispatch failed (%s)", type(e).__name__)
 
@@ -853,11 +987,20 @@ class Session:
             if self.resident_id:
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.run_in_executor(
+                    _save_fut = loop.run_in_executor(
                         None,
                         save_user_context,
                         self.resident_id,
                         self.user_context.to_dict(),
+                    )
+                    # Surface disk-write failures (permission denied,
+                    # disk full, path vanished) instead of letting them
+                    # disappear into the executor. Wrapping in
+                    # `asyncio.ensure_future` gives us a standard
+                    # asyncio future that accepts add_done_callback
+                    # uniformly across Python versions.
+                    _save_fut.add_done_callback(
+                        _log_bg_exception("memory-save")
                     )
                 except RuntimeError:
                     # No running loop (shouldn't happen on this path) —
@@ -903,12 +1046,37 @@ class Session:
         vision_context: str = "",
         user_context: str = "",
         time_context: str = "",
+        audio_events_context: str = "",
     ):
         """Stream Claude + parallel TTS, checking for cancellation."""
         full_response: list[str] = []
         tts_queue: asyncio.Queue = asyncio.Queue(maxsize=_TTS_QUEUE_MAXSIZE)
         turn_trace = self._current_turn_trace
         t_turn_start = time.monotonic()
+        # Phase U.3 follow-up #3 — TTFA gap diagnostic. When a user-speech
+        # turn is starting, log the delta from speech_end to this point.
+        # Previous instrumentation showed TTFA P50 ~5.6 s but STT + Claude
+        # + TTS accounted for only ~2.9 s of it. The gap (~2.7 s) was
+        # invisible. This line exposes the "speech_end → _run_response
+        # started" slice so we can tell whether the delay is in main.py
+        # pre-start_response plumbing (awaited transcribe + audio_events,
+        # event-loop contention) or later in the pipeline. Skipped on
+        # proactive / vision-reactive turns where speech_end isn't set.
+        if self._current_turn_speech_end_ts is not None:
+            lag_ms = (t_turn_start - self._current_turn_speech_end_ts) * 1000
+            log.info(
+                "[TIMING] speech_end \u2192 _run_response started = %.0fms", lag_ms,
+            )
+        # Stage-latency checkpoints used by the finally block to derive
+        # TTFA + per-stage P50/P95 rollups. Shared mutably between the
+        # producer (first-sentence-queued) and consumer (first-tts-ready
+        # and first-bytes-sent) via dict so we don't need `nonlocal`
+        # declarations in the nested functions.
+        turn_ck = {
+            "first_sentence_queued_ts": None,
+            "first_tts_ready_ts": None,
+            "first_bytes_sent_ts": None,
+        }
 
         async def producer():
             """Read Claude stream; launch a synthesize task per sentence."""
@@ -920,7 +1088,13 @@ class Session:
             try:
                 await self._safe_send_json(ws, {"type": "status", "state": "thinking"})
 
-                async for chunk in engine.respond(text, vision_context=vision_context, user_context=user_context, time_context=time_context):
+                async for chunk in engine.respond(
+                    text,
+                    vision_context=vision_context,
+                    user_context=user_context,
+                    time_context=time_context,
+                    audio_events_context=audio_events_context,
+                ):
                     if self._cancelled:
                         log.info("Barge-in: stopping Claude stream")
                         break
@@ -954,6 +1128,23 @@ class Session:
                         sentence = text_buf[:match.start()].strip()
                         if sentence and openai_key and not self._cancelled:
                             ts = time.monotonic()
+                            # Phase U.3 follow-up #3 — extra timing anchor:
+                            # speech_end → first sentence boundary (the
+                            # moment TTS can begin for the first time this
+                            # turn). Lets us see, in combination with the
+                            # [TIMING] TTFA line, whether the slow path is
+                            # pre-sentence or TTS first-byte.
+                            if (
+                                turn_ck["first_sentence_queued_ts"] is None
+                                and self._current_turn_speech_end_ts is not None
+                            ):
+                                pre_sentence_ms = (
+                                    ts - self._current_turn_speech_end_ts
+                                ) * 1000
+                                log.info(
+                                    "[TIMING] speech_end \u2192 first sentence boundary = %.0fms",
+                                    pre_sentence_ms,
+                                )
                             log.info("[TIMING] Sentence boundary: %r", sentence[:60])
                             # Record for the auto-populated TTS cache —
                             # sentences heard repeatedly across sessions
@@ -966,6 +1157,10 @@ class Session:
                                 synthesize(sentence, openai_key, ts)
                             )
                             tts_queue.put_nowait((sentence, task, ts))
+                            # Stage-metric checkpoint: time of first sentence
+                            # queued (used for TTS-first-byte computation).
+                            if turn_ck["first_sentence_queued_ts"] is None:
+                                turn_ck["first_sentence_queued_ts"] = ts
                         # Advance the buffer past this boundary. The
                         # remaining text is what comes after the
                         # whitespace separator; rescan from the start
@@ -978,6 +1173,21 @@ class Session:
                 text_buf = text_buf.strip()
                 if text_buf and openai_key and not self._cancelled:
                     ts = time.monotonic()
+                    # Same diagnostic as the sentence-boundary branch: for
+                    # one-sentence replies there is no in-stream boundary
+                    # and the final tail IS the first TTS unit, so we
+                    # measure that anchor here too.
+                    if (
+                        turn_ck["first_sentence_queued_ts"] is None
+                        and self._current_turn_speech_end_ts is not None
+                    ):
+                        pre_sentence_ms = (
+                            ts - self._current_turn_speech_end_ts
+                        ) * 1000
+                        log.info(
+                            "[TIMING] speech_end \u2192 first sentence boundary = %.0fms (final tail)",
+                            pre_sentence_ms,
+                        )
                     log.info("[TIMING] Final tail: %r", text_buf[:60])
                     record_phrase(text_buf)
                     task = asyncio.create_task(
@@ -1033,6 +1243,20 @@ class Session:
                     log.error("TTS failed for %r: %s", sentence[:40], e)
                     continue
 
+                # Skip emoji-only / empty synthesise results (see
+                # `_strip_nonspeakable` in tts.py). Prevents us from
+                # flipping the "speaking" status and polluting TTFA
+                # with a zero-byte send that the client can't play.
+                if not audio:
+                    continue
+
+                # Stage-metric checkpoint: time the first TTS task yielded
+                # audio — i.e. the moment the bytes became available to
+                # send. Paired with first_sentence_queued_ts in the finally
+                # block to compute TTS first-byte latency.
+                if turn_ck["first_tts_ready_ts"] is None:
+                    turn_ck["first_tts_ready_ts"] = time.monotonic()
+
                 # Telemetry: one span per TTS call. Latency is sentence-boundary
                 # to the moment the audio bytes became available locally.
                 tts_latency_ms = (time.monotonic() - ts) * 1000
@@ -1055,6 +1279,10 @@ class Session:
                     first_tts = False
 
                 t_send = time.monotonic()
+                # Stage-metric checkpoint: time first audio bytes leave the
+                # server — this is what TTFA is measured against.
+                if turn_ck["first_bytes_sent_ts"] is None:
+                    turn_ck["first_bytes_sent_ts"] = t_send
                 await self._safe_send_bytes(ws, audio)
                 self.mark_tts_sent()
                 log.info(
@@ -1092,14 +1320,27 @@ class Session:
             )
             await self._safe_send_json(ws, {"type": "response_done"})
         except Exception as e:
-            log.error("Response pipeline error: %s", e)
-            # Send a generic message to the client; never leak raw exception
-            # details that may contain API fingerprints or stack fragments.
+            # Log type + repr so the "empty message" pattern we saw at
+            # session-shutdown is diagnosable. Some network / anyio
+            # exception types stringify to "" (e.g. `ClosedResourceError`)
+            # and the prior `"%s", e` line was emitting a blank tail.
+            log.error("Response pipeline error: %s: %r", type(e).__name__, e)
+            # Use the ConversationError's user-safe message when available
+            # (our own typed exception with an already-sanitised string);
+            # fall back to a generic message for any other exception type
+            # so raw details never leak to the client. This lets the
+            # Claude first-token-timeout path surface the friendly
+            # "Give me a moment…" wording the engine defined.
+            from app.conversation import ConversationError
+            if isinstance(e, ConversationError):
+                user_message = str(e)
+            else:
+                user_message = "Something went wrong while I was responding. Let's try again."
             await self._safe_send_json(
                 ws,
                 {
                     "type": "error",
-                    "message": "Something went wrong while I was responding. Let's try again.",
+                    "message": user_message,
                 },
             )
         finally:
@@ -1143,6 +1384,48 @@ class Session:
             lat.append(round(total_turn_ms, 1))
             if len(lat) > _MAX_TURN_LATENCY_SAMPLES:
                 del lat[0:len(lat) - _MAX_TURN_LATENCY_SAMPLES]
+
+            # Per-stage metrics — what actually lets us see WHERE latency
+            # goes. Recorded alongside the whole-turn metric so main.py's
+            # session-summary roll-up can emit P50/P95 per stage. See D85.
+            self._record_stage_sample("stt_ms_samples", self._current_turn_stt_ms)
+            self._record_stage_sample(
+                "claude_ttft_ms_samples", engine.last_first_token_ms
+            )
+            tts_fb_ms = None
+            if (
+                turn_ck["first_sentence_queued_ts"] is not None
+                and turn_ck["first_tts_ready_ts"] is not None
+            ):
+                tts_fb_ms = (
+                    turn_ck["first_tts_ready_ts"]
+                    - turn_ck["first_sentence_queued_ts"]
+                ) * 1000
+            self._record_stage_sample("tts_first_byte_ms_samples", tts_fb_ms)
+
+            # TTFA — the brief's SLA metric. Only computable for turns
+            # initiated by user speech (speech_end_ts populated). Proactive
+            # check-ins and vision-reactive / welfare-check turns skip it.
+            ttfa_ms = None
+            if (
+                self._current_turn_speech_end_ts is not None
+                and turn_ck["first_bytes_sent_ts"] is not None
+                and not self._cancelled
+            ):
+                ttfa_ms = (
+                    turn_ck["first_bytes_sent_ts"]
+                    - self._current_turn_speech_end_ts
+                ) * 1000
+                log.info(
+                    "[TIMING] TTFA: %.0fms (speech_end \u2192 first audio byte out)",
+                    ttfa_ms,
+                )
+            self._record_stage_sample("ttfa_ms_samples", ttfa_ms)
+
+            # Clear per-turn state so a follow-up proactive turn doesn't
+            # inherit stale values.
+            self._current_turn_speech_end_ts = None
+            self._current_turn_stt_ms = None
             self._current_turn_trace = None
 
             if not self._cancelled:
