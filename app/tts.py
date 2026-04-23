@@ -65,6 +65,32 @@ _MAX_TTS_BYTES = 4 * 1024 * 1024
 # and we fail the sentence gracefully rather than block the consumer.
 _TTS_FIRST_BYTE_TIMEOUT_S = 10.0
 
+# Mid-stream inter-chunk deadline. Once the first byte arrives (and the
+# first-byte timeout is disabled via reschedule(None)), an OpenAI API
+# throttle can dribble data at ~7 KB/s instead of the normal 100+ KB/s,
+# causing an 11 s TTS delivery for a short sentence (observed in live
+# session abide-350964a5617c). Without a per-chunk timeout there is
+# nothing to abort a stalled-but-still-connected stream. 3 s is well
+# above the normal inter-chunk gap at full speed (~50-100 ms) and still
+# catches a throttled stream ~8 s before the old worst-case.
+_TTS_CHUNK_TIMEOUT_S = 3.0
+
+# Rate-based abort for slow-dribble throttle. The per-chunk timeout
+# above only fires when a single gap between consecutive chunks exceeds
+# 3 s. A different throttle pattern (chunks arriving every 1-2 s at
+# 10-21 KB/s instead of 100+ KB/s) was observed in live session
+# abide-ee7e5abb250e: "Ha, just waving hello then — what's up, Shree?"
+# delivered 125,400 B at ~21 KB/s = 6,000 ms first→last, causing
+# audible distortion (ring-buffer underrun). The chunk timeout never
+# fired because each individual gap was <3 s.
+# Fix: after a 1.5 s grace period (the ring buffer is well-stocked by
+# then), if the overall delivery rate falls below 30 KB/s we abort. At
+# normal speed (100-200 KB/s) a 1.5 s check yields ~150-300 KB received
+# — well above any realistic sentence size — so this only triggers under
+# genuine throttle.
+_TTS_MIN_RATE_BPS = 30 * 1024   # 30 KB/s floor; normal is 100-200 KB/s
+_TTS_RATE_CHECK_AFTER_S = 1.5   # grace period before rate enforcement
+
 # TTS cache: pre-generated opus audio for frequently-used stock phrases.
 # Populated by prewarm_cache() at session start. synthesize() checks this
 # first and serves the cached bytes instantly (0ms), bypassing the OpenAI
@@ -313,9 +339,40 @@ async def stream_sentence(
                         raise APIKeyError(
                             "Please check your OpenAI API key in the settings panel (gear icon)."
                         )
+                    if resp.status_code == 429:
+                        # Rate-limited by OpenAI. Skip this sentence cleanly
+                        # instead of raising — the response pipeline continues
+                        # with the next sentence, and the user hears a partial
+                        # reply rather than a hard error.
+                        log.warning("[TTS] Rate limited by OpenAI — skipping sentence %r", text[:40])
+                        return
                     raise Exception(f"TTS API returned {resp.status_code}: {body[:200]!r}")
 
-                async for chunk in resp.aiter_bytes():
+                _leftover = b""
+                _aiter = resp.aiter_bytes().__aiter__()
+                while True:
+                    try:
+                        if first_byte_ts is None:
+                            # Waiting for first byte — first-byte timeout_cm covers this.
+                            chunk = await _aiter.__anext__()
+                        else:
+                            # Streaming — apply inter-chunk deadline so a throttled
+                            # OpenAI stream (observed at ~7 KB/s in live sessions)
+                            # aborts after _TTS_CHUNK_TIMEOUT_S instead of dribbling
+                            # for 11+ seconds.
+                            chunk = await asyncio.wait_for(
+                                _aiter.__anext__(), timeout=_TTS_CHUNK_TIMEOUT_S
+                            )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        elapsed_ms = (time.monotonic() - first_byte_ts) * 1000
+                        log.warning(
+                            "[STALL] TTS mid-stream: no data for %.1fs after %.0fms "
+                            "— aborting '%s...'",
+                            _TTS_CHUNK_TIMEOUT_S, elapsed_ms, text[:40],
+                        )
+                        return
                     if not chunk:
                         continue
                     if first_byte_ts is None:
@@ -328,6 +385,16 @@ async def stream_sentence(
                                 (first_byte_ts - sentence_detected_ts) * 1000,
                                 (first_byte_ts - t_call) * 1000,
                             )
+                    # Align to Int16 (2-byte) boundary. An odd-byte chunk causes
+                    # new Int16Array(buf) to drop the stray byte, byte-swapping
+                    # every subsequent sample in that chunk — sounds like static.
+                    chunk = _leftover + chunk
+                    _leftover = b""
+                    if len(chunk) % 2 == 1:
+                        _leftover = chunk[-1:]
+                        chunk = chunk[:-1]
+                    if not chunk:
+                        continue
                     total_bytes += len(chunk)
                     if total_bytes > _MAX_TTS_BYTES:
                         log.warning(
@@ -335,7 +402,26 @@ async def stream_sentence(
                             _MAX_TTS_BYTES, total_bytes,
                         )
                         return
+                    # Rate-based abort: per-chunk timeout catches complete
+                    # stalls (gap > 3 s), but not slow-dribble (chunks
+                    # arriving every 1-2 s at 10-21 KB/s). After the grace
+                    # period, check the running average; abort if it's below
+                    # the minimum floor.
+                    _elapsed = time.monotonic() - first_byte_ts
+                    if (
+                        _elapsed >= _TTS_RATE_CHECK_AFTER_S
+                        and (total_bytes / _elapsed) < _TTS_MIN_RATE_BPS
+                    ):
+                        _rate_kbs = total_bytes / _elapsed / 1024
+                        log.warning(
+                            "[STALL] TTS slow-dribble: %.0f KB/s after %.0fms "
+                            "— aborting '%s...'",
+                            _rate_kbs, _elapsed * 1000, text[:40],
+                        )
+                        return
                     yield chunk
+                if _leftover:
+                    yield _leftover + b"\x00"  # pad final stray byte to complete Int16
     except TimeoutError:
         log.warning(
             "[STALL] TTS first-byte deadline (%.1fs) tripped for %r — skipping",

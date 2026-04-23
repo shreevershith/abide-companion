@@ -363,10 +363,16 @@ class PTZController:
         target = (target // zoom_step) * zoom_step
 
         if target == current:
-            log.info(
-                "[PTZ] zoom %s: already at limit (%d, range=[%d,%d])",
-                direction, current, zr.min, zr.max,
-            )
+            if direction == "in":
+                log.info(
+                    "[PTZ] zoom in: already at soft cap (%d, user_cap=%d hardware=[%d,%d])",
+                    current, user_cap, zr.min, zr.max,
+                )
+            else:
+                log.info(
+                    "[PTZ] zoom %s: already at limit (%d, range=[%d,%d])",
+                    direction, current, zr.min, zr.max,
+                )
             return
 
         if self._apply(_duvc.CamProp.Zoom, target):

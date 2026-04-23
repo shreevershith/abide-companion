@@ -150,7 +150,7 @@ async def _on_shutdown() -> None:
 # timeout would let a hung connection stall the handler for 30 s before
 # the read phase even starts.
 _analyze_client = httpx.AsyncClient(
-    timeout=httpx.Timeout(connect=5.0, read=25.0),
+    timeout=httpx.Timeout(25.0, connect=5.0),
     http2=True,
 )
 
@@ -301,13 +301,21 @@ _FRAME_B64_RE = re.compile(r'^[A-Za-z0-9+/=\s]*$')
 def _log_prewarm_exception(name: str):
     """Returns a done-callback that logs an unhandled exception from a
     fire-and-forget prewarm task. Without this, Python silently swallows
-    task exceptions and bad API keys don't surface until the first turn."""
+    task exceptions and bad API keys don't surface until the first turn.
+
+    Defensive try/except mirrors session.py:_log_bg_exception — asyncio
+    silently discards any exception raised inside a done-callback, so we
+    must guard ourselves: task.exception() can raise CancelledError in a
+    narrow race between our cancelled() check and the call."""
     def _cb(task: asyncio.Task):
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            log.warning("%s prewarm failed (non-fatal): %s", name, exc)
+        try:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.warning("%s prewarm failed (non-fatal): %s: %r", name, type(exc).__name__, exc)
+        except Exception as cb_exc:
+            log.error("[BUG] _log_prewarm_exception callback raised for %s: %r", name, cb_exc)
     return _cb
 
 
@@ -1190,12 +1198,43 @@ async def websocket_endpoint(ws: WebSocket):
                                 await Session._safe_send_json(ws,{"type": "error", "message": "Anthropic API key not set"})
                         else:
                             log.info("Empty transcript, skipping")
-                            # If audio-events was pre-dispatched for this
-                            # segment but transcript was empty/filtered,
-                            # cancel the task so we don't run YAMNet for
-                            # nothing (saves CPU, doesn't affect TTFA).
-                            if audio_events_task is not None and not audio_events_task.done():
-                                audio_events_task.cancel()
+                            # Don't cancel audio_events_task when STT returned
+                            # empty. Welfare events (cough, gasp, sneeze) are
+                            # captured as non-speech audio segments — exactly
+                            # the case where Whisper returns nothing. Previously
+                            # we cancelled YAMNet here to "save CPU", but that
+                            # silently dropped every cough/gasp the user made
+                            # without speaking. The callback stores results in
+                            # _pending_audio_events_context for the next turn;
+                            # the block below fires proactively if YAMNet has
+                            # already finished (it's ~280 ms vs Whisper ~600 ms+,
+                            # so YAMNet often completes first).
+                            _WELFARE_TAGS = {"Cough", "Sneeze", "Gasp", "Wheeze"}
+                            if (
+                                audio_events_task is not None
+                                and audio_events_task.done()
+                                and not audio_events_task.cancelled()
+                                and engine is not None
+                                and openai_key
+                            ):
+                                try:
+                                    _events = audio_events_task.result()
+                                    if _events and any(e.tag in _WELFARE_TAGS for e in _events):
+                                        _now = time.monotonic()
+                                        if _now - session._last_audio_event_react_ts >= 15.0:
+                                            session._last_audio_event_react_ts = _now
+                                            _ctx = audio_events.format_events_for_prompt(_events)
+                                            log.info(
+                                                "[AUDIO-EVENTS] welfare event on empty-transcript turn — "
+                                                "firing proactive reaction (%s)",
+                                                ", ".join(f"{e.tag}:{e.confidence:.2f}" for e in _events),
+                                            )
+                                            session.start_response(
+                                                ws, engine, "", openai_key,
+                                                audio_events_context=_ctx,
+                                            )
+                                except Exception as _exc:
+                                    log.debug("Audio events welfare check failed: %s", _exc)
                             if not session.is_audible:
                                 await Session._safe_send_json(ws,{"type": "status", "state": "listening"})
                     except asyncio.TimeoutError:
@@ -1233,6 +1272,16 @@ async def websocket_endpoint(ws: WebSocket):
                                 "type": "error",
                                 "message": "Please check your Groq API key in the settings panel (gear icon).",
                                 "open_settings": True,
+                            })
+                        elif type_name == "RateLimitError" or (
+                            hasattr(e, "status_code") and getattr(e, "status_code", None) == 429
+                        ):
+                            log.warning("Groq rate limit hit: %s", type(e).__name__)
+                            if audio_events_task is not None and not audio_events_task.done():
+                                audio_events_task.cancel()
+                            await Session._safe_send_json(ws, {
+                                "type": "error",
+                                "message": "I'm getting a lot of requests right now — give me a moment and try again.",
                             })
                         else:
                             # Log the real error server-side but send a safe,
@@ -1334,7 +1383,7 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 save_user_context(session.resident_id, session.user_context.to_dict())
             except Exception as e:
-                log.debug("[MEMORY] Final flush failed: %s", type(e).__name__)
+                log.warning("[MEMORY] Final flush failed: %s", type(e).__name__)
 
         # Phase N — return the PTZ camera to a neutral pose so the next
         # session starts centred. Silent no-op when PTZ isn't available.

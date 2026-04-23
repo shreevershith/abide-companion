@@ -29,6 +29,9 @@ from app import telemetry
 log = logging.getLogger("abide.session")
 
 _SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
+# Strip any [[CAM:...]] markers that leak into TTS text (e.g. when Claude
+# puts the marker mid-response instead of at the very head of the reply).
+_CAM_STRIP_RE = re.compile(r'\[\[CAM:[^\]]*\]\]', re.IGNORECASE)
 
 # Cap on the rolling list of per-turn latencies kept in Session.stats.
 # Long sessions shouldn't grow an unbounded list just for telemetry.
@@ -315,6 +318,11 @@ class Session:
         # consumed and cleared by start_response() so it is injected into
         # the NEXT turn rather than blocking the current one.
         self._pending_audio_events_context: str = ""
+        # Monotonic timestamp of the last proactive response fired for a
+        # welfare audio event (cough/gasp/sneeze) on an empty-transcript
+        # turn. Guards a 15 s cooldown so back-to-back coughs don't each
+        # trigger a separate "are you okay?" reaction.
+        self._last_audio_event_react_ts: float = 0.0
 
         # Vision state
         self.vision_buffer: VisionBuffer = VisionBuffer()
@@ -1199,8 +1207,11 @@ class Session:
                                         )
                                     log.info("[TIMING] Sentence boundary: %r", sentence[:60])
                                     record_phrase(sentence)
-                                    chunk_q, fill_task = _make_fill_task(sentence, ts)
-                                    tts_queue.put_nowait((sentence, chunk_q, fill_task, ts))
+                                    tts_sentence = _CAM_STRIP_RE.sub("", sentence).strip()
+                                    if not tts_sentence:
+                                        continue
+                                    chunk_q, fill_task = _make_fill_task(tts_sentence, ts)
+                                    tts_queue.put_nowait((tts_sentence, chunk_q, fill_task, ts))
                                     if turn_ck["first_sentence_queued_ts"] is None:
                                         turn_ck["first_sentence_queued_ts"] = ts
                                 text_buf = text_buf[match.end():]
@@ -1224,8 +1235,10 @@ class Session:
                                 )
                             log.info("[TIMING] Final tail: %r", text_buf[:60])
                             record_phrase(text_buf)
-                            chunk_q, fill_task = _make_fill_task(text_buf, ts)
-                            tts_queue.put_nowait((text_buf, chunk_q, fill_task, ts))
+                            tts_tail = _CAM_STRIP_RE.sub("", text_buf).strip()
+                            if tts_tail:
+                                chunk_q, fill_task = _make_fill_task(tts_tail, ts)
+                                tts_queue.put_nowait((tts_tail, chunk_q, fill_task, ts))
 
                         # Telemetry: Claude generation with token usage. Done here
                         # (after the stream exits) so we have final usage numbers.

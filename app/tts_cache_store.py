@@ -152,7 +152,11 @@ def _save() -> None:
             json.dump(snapshot, f, ensure_ascii=False)
         tmp.replace(_STORE_PATH)
     except Exception as e:
-        log.debug("[TTS-STORE] save failed: %s", type(e).__name__)
+        # WARNING not DEBUG: a silent save failure means the phrase-frequency
+        # store stops persisting and the next session's prewarm list regresses
+        # to the seed list only. Disk-full and permission errors need to be
+        # visible so an operator can act.
+        log.warning("[TTS-STORE] save failed: %s", type(e).__name__)
 
 
 def learned_phrases(limit: int = 40) -> list[str]:

@@ -209,8 +209,9 @@ literal spatial commands like "zoom in", "zoom out", "zoom back", \
 "wider view". Questions about visibility — "can you see me?", "are \
 you able to see my face?", "do I look okay?" — are NOT zoom commands; \
 answer them verbally without emitting a marker. If in doubt, do NOT \
-emit a marker. When a zoom command does fire, begin your reply with \
-ONE of these markers before any other text:
+emit a marker. When a zoom command does fire, the marker MUST be the \
+absolute first characters of your reply — no "Oh", no acknowledgment, \
+no text of any kind before it:
   [[CAM:zoom_in]]     — closer to the subject
   [[CAM:zoom_out]]    — wider view
   [[CAM:zoom_reset]]  — back to the default zoom level
@@ -337,7 +338,12 @@ class ConversationEngine:
         elderly-care welfare reactions grounded in what was actually
         heard, not hallucinated from text-only context.
         """
-        self._history.append({"role": "user", "content": user_text})
+        # Per-message size cap: a very long injected user_text (e.g. a
+        # system prompt from a caller, or a runaway context block) could
+        # push history tokens past 6-8 K before the MAX_HISTORY slice
+        # kicks in. 10 KB is ~2 500 tokens — well above any real elderly
+        # user utterance; over that is almost certainly a bug in the caller.
+        self._history.append({"role": "user", "content": user_text[:10_000]})
 
         if len(self._history) > MAX_HISTORY:
             self._history = self._history[-MAX_HISTORY:]
@@ -527,6 +533,10 @@ class ConversationEngine:
                     if resp.status_code == 401:
                         raise APIKeyError(
                             "Please check your Anthropic API key in the settings panel (gear icon)."
+                        )
+                    if resp.status_code == 429:
+                        raise ConversationError(
+                            "I'm getting a lot of requests right now — give me a moment and try again."
                         )
                     raise ConversationError(
                         "I'm having trouble reaching my services. Please try again in a moment."

@@ -739,6 +739,70 @@ Full codebase audit covering security vulnerabilities, performance bottlenecks, 
 
 ---
 
+### D106. Detection sensitivity bundle — vision timeout, yawning, cough-on-silence, YAMNet threshold
+
+Four targeted fixes after live session `abide-2d0bfd1f838b` revealed three detection problems: waving took 10-15 s to elicit a response, yawning was never noteworthy, and coughing required many attempts.
+
+**Root causes identified from log analysis:**
+
+1. **Waving latency** — `process_frames()` drops a batch if the previous vision task is still in-flight. With an 8 s timeout, each API stall blocked 3+ subsequent 2.4 s cycles. Multiple consecutive stalls produced the 10-15 s gap. Fix: timeout 8 s → 5 s (still 3× over GPT-4.1-mini median of ~1.5 s), cutting blocked cycles to ≤2 per stall. (`app/vision.py`)
+
+2. **Yawning never triggered a reaction** — the vision prompt NOTEWORTHY examples had no yawning case; the model consistently returned `noteworthy=false` for mouth-opening cues. Fix: added a labelled `noteworthy=true` example. Yawning is a fatigue/welfare signal for elderly care. (`app/vision.py`)
+
+3. **Cough-without-speech never reached Claude** — when STT returned an empty transcript (the common case for a bare cough), the code explicitly cancelled the YAMNet task: `audio_events_task.cancel()`. The comment read "saves CPU, doesn't affect TTFA" — technically true but wrong: YAMNet cancellation silently discarded every cough/gasp event captured when the user wasn't speaking. Fix: remove the cancellation; the existing `_store_audio_events` done-callback stores results for the next turn. Additional improvement: if YAMNet has already completed by the time Whisper returns empty (common — YAMNet ~280 ms vs Whisper ~600 ms+), check for urgent welfare events (Cough, Sneeze, Gasp, Wheeze) and fire a proactive `start_response("")` immediately with a 15 s cooldown. (`app/main.py`, `app/session.py`)
+
+4. **YAMNet threshold too strict** — genuine coughs from across the room were landing in the 0.32-0.39 confidence range, below the 0.40 threshold set in D101/Phase T. That threshold was raised from 0.30 because ambient noise caused spurious detections; 0.35 is the midpoint that preserves the recall improvement while staying above breath-noise floor (0.15-0.25). (`app/audio_events.py`)
+
+**Cosmetic fix:** `ptz.py` zoom "already at limit" log now says "already at soft cap" with `user_cap` when direction is "in", so it's obvious the 200 ceiling is intentional (not a hardware limit). (`app/ptz.py`)
+
+---
+
+### D107. TTS mid-stream chunk timeout
+
+**Problem:** `stream_sentence` calls `timeout_cm.reschedule(None)` once the first byte arrives, disabling all deadline. An OpenAI API throttle then dribbles data at any speed with no abort mechanism. Live session `abide-350964a5617c` had a sentence deliver at 7.4 KB/s (normal: 100-200 KB/s), taking 11,188 ms from first to last byte. The consumer blocked on that slow sentence; the next sentence's first-byte deadline tripped at 10 s and was silently skipped. Net result: audible distortion (one sentence played slowly, the next dropped).
+
+**Fix:** `async for chunk in resp.aiter_bytes()` replaced with a manual `while True` loop. Before `first_byte_ts` is set, each `__anext__` is awaited bare — the outer `timeout_cm` (10 s first-byte deadline) covers this. Once `first_byte_ts` is set and `timeout_cm.reschedule(None)` runs, subsequent iterations use `asyncio.wait_for(__anext__, timeout=_TTS_CHUNK_TIMEOUT_S)` (3 s). If no data arrives within that window, `asyncio.TimeoutError` is caught and the generator returns — the `async with client.stream()` context manager closes the response cleanly. Log line: `[STALL] TTS mid-stream: no data for 3.0s after Xms — aborting '...'`.
+
+**Why 3 s:** The normal inter-chunk gap at full speed is ~50-100 ms. 3 s is 30-60× over normal — no legitimate response pauses this long mid-stream. Catches the throttle scenario ~8 s before the old worst-case (11 s observed), reducing audible distortion from 11 s to ≤3 s.
+
+### D108. TTS slow-dribble rate-based abort
+
+**Problem:** The per-chunk 3 s inter-chunk timeout (D107) catches complete stalls but not a different throttle pattern where OpenAI delivers chunks every 1-2 s at 10-21 KB/s instead of normal 100-200 KB/s. Live session `abide-ee7e5abb250e` showed `"Ha, just waving hello then — what's up, Shree?"` with `first→last=6,000 ms, size=125,400 B` (≈21 KB/s). The PCM ring buffer drained faster than chunks arrived, causing dropouts heard as distortion. The 3 s chunk timeout never fired because each individual inter-chunk gap was < 3 s.
+
+**Fix:** After a 1.5 s grace period (time for the ring buffer to fill before rate-checking is meaningful), compute the running delivery rate `total_bytes / elapsed_since_first_byte`. If it drops below `_TTS_MIN_RATE_BPS` (30 KB/s), abort the generator with a `[STALL] TTS slow-dribble` warning. The check runs on every chunk after the grace period — O(1) per chunk (two comparisons and a division).
+
+**Why 1.5 s grace / 30 KB/s floor:** At normal speed (100 KB/s), 1.5 s of streaming yields ~150 KB — well past any typical sentence size, so the stream has usually ended before the check triggers. 30 KB/s is 3× above the fastest observed throttle (21 KB/s) and 10× below normal — no legitimate response should be this slow on any modern broadband connection. Short sentences (< ~45 KB) finish in < 1.5 s at normal speed and are never rate-checked.
+
+**Trade-off:** The user hears audio up to ~1.5 s of the sentence (which the ring buffer has already received and queued), then silence — a truncated sentence rather than a garbled 6 s delivery. The next sentence's first-byte TTFA is also freed from waiting for the slow response to drain.
+
+---
+
+### D109. Security, performance, and error-handling audit — second full-pass batch
+
+**Scope:** Systematic codebase audit across all pipeline files. 126 findings triaged; 9 highest-impact changes shipped (the rest were already handled, by-design, or out-of-scope for this deployment).
+
+**Changes shipped:**
+
+(a) **`_log_prewarm_exception` defensive wrapper** (`main.py`) — added `try/except Exception` around the callback body to match `session.py:_log_bg_exception` (D105 item g). `task.exception()` can raise `CancelledError` in a race between the `cancelled()` check and the call; asyncio silently discards callback exceptions, so a bug there was invisible.
+
+(b) **Final memory-flush log level** (`main.py`) — `log.debug` → `log.warning` on the session-end `save_user_context` call. A disk-full or permission error here silently drops the user's name/preferences with no operator signal.
+
+(c) **Groq 429 rate-limit branch** (`main.py`) — added `RateLimitError` / `status_code==429` detection between the auth error branch and the generic fallback. Previously a Groq rate limit surfaced as "I'm having trouble hearing you right now" — indistinguishable from a real audio failure. Now surfaces "I'm getting a lot of requests right now — give me a moment."
+
+(d) **Per-message history size cap** (`conversation.py`) — `user_text` capped at 10 000 chars before appending to `_history`. A system-generated turn (check-in, vision-reactive) with a runaway context block could push history past 6-8 K tokens before `MAX_HISTORY` slices. 10 KB ≈ 2 500 tokens — well above any real utterance.
+
+(e) **Anthropic 429 handling** (`conversation.py`) — added between the 401 branch and the generic `ConversationError`. Presents a user-safe "rate limited" message instead of the generic "trouble reaching my services."
+
+(f) **Vision JSON-parse fallback removed** (`vision.py`) — previously on `JSONDecodeError`, the raw OpenAI response (which may be an API error message like "Error 429: Too Many Requests") was used as the activity text and injected into Claude's camera-observations block. Now returns `empty` SceneResult; raw content is still logged at WARNING for diagnostics.
+
+(g) **Memory save failure log level** (`memory.py`) — `log.debug` → `log.warning`. Silent disk-full / permission failures mean the resident's name, preferences, and mood are permanently lost with no operator signal.
+
+(h) **TTS phrase-store save failure log level** (`tts_cache_store.py`) — same rationale: `log.debug` → `log.warning`. A persistent save failure here degrades the prewarm list for every subsequent session.
+
+(i) **OpenAI TTS 429 handling** (`tts.py`) — on HTTP 429, `stream_sentence` now `return`s cleanly (skips the sentence) instead of raising a generic `Exception`. The response pipeline continues with the next sentence; the user hears a partial reply rather than a hard error and an abrupt silence.
+
+---
+
 ## Known Limitations
 
 - Barge-in latency depends on deployment audio path and AEC quality.

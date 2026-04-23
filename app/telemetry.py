@@ -238,17 +238,24 @@ def observe_stt(
     transcript: str,
     latency_ms: float,
 ) -> None:
-    """Attach an STT span to the turn trace."""
+    """Attach an STT generation to the turn trace.
+
+    Uses SECONDS as the usage unit — Groq Whisper bills by audio duration.
+    16kHz 16-bit mono PCM = 32 000 bytes/s, so we derive seconds from bytes.
+    """
     if trace is None:
         return
-    span = trace.span(
+    audio_seconds = round(audio_bytes / 32_000, 2)
+    gen = trace.generation(
         name="stt-groq-whisper",
-        input={"audio_bytes": audio_bytes},
+        model="whisper-large-v3",
+        input={"audio_seconds": audio_seconds},
         output={"transcript": transcript},
+        usage={"input": audio_seconds, "unit": "SECONDS"},
         metadata={"latency_ms": round(latency_ms, 1)},
     )
     try:
-        span.end()
+        gen.end()
     except Exception:
         pass
 
@@ -296,17 +303,22 @@ def observe_tts(
     audio_bytes: int,
     latency_ms: float,
 ) -> None:
-    """Attach one TTS span to the turn trace (one per synthesized sentence)."""
+    """Attach one TTS generation to the turn trace (one per synthesized sentence).
+
+    Uses CHARACTERS as the usage unit — OpenAI TTS bills per 1M characters.
+    """
     if trace is None:
         return
-    span = trace.span(
+    gen = trace.generation(
         name="tts-openai",
+        model="tts-1",
         input={"text": sentence},
         output={"audio_bytes": audio_bytes},
-        metadata={"latency_ms": round(latency_ms, 1), "model": "tts-1", "voice": "nova"},
+        usage={"input": len(sentence), "unit": "CHARACTERS"},
+        metadata={"latency_ms": round(latency_ms, 1), "voice": "nova"},
     )
     try:
-        span.end()
+        gen.end()
     except Exception:
         pass
 
@@ -335,14 +347,20 @@ def observe_vision(
         session_id=session_id,
         input={"num_frames": num_frames, "image_bytes": image_bytes},
         output={"activity": activity, "bbox": bbox},
-        metadata={
-            "latency_ms": round(latency_ms, 1),
-            "is_fall": is_fall,
-            "model": "gpt-4o-mini",
-        },
+        metadata={"latency_ms": round(latency_ms, 1), "is_fall": is_fall},
         tags=["vision"] + (["fall"] if is_fall else []),
     )
-    # No explicit end needed for a trace with output already set.
+    gen = trace.generation(
+        name="vision-gpt4.1-mini",
+        model="gpt-4.1-mini",
+        input={"num_frames": num_frames, "image_bytes": image_bytes},
+        output={"activity": activity, "bbox": bbox},
+        metadata={"latency_ms": round(latency_ms, 1), "is_fall": is_fall},
+    )
+    try:
+        gen.end()
+    except Exception:
+        pass
     return trace
 
 

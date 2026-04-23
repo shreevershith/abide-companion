@@ -127,6 +127,7 @@ EXAMPLES (showing motion_cues → activity → noteworthy alignment):
 {"motion_cues": "Small head turns while speaking; shoulders still", "activity": "Talking and looking around.", "noteworthy": false, "bbox": [0.22, 0.08, 0.80, 0.96]}
 {"motion_cues": "Fingers move on keyboard; torso leans forward slightly", "activity": "Typing on laptop.", "noteworthy": false, "bbox": [0.15, 0.10, 0.70, 0.90]}
 {"motion_cues": "Right arm moves up toward head", "activity": "Scratching head.", "noteworthy": false, "bbox": [0.20, 0.08, 0.75, 0.95]}
+{"motion_cues": "Mouth opens wide; head tilts back briefly; eyes close momentarily", "activity": "Yawning.", "noteworthy": true, "bbox": [0.22, 0.05, 0.78, 0.90]}
 {"motion_cues": "Right arm extends forward reaching for object on table", "activity": "Reaching for something on the desk.", "noteworthy": false, "bbox": [0.15, 0.10, 0.75, 0.90]}
 {"motion_cues": "Torso shifts slightly in chair; head turns", "activity": "Shifting in seat.", "noteworthy": false, "bbox": [0.22, 0.10, 0.78, 0.95]}
 {"motion_cues": "Hand lowers from being raised", "activity": "Lowering right arm.", "noteworthy": false, "bbox": [0.25, 0.08, 0.75, 0.95]}
@@ -418,21 +419,21 @@ async def analyze_frames(
     t0 = time.monotonic()
     client = _get_client()
     try:
-        # Phase U.3 follow-up #3 — explicit per-call timeout.
-        # The shared httpx.AsyncClient has a 15 s default timeout, but
-        # an 11 s outlier was observed in live session
-        # `abide-621b915bf3e3` — GPT-4.1-mini hiccups occasionally and
-        # stalls the whole vision pipeline for that long. 8 s is more
-        # than enough for a normal 2-frame request (median ~1.5 s) and
-        # lets us fail-fast and drop the batch on slowdowns so the next
-        # 2.4-s vision cycle can still catch up.
+        # Explicit per-call timeout. GPT-4.1-mini median is ~1.5 s on a
+        # 2-frame request; 5 s is 3× over median. Prior value was 8 s
+        # (set after an 11 s outlier in `abide-621b915bf3e3`), but with
+        # the vision loop dropping batches while a task is in-flight,
+        # each timeout blocked 3+ subsequent cycles (8 s ÷ 2.4 s). Live
+        # sessions then missed 10-15 s of gestures (e.g. waving) because
+        # consecutive batches all timed out. 5 s cuts that to ≤2 skipped
+        # cycles per timeout while still providing 3× headroom.
         resp = await asyncio.wait_for(
             client.post(CHAT_URL, headers=headers, json=payload),
-            timeout=8.0,
+            timeout=5.0,
         )
     except asyncio.TimeoutError:
         log.warning(
-            "Vision request exceeded 8 s timeout — dropping this batch"
+            "Vision request exceeded 5 s timeout — dropping this batch"
         )
         return empty
     except Exception as e:
@@ -484,8 +485,12 @@ async def analyze_frames(
         else:
             noteworthy = bool(raw_nw)
     except json.JSONDecodeError:
-        log.warning("Vision JSON decode failed; using raw text. Raw=%r", raw_content[:120])
-        activity = raw_content.split("\n", 1)[0].strip()
+        # Raw content logged for diagnostics. Do NOT use it as activity text —
+        # when the model ignores response_format it often returns an API error
+        # message (e.g. "Error 429: Too Many Requests") that would be injected
+        # verbatim into Claude's camera-observations block.
+        log.warning("Vision JSON decode failed — dropping batch. Raw=%r", raw_content[:120])
+        return empty
 
     # Phase U.3 follow-up #6 — HTML-escape < and > in both fields before
     # they flow into Claude's prompt. The activity string lands inside

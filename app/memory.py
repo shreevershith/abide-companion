@@ -103,7 +103,11 @@ def save_user_context(resident_id: str, payload: dict) -> None:
             json.dump(payload, f, ensure_ascii=False)
         tmp.replace(path)
     except OSError as e:
-        log.debug("[MEMORY] Save failed (%s) for id=%s", type(e).__name__, resident_id)
+        # WARNING not DEBUG: a silent save failure means the user's name,
+        # preferences, and mood are lost across sessions with no indication.
+        # Common causes are disk-full and permission errors — both need to
+        # be visible in the log so an operator can act.
+        log.warning("[MEMORY] Save failed (%s) for id=%s", type(e).__name__, resident_id)
 
 
 def delete_user_context(resident_id: str) -> bool:

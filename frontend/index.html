@@ -1618,19 +1618,16 @@ function poseTrackLoop() {
             }
         }
 
-        // Consumer 2: fall heuristic — DISABLED (Phase U.3 follow-up #2).
-        // Even with the stricter "nose below hip by 0.05 sustained 1.5 s"
-        // rule, the heuristic fires on anyone standing at a desk who
-        // bends over a laptop: from the camera's POV the head dips to
-        // or below hip level, there is no ankle landmark visible to
-        // disambiguate, and the fall banner pops up mid-session. The
-        // vision-prompt `FALL:` prefix (GPT-4.1-mini) already covers
-        // genuine falls and is semantic-aware (distinguishes "leaning
-        // over laptop" from "lying on the floor"), so we drop the pose
-        // path rather than keep piling on heuristics that keep the
-        // false-positive problem without solving it.
-        // _checkFallHeuristic is kept below (dead) so a future,
-        // more-reliable re-enable is still easy to wire back in.
+        // Consumer 2: fall heuristic — re-enabled with ankle-visibility guard.
+        // The D95 false-positive was "bent over desk, ankles hidden under
+        // furniture." A genuinely fallen person on the floor will have at
+        // least one ankle visible (landmarks 27/28). Desk-leaning posture
+        // never exposes ankles from a forward-facing camera. The ankle check
+        // is the disambiguation that was always in the landmark data.
+        const fallReason = _checkFallHeuristic(landmarks);
+        if (fallReason && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "fall_alert", reason: fallReason }));
+        }
     } else {
         // No person detected — reset fall state so a later fall starts
         // from a clean counter.
@@ -1678,18 +1675,27 @@ function _computeBboxFromLandmarks(landmarks) {
 }
 
 function _checkFallHeuristic(landmarks) {
-    // COCO 33-point skeleton: 0 = nose, 23/24 = left/right hip.
-    // Under normal upright posture (standing or seated) the nose sits
-    // well above the hips on the normalized y axis (0=top, 1=bottom).
-    // A fallen person's nose approaches or drops below hip level.
+    // COCO 33-point skeleton: 0 = nose, 23/24 = left/right hip,
+    // 27/28 = left/right ankle.
     const nose = landmarks[0];
     const lHip = landmarks[23];
     const rHip = landmarks[24];
+    const lAnkle = landmarks[27];
+    const rAnkle = landmarks[28];
     if (!nose || !lHip || !rHip) return null;
-    // Require reasonable confidence so we don't fire on low-visibility frames.
     if ((nose.visibility || 0) < 0.4 ||
         (lHip.visibility || 0) < 0.4 ||
         (rHip.visibility || 0) < 0.4) {
+        return null;
+    }
+    // Ankle-visibility guard: if neither ankle is visible the person is
+    // likely bent over a desk (ankles hidden under furniture), not fallen.
+    // A genuinely fallen person on the floor will have at least one ankle
+    // in frame. This is the key disambiguation from D95.
+    const ankleVisible = (lAnkle && (lAnkle.visibility || 0) >= 0.4) ||
+                         (rAnkle && (rAnkle.visibility || 0) >= 0.4);
+    if (!ankleVisible) {
+        fallFrameCounter = 0;
         return null;
     }
     const hipY = (lHip.y + rHip.y) / 2;
@@ -1762,7 +1768,7 @@ const playbackCode = `
 class PlaybackProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
-        this._cap = 24000 * 8;   // 8 s ring buffer at 24 kHz
+        this._cap = 24000 * 30;  // 30 s ring buffer at 24 kHz (~11.5 MB Float32)
         this._buf = new Float32Array(this._cap);
         this._wr = 0; this._rd = 0; this._n = 0;
         this._ttsDone = false;
@@ -1773,10 +1779,13 @@ class PlaybackProcessor extends AudioWorkletProcessor {
             } else if (data.type === "audio") {
                 const f = data.pcm;
                 for (let i = 0; i < f.length; i++) {
-                    this._buf[this._wr] = f[i];
-                    this._wr = (this._wr + 1) % this._cap;
+                    if (this._n < this._cap) {
+                        this._buf[this._wr] = f[i];
+                        this._wr = (this._wr + 1) % this._cap;
+                        this._n++;
+                    }
+                    // else: buffer full — drop sample rather than corrupt unplayed audio
                 }
-                this._n += f.length;
             } else if (data.type === "tts_done") {
                 // If buffer already empty, fire drained immediately so
                 // playback_end reaches the server without waiting for process().
@@ -1796,7 +1805,13 @@ class PlaybackProcessor extends AudioWorkletProcessor {
             }
             this._n -= n;
         } else {
+            // Underrun: consume the available samples and fill the rest with silence.
+            // Must advance _rd so stale data isn't replayed when the next chunk arrives.
             out.fill(0);
+            for (let i = 0; i < this._n; i++) {
+                out[i] = this._buf[this._rd];
+                this._rd = (this._rd + 1) % this._cap;
+            }
             this._n = 0;
         }
         // Signal playback_end when buffer drains after tts_done was received.

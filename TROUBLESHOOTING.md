@@ -4,6 +4,36 @@ A running record of bugs encountered while building Abide Companion — **when**
 
 ---
 
+## 31. Full codebase audit — 9 targeted fixes from 126 findings (D109)
+
+**When**: Systematic security/performance/error-handling audit after the TTS slow-dribble fix (D108). All pipeline files reviewed; 126 findings triaged.
+
+**What was found and shipped**:
+
+1. **`_log_prewarm_exception` callback could silently discard errors.** The done-callback in `main.py` had no `try/except` around its body. asyncio silently drops any exception raised inside a done-callback, and `task.exception()` can raise `CancelledError` in a race between the `cancelled()` check and the call. Fixed: added defensive `try/except Exception` wrapper, matching `session.py:_log_bg_exception` (D105 item g). Now any callback bug surfaces at ERROR level.
+
+2. **Final session memory flush logged at DEBUG.** At WebSocket disconnect, the belt-and-suspenders `save_user_context` call logged failures at `log.debug` — meaning a disk-full or permission error that permanently dropped the user's name/preferences would never appear in normal log output. Changed to `log.warning`.
+
+3. **Groq 429 rate-limit indistinguishable from audio failure.** The `transcribe()` except block only handled 401 (auth) and the generic fallback. A Groq `RateLimitError` hit the generic branch and surfaced to the user as "I'm having trouble hearing you right now" — same message as a network failure. Added a `RateLimitError` / `status_code==429` branch that sends "I'm getting a lot of requests right now — give me a moment and try again."
+
+4. **Unbounded user message size in conversation history.** `_history.append` stored `user_text` at full length. A very long system-generated prompt (e.g. a check-in block with a large audio-events context) could push history tokens well past 6-8 K before the `MAX_HISTORY` slice runs. Added a 10 KB cap at the append site in `conversation.py`.
+
+5. **Anthropic 429 mapped to generic ConversationError.** Same as item 3 but for the Claude API call in `respond()`. Added specific 429 branch with user-safe rate-limit message.
+
+6. **Vision JSON parse fallback injected API error messages into Claude.** When GPT-4.1-mini ignored `response_format: json_object`, the `JSONDecodeError` fallback used `raw_content.split("\n", 1)[0].strip()` as the activity text. If the model returned an HTTP error body ("Error: 429 Too Many Requests"), that text would be injected verbatim into the `<camera_observations>` block and reach Claude. Fixed: return `empty` SceneResult on JSON parse failure; raw content is still logged at WARNING for diagnostics.
+
+7. **`memory.save_user_context` failure logged at DEBUG.** Same as item 2 but for in-session saves triggered by `_extract_user_facts`. Changed to `log.warning`.
+
+8. **`tts_cache_store._save` failure logged at DEBUG.** A disk-full failure here silently degrades the prewarm list for all subsequent sessions. Changed to `log.warning`.
+
+9. **OpenAI TTS 429 raised a generic Exception.** The `stream_sentence` 429 path raised `Exception(f"TTS API returned 429: ...")` which propagated up through the response pipeline and sent a hard error to the client. Fixed: `return` cleanly instead, skipping the rate-limited sentence — the pipeline continues with the next sentence and the user hears a partial reply rather than a hard stop.
+
+**What the audit confirmed safe / already handled**: localStorage API keys by design (CLAUDE.md); MediaPipe assets served from local `/vendor/` (no CDN dependency); face_bbox rate gate already at 15 Hz (D105); `_safe_path` path-traversal defence; all four API paths have timeout handling; `_safe_send_json` used everywhere.
+
+**Files touched**: `app/main.py`, `app/conversation.py`, `app/vision.py`, `app/memory.py`, `app/tts_cache_store.py`, `app/tts.py`, `DESIGN-NOTES.md`, `CLAUDE.md`.
+
+---
+
 ## 30. "What if Python isn't installed?" — zero-config auto-install (Phase V / D100)
 
 **When**: Final pre-demo review. Walking through `start.bat` as an imagined non-technical user: *double-click → see "ERROR: Python is not on PATH" → read three-step install instructions → click link to python.org → run installer → remember to tick "Add python.exe to PATH" → re-run start.bat.* That's seven steps, one of them a UI checkbox with a consequence the user doesn't understand. The brief explicitly forbids this ("no terminal commands, no Settings changes") and the evaluator confirmed the bar. We had a gap.

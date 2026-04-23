@@ -121,13 +121,24 @@ _RELEVANT_CLASSES: dict[int, str] = {
 # Minimum max-pooled probability to surface a tag. YAMNet's probability
 # distribution is usually peaky for clear events (0.5+ on a real
 # cough) but can land in 0.2-0.4 on partial / distant / overlapping
-# events. 0.40 balances recall and precision for a care setting: at
-# 0.30 the classifier generated spurious "Cough" tags from ambient
-# noise and breathing, which triggered unnecessary welfare reactions
-# and eroded user trust. 0.40 still catches the clear events that
-# matter (loud cough, audible gasp, unmistakable sneeze) while
-# suppressing the borderline low-confidence detections that are noise.
-_CONFIDENCE_THRESHOLD = 0.40
+# events. 0.40 proved too strict in live testing — genuine coughs
+# from across the room or through background noise were landing in
+# the 0.32-0.39 range and never surfacing. 0.35 is the practical
+# midpoint: still suppresses breath noise (typical 0.15-0.25) and
+# routine throat sounds (0.25-0.32), while catching real coughs,
+# gasps, and sneezes that matter for elderly welfare.
+_CONFIDENCE_THRESHOLD = 0.35
+
+# Per-tag overrides for tags that are far more prone to false positives
+# than Cough/Gasp/Sneeze. Snoring is frequently triggered by sustained
+# vowels, humming, or background drone while the user is fully awake —
+# live session abide-774570102957 saw Snoring:0.94 while the user was
+# talking. Crying similarly fires on musical sounds. Higher bar means
+# we only surface these when the model is genuinely confident.
+_TAG_THRESHOLDS: dict[str, float] = {
+    "Snoring": 0.70,
+    "Crying": 0.65,
+}
 
 # ── Lazy-loaded interpreter state ─────────────────────────────────────
 # Created on first call to classify_segment(); reused thereafter. Guarded
@@ -238,7 +249,8 @@ def _classify_blocking(pcm: np.ndarray) -> list[AudioEvent]:
     events: list[AudioEvent] = []
     for class_idx, tag in _RELEVANT_CLASSES.items():
         conf = float(per_class_max[class_idx])
-        if conf >= _CONFIDENCE_THRESHOLD:
+        threshold = _TAG_THRESHOLDS.get(tag, _CONFIDENCE_THRESHOLD)
+        if conf >= threshold:
             events.append(AudioEvent(tag=tag, confidence=conf))
     events.sort(key=lambda e: -e.confidence)
     return events
