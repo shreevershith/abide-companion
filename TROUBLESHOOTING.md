@@ -4,7 +4,7 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
-## 16. Resume-session banner flashed old transcript then Start wiped it (Post-launch)
+## 16. Resume-session banner flashed old transcript then Start wiped it
 
 **Context**: Live testing surfaced a confusing flow. On page refresh the "Resume last session?" banner (D65) appeared; clicking Yes restored the old transcript into the conversation panel; clicking Start — the only way to begin a new session — called `clearStoredSession()` and replaced the transcript with the "Press Start and speak" placeholder. The user saw their old chat for ~1 second, then it disappeared. Tester quote: *"it just puts everything in chat then I click start then everything starts from 0."*
 
@@ -18,7 +18,7 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
-## 15. Barge-in false positives on keypresses / coughs / mic thumps (Post-launch)
+## 15. Barge-in false positives on keypresses / coughs / mic thumps
 
 **Context**: Live testing showed 4 of 7 barge-ins in a single session firing, killing Abide's response mid-sentence, then being immediately followed by `[FILTER] Rejected quiet segment` on the captured audio (RMS 0.007–0.014, below the 0.015 post-hoc gate). Each false interrupt cut Abide off and made it feel twitchy.
 
@@ -32,7 +32,7 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
-## 14. Extractor saved "Abide" as the user's name, poisoning the session (Post-launch)
+## 14. Extractor saved "Abide" as the user's name, poisoning the session
 
 **Context**: Live testing showed `[CONTEXT] Extracted user facts: {'name': 'Abide'}` on turn 2 of a session where the user had said nothing about a name. From then on every Claude turn received `What I know about you: - Name: Abide` injected into its system prompt, and every Whisper STT call received `user_name="Abide"` as a biasing hint (D60). Both channels actively corrupted for the rest of the session.
 
@@ -46,7 +46,7 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
-## 13. Hardening pass: localStorage validation, parallel TTS prewarm, say_canned error path (Post-Phase-7)
+## 13. Hardening pass: localStorage validation, parallel TTS prewarm, say_canned error path
 
 **Context**: Audit of the 7 recently-added features (TTS cache, welcome greeting, stability filter, export, resume, name biasing, confidence chip) surfaced five real issues:
 
@@ -64,7 +64,7 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
-## 12. Vision-reactive trigger lost when Abide is busy talking (Post-Phase-7)
+## 12. Vision-reactive trigger lost when Abide is busy talking
 
 **Symptom**: User waved at the camera for ~12 seconds. Vision correctly detected "Waving hand." 4 times in a row. But no `[VISION-REACT]` log entry appeared and Abide never reacted. The user complained "You're not responding" and Abide apologized for a "delay or connection issue."
 
@@ -80,7 +80,7 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
-## 11. Security/performance audit: race conditions, unguarded sends, per-request client (Post-Phase-7)
+## 11. Security/performance audit: race conditions, unguarded sends, per-request client
 
 **Symptom**: During a code review audit, three categories of issues were identified:
 
@@ -106,7 +106,7 @@ A running record of bugs, root causes, and fixes encountered while building Abid
 
 ---
 
-## 10. STT prompt was seeding the very hallucinations it was meant to prevent (Phase 7+)
+## 10. STT prompt was seeding the very hallucinations it was meant to prevent
 
 **Symptom**: Even with the blocklist from Fix #8 and D41 in place, phantom `"Thank you"` transcripts were still reaching Claude — "I get random Thank you all of a sudden" during normal use. The blocklist only caught the well-documented YouTube outros (`"Thanks for watching"`, `"Subtitles by Amara.org"`, etc.), not a bare `"Thank you."`.
 
@@ -135,7 +135,7 @@ This is the Whisper equivalent of writing `logit_bias={" thank you": +5}` and be
 
 ---
 
-## 9. Sequential TTS calls + WS send-after-close (Phase 5)
+## 9. Sequential TTS calls + WS send-after-close
 
 **Symptom**: Even after HTTP/2 + prewarm (Fix #7), total turn latency stayed at 3-5 seconds because every sentence's TTS was being awaited sequentially. A 3-sentence response paid ~1.5s × 3 = 4.5s in serial TTS calls. Separately, the server was logging `Unexpected ASGI message 'websocket.send', after sending 'websocket.close' or response already completed` when TTS finished after a client disconnect.
 
@@ -161,7 +161,7 @@ This is the Whisper equivalent of writing `logit_bias={" thank you": +5}` and be
 
 ---
 
-## 8. Whisper "Thank you." hallucination on short/quiet audio (Phase 5)
+## 8. Whisper "Thank you." hallucination on short/quiet audio
 
 **Symptom**: Server logs showed phantom transcripts — `Thank you.`, `Наржу.` (Russian), `Entah kalau abaid.` (Indonesian) — for audio segments the user never spoke. These phantom turns triggered full Claude + TTS cycles, wasting latency budget and producing confused apologetic responses.
 
@@ -181,7 +181,7 @@ Rejected segments log `[FILTER] Rejected short/quiet segment: N samples (Xs), RM
 
 ---
 
-## 7. HTTP/1.1 streaming + head-of-line blocking = 1500ms first-byte (Phase 5)
+## 7. HTTP/1.1 streaming + head-of-line blocking = 1500ms first-byte
 
 **Symptom**: Even after switching to persistent httpx clients (Fix #5), Claude first-token latency was still 969–1531ms and OpenAI TTS first-byte was still 719–1797ms. The pattern was clear: the **first** API call of a turn was always slow, while calls *within* the same response were faster — suggesting connection reuse was partially working but handshakes were still happening.
 
@@ -210,7 +210,7 @@ Groq wasn't affected because its transcription endpoint returns a single non-str
 
 ---
 
-## 6. Echo feedback triggering phantom barge-ins (Phase 5)
+## 6. Echo feedback triggering phantom barge-ins
 
 **Symptom**: During a test conversation, Abide would cut itself off mid-sentence even though the user said nothing. Server logs showed repeated `Barge-in triggered — cancelling response` events between TTS sentences. User observation: "Even the slightest of sound, I think that you're taking it as a barge."
 
@@ -226,7 +226,7 @@ Tunables are top-of-file constants in `main.py`: `POST_TTS_COOLDOWN_MS`, `SUSTAI
 
 ---
 
-## 5. TTS latency 1.3-2.8s per sentence — per-request httpx clients (Phase 5)
+## 5. TTS latency 1.3-2.8s per sentence — per-request httpx clients
 
 **Symptom**: Server timing logs showed OpenAI TTS first-byte latency of 1282-2797ms per sentence. Normal `tts-1` is 200-500ms. Same pattern hit Claude calls. Full turns were running 3-4 seconds end-to-end, blowing past the <1500ms requirement in CLAUDE.md.
 
@@ -244,7 +244,7 @@ Tunables are top-of-file constants in `main.py`: `POST_TTS_COOLDOWN_MS`, `SUSTAI
 
 ---
 
-## 4. VAD cutting off speech too early (Phase 5)
+## 4. VAD cutting off speech too early
 
 **Symptom**: User couldn't pause naturally between sentences without the system prematurely marking speech as "ended" and sending to transcription. Resulted in fragmented, multi-turn transcripts for single thoughts.
 
@@ -260,7 +260,7 @@ This lets us see if slowness is Groq itself vs. local processing overhead.
 
 ---
 
-## 3. Anthropic SDK "Connection error" on Windows (Phase 3)
+## 3. Anthropic SDK "Connection error" on Windows
 
 **Symptom**: After transcript arrived, UI showed `Claude error: Connection error` and hung on "Thinking...". The anthropic SDK retried twice then gave up. Meanwhile Groq calls worked fine on the same machine, so it wasn't a general network issue.
 
@@ -274,7 +274,7 @@ This lets us see if slowness is Groq itself vs. local processing overhead.
 
 ---
 
-## 2. WebSocket send/recv race on first message (Phase 2)
+## 2. WebSocket send/recv race on first message
 
 **Symptom**: Occasionally on the very first audio chunk after Start, the config JSON hadn't been processed yet and the server errored with "Groq API key not set".
 
@@ -284,7 +284,7 @@ This lets us see if slowness is Groq itself vs. local processing overhead.
 
 ---
 
-## 1. AudioWorklet chunk size mismatch (Phase 1)
+## 1. AudioWorklet chunk size mismatch
 
 **Symptom**: Audio loopback worked but silero-vad behaved erratically — missed the start of speech, fired spurious `end` events.
 

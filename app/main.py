@@ -1,4 +1,4 @@
-"""Phase 7: FastAPI with VAD + STT + Claude + TTS + Barge-in + Vision + Langfuse telemetry."""
+"""FastAPI with VAD + STT + Claude + TTS + Barge-in + Vision + Langfuse telemetry."""
 
 import base64
 import json
@@ -465,7 +465,7 @@ async def websocket_endpoint(ws: WebSocket):
                     except (TypeError, ValueError):
                         pass
 
-                    # Cross-session memory (Phase E): if the browser sent a
+                    # Cross-session memory: if the browser sent a
                     # resident_id that passes the strict format check, hydrate
                     # UserContext from disk. The path-traversal guard lives in
                     # app.memory._safe_path; we re-check the format here so we
@@ -626,7 +626,7 @@ async def websocket_endpoint(ws: WebSocket):
                     session.client_playing = False
 
                 elif msg_type == "forget_me":
-                    # Cross-session memory wipe (Phase E). Delete the
+                    # Cross-session memory wipe. Delete the
                     # on-disk memory file, reset the in-memory UserContext,
                     # and clear resident_id so subsequent fact extractions
                     # don't resurrect the record. Client is responsible
@@ -861,7 +861,7 @@ async def websocket_endpoint(ws: WebSocket):
         if checkin_task is not None and not checkin_task.done():
             checkin_task.cancel()
 
-        # Belt-and-suspenders final save of UserContext (Phase E). The
+        # Belt-and-suspenders final save of UserContext. The
         # in-session save hook in Session._extract_user_facts writes after
         # each fact update, but if the client disconnected mid-extraction
         # the latest update might not have landed yet. Runs synchronously

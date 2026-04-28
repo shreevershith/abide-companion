@@ -70,3 +70,11 @@ tts_cache/
 # Keyed by browser-generated resident_id UUIDs; contain name, topics,
 # preferences, mood signals only. No conversation transcripts or audio.
 memory/
+
+# ── Local working docs / scratch (not part of the repo) ──
+CLAUDE.md
+WRITEUP.md
+Abide-Companion-Writeup.docx
+scripts/smoke_ttfa.py
+scripts/md_to_docx.py
+.docgen/
