@@ -66,7 +66,17 @@ node_modules/
 # ── Runtime-learned TTS cache frequencies (auto-populated) ──
 tts_cache/
 
-# ── Per-resident UserContext memory files (Phase E) ──
+# ── Submission artifacts and internal tooling ──
+WRITEUP.md
+Abide-Companion-Writeup.docx
+scripts/smoke_ttfa.py
+scripts/md_to_docx.py
+.docgen/
+
+# ── Per-resident UserContext memory files ──
 # Keyed by browser-generated resident_id UUIDs; contain name, topics,
 # preferences, mood signals only. No conversation transcripts or audio.
 memory/
+
+#claude.md is the internal documentation for the project, not meant for public release.
+CLAUDE.md

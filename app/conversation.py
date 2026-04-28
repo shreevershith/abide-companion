@@ -11,7 +11,7 @@ import httpx
 
 log = logging.getLogger("abide.conversation")
 
-# Phase U.3 follow-up #4 — hard cap on how long we'll wait for Claude to
+# Hard cap on how long we'll wait for Claude to
 # emit its first token before we abort the stream and fail the turn.
 # Live session `abide-63d2e9245567` had THREE separate Claude requests
 # produce zero output for 4 s / 12 s / 17 s before the user spoke again
@@ -29,7 +29,7 @@ _CLAUDE_FIRST_TOKEN_TIMEOUT_S = 15.0
 # sessions, even if we didn't trip the hard deadline above.
 _CLAUDE_STALL_WARN_MS = 5000.0
 
-# Phase R — camera-action marker. Claude emits `[[CAM:<action>]]` at the
+# Camera-action marker. Claude emits `[[CAM:<action>]]` at the
 # very start of a reply to request a hardware camera action (currently
 # zoom_in / zoom_out / zoom_reset). The server strips the marker from the
 # stream before it reaches the transcript and dispatches the action to
@@ -41,13 +41,13 @@ _CAM_MARKER_PREFIX = "[[CAM:"
 _CAM_MARKER_MAX_BUFFER = 40  # give up after this many chars — a real marker is <25
 _CAM_ALLOWED_ACTIONS = frozenset({"zoom_in", "zoom_out", "zoom_reset"})
 
-# Phase S.3 follow-up — defence-in-depth strip for XML-like tags that
+# Defence-in-depth strip for XML-like tags that
 # Claude occasionally mirrors into its reply despite SYSTEM_PROMPT
 # forbidding it (observed once in-session: Claude prefixed a reply with
 # `<audio_events>cough detected</audio_events>\n\n` after being taught
 # the incoming tag format).
 #
-# Phase U follow-up: narrowed the tag capture from `\w+` to a closed
+# Narrowed the tag capture from `\w+` to a closed
 # whitelist of the three known sensor tags, so a legitimate inline HTML
 # fragment Claude might emit for emphasis (`<b>bold</b>` etc.) doesn't
 # get silently eaten. Strict balanced-pair match — dangling `<tag>`
@@ -99,8 +99,8 @@ class APIKeyError(ConversationError):
     the frontend distinguishes it by the `open_settings: true` flag to open
     the key drawer automatically."""
 
-MODEL = "claude-sonnet-4-6"  # Phase P — was "claude-sonnet-4-20250514"; upgraded for ~10-20% faster TTFT + better quality. Revert if eval session shows regression.
-# Phase U.3 follow-up: bumped 20 → 60 so the prompt-cache prefix stays
+MODEL = "claude-sonnet-4-6"  # was "claude-sonnet-4-20250514"; upgraded for ~10-20% faster TTFT + better quality. Revert if eval session shows regression.
+# Bumped 20 → 60 so the prompt-cache prefix stays
 # stable across a typical 20-30 min session. With MAX_HISTORY = 20 the
 # oldest message gets sliced off on turn 11, shifting the sequence that
 # the cache_control marker on messages[-2] was written against — so every
@@ -261,7 +261,7 @@ class ConversationEngine:
         self.last_total_ms: float = 0.0
         self.last_system_prompt: str = ""
         self.last_messages_snapshot: list[dict] = []
-        # Phase O — Anthropic prompt-cache telemetry. Populated from
+        # Anthropic prompt-cache telemetry. Populated from
         # the message_start event's usage field when caching is active.
         # None when the API didn't return the keys (pre-caching path or
         # when the cached prefix was below the model's activation
@@ -269,12 +269,12 @@ class ConversationEngine:
         # and earlier; confirmed via Anthropic's GA docs).
         self.last_cache_read_tokens: int | None = None
         self.last_cache_creation_tokens: int | None = None
-        # Phase R — camera action emitted by the most recent Claude
+        # Camera action emitted by the most recent Claude
         # reply (via the [[CAM:...]] inline marker). Consumed once per
         # turn by Session's producer, which dispatches it to PTZController.
         # Reset at the start of each respond() call.
         self.last_camera_action: str | None = None
-        # Phase S.1 — optional per-session system prompt override. When
+        # Optional per-session system prompt override. When
         # set (main.py assigns it right after PTZController init), the
         # engine uses this in place of the static SYSTEM_PROMPT. Keeps
         # the session-invariant hardware context (available camera axes)
@@ -348,8 +348,7 @@ class ConversationEngine:
         if len(self._history) > MAX_HISTORY:
             self._history = self._history[-MAX_HISTORY:]
 
-        # Phase O (revised, Phase R.1 refinement, Phase S.2 threshold
-        # correction) — Anthropic prompt caching.
+        # Anthropic prompt caching.
         #
         # Original Phase O put dynamic turn context (time / user facts /
         # vision) into a second `system` block. That kept SYSTEM_PROMPT
@@ -375,7 +374,7 @@ class ConversationEngine:
         # newest user message + response. Prompt caching is GA now, so
         # the `anthropic-beta: prompt-caching-2024-07-31` header is no
         # longer required (and was removed below).
-        # Phase S.1 — prefer the per-session prompt (SYSTEM_PROMPT +
+        # Prefer the per-session prompt (SYSTEM_PROMPT +
         # hardware-specific capability note) if main.py supplied one,
         # falling back to the static module-level SYSTEM_PROMPT for
         # back-compat. The whole block goes into the cached prefix.
@@ -462,14 +461,14 @@ class ConversationEngine:
         headers = {
             "x-api-key": self._api_key,
             "anthropic-version": "2023-06-01",
-            # Phase O/S.2: prompt caching is GA. The beta header that
+            # Prompt caching is GA. The beta header that
             # used to enable it (`prompt-caching-2024-07-31`) is no
             # longer required — removed to keep the request clean.
             "content-type": "application/json",
         }
         payload = {
             "model": MODEL,
-            # Phase U.3 follow-up #3 — dropped 300 → 180.
+            # dropped 300 → 180.
             # Live session `abide-621b915bf3e3` showed output_tokens
             # averaging 15–30 for normal replies, peaking at 51 on a
             # rhyme. 300 was loose headroom; 180 keeps the rhyme use
@@ -491,15 +490,15 @@ class ConversationEngine:
         self.last_total_ms = 0.0
         self.last_system_prompt = system_prompt_flat
         self.last_messages_snapshot = list(self._history)
-        # Phase O — cache telemetry. Populated from message_start
+        # Cache telemetry. Populated from message_start
         # event's usage field when Anthropic returns it.
         self.last_cache_read_tokens: int | None = None
         self.last_cache_creation_tokens: int | None = None
-        # Phase R — fresh camera-action side-channel per turn.
+        # Fresh camera-action side-channel per turn.
         self.last_camera_action = None
 
         full_response = []
-        # Phase R — camera-marker stripping state. We hold the first
+        # Camera-marker stripping state. We hold the first
         # few chunks until we either match `[[CAM:<action>]]` at the
         # head of the reply (and strip + record it) OR confirm the
         # reply doesn't start with a marker and flush the buffer. The
@@ -514,7 +513,7 @@ class ConversationEngine:
         log.info("[TIMING] Claude request sent")
 
         try:
-            # Phase U.3 follow-up #4 — asyncio.timeout around the stream
+            # asyncio.timeout around the stream
             # setup + first-token phase. Once we've received the first
             # text token we call `.reschedule(None)` to disable the
             # deadline, letting the rest of the generation run as long
@@ -599,7 +598,7 @@ class ConversationEngine:
                                 # run as long as it needs. `reschedule(None)`
                                 # disables the outer `asyncio.timeout`.
                                 timeout_cm.reschedule(None)
-                            # Phase R — camera-action marker handling.
+                            # Camera-action marker handling.
                             # We compute the VISIBLE portion of this chunk
                             # (after any marker-stripping) before appending
                             # to full_response, so the assistant's saved
@@ -703,7 +702,7 @@ class ConversationEngine:
                 full_response.append(marker_buf)
                 yield marker_buf
         except TimeoutError:
-            # Phase U.3 follow-up #4 — first-token deadline tripped.
+            # First-token deadline tripped.
             # Treat identically to an HTTP-level failure: log + raise a
             # user-safe `ConversationError` so Session's response pipeline
             # surfaces the friendly message and resets to "listening".

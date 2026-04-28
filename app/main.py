@@ -1,4 +1,4 @@
-"""Phase 7: FastAPI with VAD + STT + Claude + TTS + Barge-in + Vision + Langfuse telemetry."""
+"""FastAPI with VAD + STT + Claude + TTS + Barge-in + Vision + Langfuse telemetry."""
 
 import base64
 import json
@@ -71,7 +71,7 @@ app = FastAPI(title="Abide Companion")
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
-# Phase U follow-up — serve the self-hosted MediaPipe assets (vendor
+# Serve the self-hosted MediaPipe assets (vendor
 # bundle, WASM runtime) and on-device ML models (YAMNet tflite, pose
 # landmarker .task) directly from the repo. Removes the CDN dependency
 # on cdn.jsdelivr.net + storage.googleapis.com that Phase U.2/U.3
@@ -261,7 +261,7 @@ async def analyze_session(request: Request) -> JSONResponse:
 
 # Echo suppression tunables.
 #
-# Phase L: these values are tuned for the Logitech MeetUp (and any
+# These values are tuned for the Logitech MeetUp (and any
 # conference device with hardware Acoustic Echo Cancellation). MeetUp
 # does AEC in firmware — the mic signal it sends to the PC is already
 # stripped of whatever the MeetUp's speaker is playing, so residual
@@ -544,7 +544,7 @@ async def websocket_endpoint(ws: WebSocket):
     # Echo-suppression state
     pending_barge_in_start: float | None = None
 
-    # Phase U.3 follow-up — per-connection face_bbox receive-rate tracker.
+    # Per-connection face_bbox receive-rate tracker.
     # Live session `abide-585f1dec5ee2` showed TTFA regress from ~3300 ms
     # to ~4968 ms on a long (9 min) session. One hypothesis: the 5 Hz
     # pose-bbox WS traffic from the browser congests the event loop
@@ -681,7 +681,7 @@ async def websocket_endpoint(ws: WebSocket):
                         global _last_session_anthropic_key
                         _last_session_anthropic_key = anthropic_key
                         engine = ConversationEngine(api_key=anthropic_key)
-                        # Phase S.1 — bake per-session camera capabilities
+                        # Bake per-session camera capabilities
                         # into the cacheable system prompt once at connect.
                         # Cleaner than re-injecting per-turn (which would
                         # fragment the cache) and honest to the user's
@@ -902,7 +902,7 @@ async def websocket_endpoint(ws: WebSocket):
                     session.client_playing = False
 
                 elif msg_type == "face_bbox":
-                    # Phase U.2 — client-side MediaPipe pose landmarks →
+                    # Client-side MediaPipe pose landmarks →
                     # min-max bbox of visible keypoints → smooth PTZ. Up
                     # to ~5 Hz from the browser; server rate-limits again
                     # in Session.dispatch_face_bbox so DirectShow doesn't
@@ -951,7 +951,7 @@ async def websocket_endpoint(ws: WebSocket):
                         face_bbox_rate_window_start = now_ts
 
                 elif msg_type == "fall_alert":
-                    # Phase U.3 — client-side pose fall heuristic fired
+                    # Client-side pose fall heuristic fired
                     # (nose y ≥ hip y for ~1 s of sustained horizontal
                     # torso). Treat identically to a vision-prompt FALL:
                     # prefix: red banner + urgent next-turn context.
@@ -1098,7 +1098,7 @@ async def websocket_endpoint(ws: WebSocket):
                     audio_events_task: asyncio.Task | None = None
                     try:
                         stt_t0 = time.monotonic()
-                        # Phase U.3 follow-up #3 — fire audio-event
+                        # Fire audio-event
                         # classification off as a background task BEFORE
                         # awaiting Whisper, instead of the prior sequential
                         # transcribe → classify flow. YAMNet inference
@@ -1385,7 +1385,7 @@ async def websocket_endpoint(ws: WebSocket):
             except Exception as e:
                 log.warning("[MEMORY] Final flush failed: %s", type(e).__name__)
 
-        # Phase N — return the PTZ camera to a neutral pose so the next
+        # Return the PTZ camera to a neutral pose so the next
         # session starts centred. Silent no-op when PTZ isn't available.
         try:
             session._ptz.center()

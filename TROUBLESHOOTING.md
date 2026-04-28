@@ -4,7 +4,7 @@ A running record of bugs encountered while building Abide Companion — **when**
 
 ---
 
-## 31. Full codebase audit — 9 targeted fixes from 126 findings (D109)
+## 31. Full codebase audit — 9 targeted fixes from 126 findings
 
 **When**: Systematic security/performance/error-handling audit after the TTS slow-dribble fix (D108). All pipeline files reviewed; 126 findings triaged.
 
@@ -34,7 +34,7 @@ A running record of bugs encountered while building Abide Companion — **when**
 
 ---
 
-## 30. "What if Python isn't installed?" — zero-config auto-install (Phase V / D100)
+## 30. "What if Python isn't installed?" — zero-config auto-install
 
 **When**: Final pre-demo review. Walking through `start.bat` as an imagined non-technical user: *double-click → see "ERROR: Python is not on PATH" → read three-step install instructions → click link to python.org → run installer → remember to tick "Add python.exe to PATH" → re-run start.bat.* That's seven steps, one of them a UI checkbox with a consequence the user doesn't understand. The brief explicitly forbids this ("no terminal commands, no Settings changes") and the evaluator confirmed the bar. We had a gap.
 
@@ -72,7 +72,7 @@ Zero terminal commands. Zero Settings changes. Zero checkboxes.
 
 ---
 
-## 29. Pre-demo security + robustness review — 8 findings, all shipped (Phase U.3 follow-up #6)
+## 29. Pre-demo security + robustness review — 8 findings, all shipped
 
 **When**: Final review before the Ruben demo. Ran three parallel reviews (security / performance / error-handling) as one "honest pass before shipping" — all found things worth fixing, none catastrophic.
 
@@ -92,11 +92,10 @@ Zero terminal commands. Zero Settings changes. Zero checkboxes.
 
 **Files touched**: `app/vision.py`, `app/session.py`, `app/main.py`, `start.bat`, `start.sh`.
 
-**Meta-observation**: The three parallel reviews cost ~5 min of agent time and found 8 items, none of which we'd have caught by staring at the diff alone. Worth doing before any shipping milestone.
 
 ---
 
-## 28. Turn-1 TTFA 2.5 s worse than turn 2+ (Phase U.3 follow-up #5)
+## 28. Turn-1 TTFA 2.5 s worse than turn 2+
 
 **When**: Live session `abide-a1265a3e45be` was the first session where the `[TIMING] speech_end → _run_response started` anchor (shipped D96) revealed a clean fingerprint. Turn 1 of each session consistently logged 2500-2800 ms for that slice; turns 2+ settled at 1100-1900 ms. Session summary: TTFA P50 5023 ms was dragged up by the turn-1 spike.
 
@@ -110,7 +109,7 @@ Zero terminal commands. Zero Settings changes. Zero checkboxes.
 
 ---
 
-## 27. "Why did it stop responding?" — three Anthropic stalls, no deadline, no UI signal (Phase U.3 follow-up #4)
+## 27. "Why did it stop responding?" — three Anthropic stalls, no deadline, no UI signal
 
 **When**: Live session `abide-63d2e9245567`, ~5 minutes in. The conversation had gone to an emotionally raw place (user opening up about loneliness, being out of work, self-worth). Claude had given several well-crafted responses. Then three Claude calls in a row produced **zero output** for 4141 ms, 12203 ms, and 17328 ms respectively — all three ended because the user spoke again (interpreting silence as "stuck") which triggered barge-in. The user typed: *"Why did it stop responding?"*
 
@@ -155,7 +154,7 @@ Claude response complete: 17328ms total (0 chars, in=None out=None, cache_read=N
 
 ---
 
-## 26. TTFA won't drop below ~5 s + vision model too eager + multilingual hallucinations (Phase U.3 follow-up #3)
+## 26. TTFA won't drop below ~5 s + vision model too eager + multilingual hallucinations
 
 **When**: Combing the 96-turn live session `abide-621b915bf3e3` looking for anything else worth fixing. Several recurring frustrations surfaced that the user hadn't flagged explicitly but kept saying around in-session:
 
@@ -201,7 +200,7 @@ Claude response complete: 17328ms total (0 chars, in=None out=None, cache_read=N
 
 ---
 
-## 25. Camera "acted like an AC moving left to right," fall banner invisible on light mode, left/right spoken wrong (Phase U.3 follow-up #2)
+## 25. Camera "acted like an AC moving left to right," fall banner invisible on light mode, left/right spoken wrong
 
 **When**: Live session `abide-621b915bf3e3` (96 turns, 12 min) after shipping #24's fixes. The user summarised the issues tersely: "I just stood why fall", "the fall message is not that visible in the light mode", "my right is abide's left and my left is abide's right". Session also exposed a recurring complaint Claude ended up conceding mid-session: *"you're tracking my hands, you're acting like an AC moving left to right."*
 
@@ -227,7 +226,7 @@ Claude response complete: 17328ms total (0 chars, in=None out=None, cache_read=N
 
 ---
 
-## 24. Four issues surfaced by a 9-minute live session (Phase U.3 follow-up)
+## 24. Four issues surfaced by a 9-minute live session
 
 **When**: Live session `abide-585f1dec5ee2` (549 s, 51 turns) exposed four regressions / mis-tunings at once:
 
@@ -260,7 +259,7 @@ Claude response complete: 17328ms total (0 chars, in=None out=None, cache_read=N
 
 ---
 
-## 23. Prompt cache still logged `cache_read=0` after Phase R's structural fix (Phase S.2)
+## 23. Prompt cache still logged `cache_read=0` after structural fix
 
 **When**: Post-Phase-R live testing. D86 had moved dynamic turn context out of the `system` array and into the user message, placed a cache breakpoint on `messages[-2]`, and predicted cache hits starting around turn 3–5 once the prefix crossed "the 1024-token threshold." In practice, every log line through turn 10+ (input tokens up to ~1300) still showed `cache_read=0 cache_create=0`.
 
@@ -282,7 +281,7 @@ D86's planning referenced the older 1024 number. With `SYSTEM_PROMPT` at ~484 to
 
 ---
 
-## 22. `/api/analyze` hardcoded a deprecated Claude model (Phase Q follow-up)
+## 22. `/api/analyze` hardcoded a deprecated Claude model
 
 **When**: Discovered during a thorough "what's left?" scan of the codebase after Phase R shipped. Every other place in the app had been migrated from `claude-sonnet-4-20250514` to `claude-sonnet-4-6` during Phase P (D83), but `app/main.py:176` — the `/api/analyze` endpoint that powers the session-summary "Right / Wrong" panel — still had the old model string hardcoded. Nothing had broken yet, but Anthropic's retirement notice schedules `claude-sonnet-4-20250514` for sunset on **2026-06-15**. Session analysis would have started returning 400s on that date, silently, with no clear signal as to why the rest of the app kept working.
 
@@ -296,7 +295,7 @@ D86's planning referenced the older 1024 number. With `SYSTEM_PROMPT` at ~484 to
 
 ---
 
-## 21. Prompt cache was structurally correct but never activating (Phase R)
+## 21. Prompt cache was structurally correct but never activating
 
 **When**: After Phase O shipped, every Claude response log line carried `cache_read=0 cache_create=0` despite sending the `anthropic-beta: prompt-caching-2024-07-31` header and marking `SYSTEM_PROMPT` with `cache_control: ephemeral`. Over a 26-turn live session: not a single cache hit.
 
@@ -310,7 +309,7 @@ D86's planning referenced the older 1024 number. With `SYSTEM_PROMPT` at ~484 to
 
 ---
 
-## 20. duvc-ctl 2.x API differed from what our wrapper expected (Phase R)
+## 20. duvc-ctl 2.x API differed from what our wrapper expected
 
 **When**: After fixing the wrong-Python-interpreter issue (entry #19) and getting `duvc-ctl` actually imported, sessions still logged "PTZ unavailable" with no diagnostic lines. The wrapper was silently concluding every DirectShow camera was PTZ-less.
 
@@ -330,7 +329,7 @@ Every probe call raised `AttributeError` which the wrapper's `try/except` swallo
 
 ---
 
-## 19. Wrong Python interpreter silently disabled PTZ (Phase R)
+## 19. Wrong Python interpreter silently disabled PTZ
 
 **When**: During live testing the user ran `python -m uvicorn app.main:app --reload` from PowerShell instead of double-clicking `start.bat`. Zoom commands were recognised by Claude (the inline marker fired) but nothing physically moved the camera. The only evidence anything was wrong was one log line near the top of each session: `[PTZ] duvc-ctl unavailable at import (ModuleNotFoundError: No module named 'duvc_ctl') — PTZ disabled`.
 
@@ -344,7 +343,7 @@ Every probe call raised `AttributeError` which the wrapper's `try/except` swallo
 
 ---
 
-## 18. MeetUp firmware does not expose pan/tilt over UVC (Phase R, correcting earlier belief)
+## 18. MeetUp firmware does not expose pan/tilt over UVC
 
 **When**: After wiring `PTZController.nudge_to_bbox` into the vision loop under the assumption that the Phase N duvc-ctl path would deliver subject-follow on MeetUp. Live testing showed the camera was tilting — but only sometimes, and only when RightSight was enabled in Logi Tune. No `[PTZ] nudge:` log lines ever fired. The tilt we were seeing wasn't ours.
 
@@ -362,7 +361,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 17. Dropped Docker in favour of native Python to reach Windows DirectShow (Phase N)
+## 17. Dropped Docker in favour of native Python to reach Windows DirectShow
 
 **When**: Phase N, after the browser-MediaCapture-PTZ investigation (D79) established we couldn't reach MeetUp's camera controls through the browser. DirectShow was the next-best path — and the same path Zoom and Teams use. We needed a Python process to speak to DirectShow directly, and our Docker-based deployment couldn't.
 
@@ -381,7 +380,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 16. Resume-session banner flashed old transcript then Start wiped it (Post-launch)
+## 16. Resume-session banner flashed old transcript then Start wiped it
 
 **Context**: Live testing surfaced a confusing flow. On page refresh the "Resume last session?" banner (D65) appeared; clicking Yes restored the old transcript into the conversation panel; clicking Start — the only way to begin a new session — called `clearStoredSession()` and replaced the transcript with the "Press Start and speak" placeholder. The user saw their old chat for ~1 second, then it disappeared. Tester quote: *"it just puts everything in chat then I click start then everything starts from 0."*
 
@@ -395,7 +394,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 15. Barge-in false positives on keypresses / coughs / mic thumps (Post-launch)
+## 15. Barge-in false positives on keypresses / coughs / mic thumps
 
 **Context**: Live testing showed 4 of 7 barge-ins in a single session firing, killing Abide's response mid-sentence, then being immediately followed by `[FILTER] Rejected quiet segment` on the captured audio (RMS 0.007–0.014, below the 0.015 post-hoc gate). Each false interrupt cut Abide off and made it feel twitchy.
 
@@ -409,7 +408,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 14. Extractor saved "Abide" as the user's name, poisoning the session (Post-launch)
+## 14. Extractor saved "Abide" as the user's name, poisoning the session
 
 **Context**: Live testing showed `[CONTEXT] Extracted user facts: {'name': 'Abide'}` on turn 2 of a session where the user had said nothing about a name. From then on every Claude turn received `What I know about you: - Name: Abide` injected into its system prompt, and every Whisper STT call received `user_name="Abide"` as a biasing hint (D60). Both channels actively corrupted for the rest of the session.
 
@@ -423,7 +422,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 13. Hardening pass: localStorage validation, parallel TTS prewarm, say_canned error path (Post-Phase-7)
+## 13. Hardening pass: localStorage validation, parallel TTS prewarm, say_canned error path
 
 **Context**: Audit of the 7 recently-added features (TTS cache, welcome greeting, stability filter, export, resume, name biasing, confidence chip) surfaced five real issues:
 
@@ -441,7 +440,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 12. Vision-reactive trigger lost when Abide is busy talking (Post-Phase-7)
+## 12. Vision-reactive trigger lost when Abide is busy talking
 
 **Symptom**: User waved at the camera for ~12 seconds. Vision correctly detected "Waving hand." 4 times in a row. But no `[VISION-REACT]` log entry appeared and Abide never reacted. The user complained "You're not responding" and Abide apologized for a "delay or connection issue."
 
@@ -457,7 +456,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 11. Security/performance audit: race conditions, unguarded sends, per-request client (Post-Phase-7)
+## 11. Security/performance audit: race conditions, unguarded sends, per-request client
 
 **Symptom**: During a code review audit, three categories of issues were identified:
 
@@ -483,7 +482,7 @@ Zoom → get_camera_property_range() = (ok=True, min=100 max=500 step=1 default=
 
 ---
 
-## 10. STT prompt was seeding the very hallucinations it was meant to prevent (Phase 7+)
+## 10. STT prompt was seeding the very hallucinations it was meant to prevent
 
 **Symptom**: Even with the blocklist from Fix #8 and D41 in place, phantom `"Thank you"` transcripts were still reaching Claude — "I get random Thank you all of a sudden" during normal use. The blocklist only caught the well-documented YouTube outros (`"Thanks for watching"`, `"Subtitles by Amara.org"`, etc.), not a bare `"Thank you."`.
 
@@ -512,7 +511,7 @@ This is the Whisper equivalent of writing `logit_bias={" thank you": +5}` and be
 
 ---
 
-## 9. Sequential TTS calls + WS send-after-close (Phase 5)
+## 9. Sequential TTS calls + WS send-after-close
 
 **Symptom**: Even after HTTP/2 + prewarm (Fix #7), total turn latency stayed at 3-5 seconds because every sentence's TTS was being awaited sequentially. A 3-sentence response paid ~1.5s × 3 = 4.5s in serial TTS calls. Separately, the server was logging `Unexpected ASGI message 'websocket.send', after sending 'websocket.close' or response already completed` when TTS finished after a client disconnect.
 
@@ -538,7 +537,7 @@ This is the Whisper equivalent of writing `logit_bias={" thank you": +5}` and be
 
 ---
 
-## 8. Whisper "Thank you." hallucination on short/quiet audio (Phase 5)
+## 8. Whisper "Thank you." hallucination on short/quiet audio
 
 **Symptom**: Server logs showed phantom transcripts — `Thank you.`, `Наржу.` (Russian), `Entah kalau abaid.` (Indonesian) — for audio segments the user never spoke. These phantom turns triggered full Claude + TTS cycles, wasting latency budget and producing confused apologetic responses.
 
@@ -558,7 +557,7 @@ Rejected segments log `[FILTER] Rejected short/quiet segment: N samples (Xs), RM
 
 ---
 
-## 7. HTTP/1.1 streaming + head-of-line blocking = 1500ms first-byte (Phase 5)
+## 7. HTTP/1.1 streaming + head-of-line blocking = 1500ms first-byte
 
 **Symptom**: Even after switching to persistent httpx clients (Fix #5), Claude first-token latency was still 969–1531ms and OpenAI TTS first-byte was still 719–1797ms. The pattern was clear: the **first** API call of a turn was always slow, while calls *within* the same response were faster — suggesting connection reuse was partially working but handshakes were still happening.
 
@@ -587,7 +586,7 @@ Groq wasn't affected because its transcription endpoint returns a single non-str
 
 ---
 
-## 6. Echo feedback triggering phantom barge-ins (Phase 5)
+## 6. Echo feedback triggering phantom barge-ins
 
 **Symptom**: During a test conversation, Abide would cut itself off mid-sentence even though the user said nothing. Server logs showed repeated `Barge-in triggered — cancelling response` events between TTS sentences. User observation: "Even the slightest of sound, I think that you're taking it as a barge."
 
@@ -603,7 +602,7 @@ Tunables are top-of-file constants in `main.py`: `POST_TTS_COOLDOWN_MS`, `SUSTAI
 
 ---
 
-## 5. TTS latency 1.3-2.8s per sentence — per-request httpx clients (Phase 5)
+## 5. TTS latency 1.3-2.8s per sentence — per-request httpx clients
 
 **Symptom**: Server timing logs showed OpenAI TTS first-byte latency of 1282-2797ms per sentence. Normal `tts-1` is 200-500ms. Same pattern hit Claude calls. Full turns were running 3-4 seconds end-to-end, blowing past the <1500ms requirement in CLAUDE.md.
 
@@ -621,7 +620,7 @@ Tunables are top-of-file constants in `main.py`: `POST_TTS_COOLDOWN_MS`, `SUSTAI
 
 ---
 
-## 4. VAD cutting off speech too early (Phase 5)
+## 4. VAD cutting off speech too early
 
 **Symptom**: User couldn't pause naturally between sentences without the system prematurely marking speech as "ended" and sending to transcription. Resulted in fragmented, multi-turn transcripts for single thoughts.
 
@@ -637,7 +636,7 @@ This lets us see if slowness is Groq itself vs. local processing overhead.
 
 ---
 
-## 3. Anthropic SDK "Connection error" on Windows (Phase 3)
+## 3. Anthropic SDK "Connection error" on Windows
 
 **Symptom**: After transcript arrived, UI showed `Claude error: Connection error` and hung on "Thinking...". The anthropic SDK retried twice then gave up. Meanwhile Groq calls worked fine on the same machine, so it wasn't a general network issue.
 
@@ -651,7 +650,7 @@ This lets us see if slowness is Groq itself vs. local processing overhead.
 
 ---
 
-## 2. WebSocket send/recv race on first message (Phase 2)
+## 2. WebSocket send/recv race on first message
 
 **Symptom**: Occasionally on the very first audio chunk after Start, the config JSON hadn't been processed yet and the server errored with "Groq API key not set".
 
@@ -661,7 +660,7 @@ This lets us see if slowness is Groq itself vs. local processing overhead.
 
 ---
 
-## 1. AudioWorklet chunk size mismatch (Phase 1)
+## 1. AudioWorklet chunk size mismatch
 
 **Symptom**: Audio loopback worked but silero-vad behaved erratically — missed the start of speech, fired spurious `end` events.
 

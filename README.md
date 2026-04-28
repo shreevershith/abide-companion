@@ -187,8 +187,7 @@ abide-companion/
 ├── README.md               This file
 ├── README-SETUP.txt        Plain-English setup guide for end users
 ├── DESIGN-NOTES.md         Development journal — what we built / tried / broke / fixed
-├── TROUBLESHOOTING.md      Bug log with root causes and fixes
-└── CLAUDE.md               Working notes for Claude Code sessions on this repo
+└── TROUBLESHOOTING.md      Bug log with root causes and fixes
 ```
 
 ---
@@ -401,7 +400,6 @@ Full list in the source. Revert the barge-in constants to laptop defaults on dep
 - [`DESIGN-NOTES.md`](DESIGN-NOTES.md) — development journal: what we set out to build, what we tried, what broke, what we didn't ship and why
 - [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — bug log with symptoms, root causes, and fixes
 - [`README-SETUP.txt`](README-SETUP.txt) — end-user setup guide in plain English
-- [`CLAUDE.md`](CLAUDE.md) — working notes for Claude Code sessions on this repo
 - [`scripts/smoke_ttfa.py`](scripts/smoke_ttfa.py) — CLI smoke test: plays a WAV at the WebSocket, asserts TTFA < 1.5 s
 
 ---
